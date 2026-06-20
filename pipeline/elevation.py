@@ -1,0 +1,137 @@
+"""Build a terrain-relief raster for the region from free Terrarium elevation tiles.
+
+Downloads Mapzen/Terrarium terrain-RGB tiles (free, no auth) covering the MA
+bounding box, decodes them to meters, computes local relief (the elevation
+range within a ~1 km window — a robust proxy for hills, valleys, and overlook
+potential), and writes:
+
+  data/processed/relief.tif     local relief in meters (EPSG:3857)
+  data/processed/elevation.tif  raw elevation in meters (EPSG:3857)
+
+score.py samples relief.tif to add a terrain component to the scenic score.
+
+Usage: python elevation.py <output_dir> [zoom]
+"""
+
+import concurrent.futures as cf
+import io
+import math
+import sys
+from pathlib import Path
+
+import numpy as np
+import rasterio
+import requests
+from PIL import Image
+from rasterio.transform import from_bounds
+from scipy.ndimage import maximum_filter, minimum_filter
+
+# MA bounding box (lon/lat) with a small margin
+BBOX = (-73.55, 41.18, -69.85, 42.92)
+TILE_URL = "https://elevation-tiles-prod.s3.amazonaws.com/terrarium/{z}/{x}/{y}.png"
+RELIEF_WINDOW_M = 1000.0  # neighborhood for local relief
+TILE_PX = 256
+R = 6378137.0  # web mercator radius
+
+
+def lonlat_to_tile(lon, lat, z):
+    n = 2 ** z
+    x = (lon + 180.0) / 360.0 * n
+    lat_r = math.radians(lat)
+    y = (1.0 - math.asinh(math.tan(lat_r)) / math.pi) / 2.0 * n
+    return x, y
+
+
+def tile_to_mercator(x, y, z):
+    """Top-left corner of tile (x, y) at zoom z, in EPSG:3857 meters."""
+    n = 2 ** z
+    mx = x / n * 2 * math.pi * R - math.pi * R
+    my = math.pi * R - y / n * 2 * math.pi * R
+    return mx, my
+
+
+def fetch_tile(z, x, y, cache: Path):
+    p = cache / f"{z}_{x}_{y}.png"
+    if p.exists():
+        return x, y, np.asarray(Image.open(p).convert("RGB"))
+    for attempt in range(3):
+        try:
+            r = requests.get(TILE_URL.format(z=z, x=x, y=y), timeout=30)
+            if r.status_code == 200:
+                p.write_bytes(r.content)
+                return x, y, np.asarray(Image.open(io.BytesIO(r.content)).convert("RGB"))
+        except requests.RequestException:
+            pass
+    return x, y, None  # missing tile -> filled as nodata
+
+
+def decode_terrarium(rgb: np.ndarray) -> np.ndarray:
+    rgb = rgb.astype(np.float64)
+    return rgb[..., 0] * 256.0 + rgb[..., 1] + rgb[..., 2] / 256.0 - 32768.0
+
+
+def main(out_dir: str, zoom: int = 11):
+    out = Path(out_dir)
+    cache = out.parent / "raw" / "terrain"
+    cache.mkdir(parents=True, exist_ok=True)
+
+    w, s, e, n = BBOX
+    x0f, y0f = lonlat_to_tile(w, n, zoom)  # north-west
+    x1f, y1f = lonlat_to_tile(e, s, zoom)  # south-east
+    x0, y0 = int(math.floor(x0f)), int(math.floor(y0f))
+    x1, y1 = int(math.floor(x1f)), int(math.floor(y1f))
+    tx = list(range(x0, x1 + 1))
+    ty = list(range(y0, y1 + 1))
+    print(f"zoom {zoom}: {len(tx)}x{len(ty)} = {len(tx) * len(ty)} tiles")
+
+    H, W = len(ty) * TILE_PX, len(tx) * TILE_PX
+    elev = np.full((H, W), np.nan, dtype=np.float64)
+
+    jobs = [(zoom, x, y) for x in tx for y in ty]
+    done = 0
+    with cf.ThreadPoolExecutor(max_workers=24) as ex:
+        for x, y, rgb in ex.map(lambda j: fetch_tile(*j, cache), jobs):
+            done += 1
+            if rgb is None:
+                continue
+            col = (x - x0) * TILE_PX
+            row = (y - y0) * TILE_PX
+            elev[row:row + TILE_PX, col:col + TILE_PX] = decode_terrarium(rgb)
+            if done % 100 == 0:
+                print(f"  {done}/{len(jobs)} tiles")
+
+    # Mercator bounds + transform for the assembled mosaic
+    left, top = tile_to_mercator(x0, y0, zoom)
+    right, bottom = tile_to_mercator(x1 + 1, y1 + 1, zoom)
+    transform = from_bounds(left, bottom, right, top, W, H)
+
+    # Local relief via a moving window (range = max - min)
+    px_m = (right - left) / W
+    win = max(3, int(round(RELIEF_WINDOW_M / px_m)) | 1)  # odd
+    print(f"pixel ~{px_m:.0f} m; relief window {win}px (~{win * px_m:.0f} m)")
+    # Clamp ocean bathymetry (Terrarium encodes sea floor as deep negatives) to
+    # sea level so coastal roads don't get spuriously huge land relief.
+    land = np.clip(np.where(np.isnan(elev), 0.0, elev), 0.0, None)
+    relief = (maximum_filter(land, size=win) - minimum_filter(land, size=win))
+    relief = relief.astype(np.float32)
+
+    prof = dict(
+        driver="GTiff", height=H, width=W, count=1, dtype="float32",
+        crs="EPSG:3857", transform=transform, compress="deflate", predictor=2,
+    )
+    with rasterio.open(out / "relief.tif", "w", **prof) as dst:
+        dst.write(relief, 1)
+    with rasterio.open(out / "elevation.tif", "w", nodata=float("nan"), **prof) as dst:
+        dst.write(elev.astype(np.float32), 1)
+
+    valid = ~np.isnan(elev)
+    print(f"elevation: {np.nanmin(elev):.0f}..{np.nanmax(elev):.0f} m "
+          f"({100 * valid.mean():.1f}% covered)")
+    print(f"relief: median {np.median(relief[valid]):.0f} m, "
+          f"p95 {np.percentile(relief[valid], 95):.0f} m")
+    print(f"wrote {out / 'relief.tif'} and {out / 'elevation.tif'}")
+
+
+if __name__ == "__main__":
+    z = int(sys.argv[2]) if len(sys.argv) > 2 else 11
+    main(sys.argv[1], z)

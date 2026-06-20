@@ -1,13 +1,17 @@
 """Score every drivable road chunk in the region for scenic quality.
 
-v0 scoring uses OSM-derived features only (no rasters yet):
+Scoring components (the per-segment "beauty vector"):
   water   - proximity to lakes/reservoirs/rivers
   coast   - proximity to the ocean coastline
   green   - adjacency to woods, forests, parks, reserves
   curves  - heading change per km (twistiness)
+  relief  - local terrain relief from elevation.py (hills, valleys, overlooks)
   farm    - adjacency to farmland/orchards/meadows
   views   - proximity to mapped viewpoints
   scenic  - explicit scenic=yes tag
+
+The relief component is read from data/processed/relief.tif if present
+(run elevation.py first); otherwise it is zero and a notice is printed.
 
 Each chunk keeps its component vector (the per-segment "beauty vector")
 plus a composite 0-10 score. Output: scored_chunks.parquet.
@@ -34,11 +38,12 @@ CHUNK_LEN = 400.0  # max road chunk length in meters
 DIST = {"water": 120, "water_mid": 350, "coast": 800, "green": 80, "farm": 80, "view": 400}
 MIN_AREA = {"water": 20_000, "green": 30_000, "farm": 20_000}
 WEIGHTS = {
-    "water": 0.26, "coast": 0.15, "green": 0.22, "curves": 0.16,
-    "farm": 0.07, "views": 0.06, "scenic_tag": 0.08,
+    "water": 0.22, "coast": 0.13, "green": 0.18, "curves": 0.13,
+    "relief": 0.16, "farm": 0.06, "views": 0.05, "scenic_tag": 0.07,
 }
 STRETCH = 1.35           # expands the composite so great roads land near 10
 CURVE_FULL = 120.0       # deg/km that counts as maximally twisty
+RELIEF_FULL = 160.0      # local relief (m within ~1 km) that counts as maximal
 CLASS_ADJ = {
     "motorway": -0.45, "motorway_link": -0.40, "trunk": -0.10, "trunk_link": -0.18,
     "primary": -0.04, "primary_link": -0.10, "secondary": 0.0, "secondary_link": -0.10,
@@ -103,6 +108,23 @@ def near_flags(tree: STRtree | None, geoms: np.ndarray, dist: float) -> np.ndarr
     return flags
 
 
+def sample_relief(chunks: gpd.GeoDataFrame, relief_path: Path) -> np.ndarray:
+    """Sample local relief (m) at each chunk midpoint, normalized to 0..1."""
+    if not relief_path.exists():
+        print(f"NOTE: {relief_path.name} missing; relief component = 0 "
+              f"(run elevation.py to enable terrain scoring)")
+        return np.zeros(len(chunks))
+    import rasterio
+    mids = chunks.geometry.interpolate(0.5, normalized=True).to_crs(3857)
+    coords = np.column_stack([mids.x.values, mids.y.values])
+    with rasterio.open(relief_path) as src:
+        vals = np.fromiter(
+            (v[0] for v in src.sample(coords)), dtype=float, count=len(coords)
+        )
+    vals = np.nan_to_num(vals, nan=0.0)
+    return np.clip(vals / RELIEF_FULL, 0, 1)
+
+
 def build_tree(gdf: gpd.GeoDataFrame, min_area: float | None = None) -> STRtree | None:
     if len(gdf) == 0:
         return None
@@ -156,6 +178,7 @@ def main(processed_dir: str):
     chunks["c_farm"] = near_flags(farm_tree, geoms, DIST["farm"]).astype(float)
     chunks["c_views"] = near_flags(view_tree, geoms, DIST["view"]).astype(float)
     chunks["c_scenic_tag"] = chunks["scenic"].astype(float)
+    chunks["c_relief"] = sample_relief(chunks, d / "relief.tif")
     print(f"features computed in {time.time() - t0:.0f}s")
 
     # Composite score
@@ -164,6 +187,7 @@ def main(processed_dir: str):
         + WEIGHTS["coast"] * chunks["c_coast"]
         + WEIGHTS["green"] * chunks["c_green"]
         + WEIGHTS["curves"] * chunks["c_curves"]
+        + WEIGHTS["relief"] * chunks["c_relief"]
         + WEIGHTS["farm"] * chunks["c_farm"]
         + WEIGHTS["views"] * chunks["c_views"]
         + WEIGHTS["scenic_tag"] * chunks["c_scenic_tag"]
