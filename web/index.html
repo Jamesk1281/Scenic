@@ -8,7 +8,7 @@
 <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
 <style>
   :root {
-    --bg: #0d1117; --panel: #161b22; --line: #30363d;
+    --bg: #0d1117; --panel: #161b22; --line: #30363d; --field: #0d1117;
     --fg: #e6edf3; --muted: #8b949e;
     --fast: #8b98a8; --scenic: #38d39f; --accent: #f0b429;
     --a: #3fb950; --b: #f85149;
@@ -20,10 +20,23 @@
            border-right: 1px solid var(--line); background: var(--panel); }
   #map { flex: 1; }
   h1 { font-size: 22px; margin: 0 0 2px; letter-spacing: -.3px; }
-  .sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
-  .step { font-size: 13px; color: var(--muted); line-height: 1.5; margin-bottom: 18px; }
-  .step b { color: var(--fg); }
-  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 5px; vertical-align: middle; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 18px; }
+
+  .search { margin-bottom: 14px; }
+  .field { position: relative; margin-bottom: 8px; }
+  .field .dot { position: absolute; left: 11px; top: 50%; transform: translateY(-50%); }
+  .field input { width: 100%; padding: 10px 12px 10px 28px; background: var(--field);
+                 color: var(--fg); border: 1px solid var(--line); border-radius: 9px; font-size: 13px; }
+  .field input:focus { outline: none; border-color: var(--scenic); }
+  .suggestions { position: absolute; z-index: 5; left: 0; right: 0; top: calc(100% + 4px);
+                 background: #1c2230; border: 1px solid var(--line); border-radius: 9px;
+                 overflow: hidden; box-shadow: 0 8px 24px #0008; }
+  .suggestions div { padding: 9px 12px; font-size: 12.5px; cursor: pointer;
+                     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .suggestions div:hover { background: #283041; }
+
+  .step { font-size: 12.5px; color: var(--muted); line-height: 1.5; margin-bottom: 16px; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; vertical-align: middle; }
   label { font-size: 12px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); }
   .slider-row { margin: 8px 0 4px; display: flex; align-items: center; gap: 10px; }
   input[type=range] { flex: 1; accent-color: var(--scenic); }
@@ -32,7 +45,7 @@
   .btns { display: flex; gap: 8px; margin-bottom: 18px; }
   button { flex: 1; background: #21262d; color: var(--fg); border: 1px solid var(--line);
            padding: 9px; border-radius: 8px; font-size: 13px; cursor: pointer; }
-  button:hover { border-color: var(--scenic); }
+  button:hover:not(:disabled) { border-color: var(--scenic); }
   button:disabled { opacity: .4; cursor: default; }
   .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 16px; }
   .card { border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
@@ -54,6 +67,13 @@
   .hint { font-size: 12px; color: var(--muted); margin-top: 18px; line-height: 1.5; }
   #spinner { display: none; color: var(--scenic); font-size: 13px; margin-bottom: 12px; }
   .muted { color: var(--muted); }
+
+  @media (max-width: 720px) {
+    #app { flex-direction: column; }
+    #map { height: 50vh; flex: none; order: -1; }
+    #panel { width: 100%; min-width: 0; max-height: 50vh;
+             border-right: none; border-top: 1px solid var(--line); }
+  }
 </style>
 </head>
 <body>
@@ -62,9 +82,21 @@
     <h1>Scenic</h1>
     <div class="sub">Beautiful routes, not fast ones · Massachusetts</div>
 
+    <div class="search">
+      <div class="field">
+        <span class="dot" style="background:var(--a)"></span>
+        <input id="startInput" placeholder="Start address or place" autocomplete="off" />
+        <div class="suggestions" id="startSug" style="display:none"></div>
+      </div>
+      <div class="field">
+        <span class="dot" style="background:var(--b)"></span>
+        <input id="endInput" placeholder="Destination address or place" autocomplete="off" />
+        <div class="suggestions" id="endSug" style="display:none"></div>
+      </div>
+    </div>
+
     <div class="step" id="instructions">
-      <span class="dot" style="background:var(--a)"></span><b>Click the map</b> to set a start,
-      then click again for a destination.
+      Type an address above, or <b>click the map</b> to drop a start and destination.
     </div>
 
     <label>Scenery preference</label>
@@ -127,15 +159,14 @@ const map = new maplibregl.Map({
   },
   center: MA.center, zoom: MA.zoom,
 });
+map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
 
 let A = null, B = null, markerA = null, markerB = null;
 const prefEl = document.getElementById("pref");
 const prefVal = document.getElementById("prefVal");
 
 function pref() { return (prefEl.value / 100).toFixed(2); }
-prefEl.addEventListener("input", () => {
-  prefVal.textContent = pref();
-});
+prefEl.addEventListener("input", () => { prefVal.textContent = pref(); });
 prefEl.addEventListener("change", () => { if (A && B) route(); });
 
 function mk(color) {
@@ -145,27 +176,52 @@ function mk(color) {
   return el;
 }
 
-map.on("click", (e) => {
-  const ll = [e.lngLat.lng, e.lngLat.lat];
-  if (!A || (A && B)) {                 // start fresh
-    clearAll();
-    A = ll;
-    markerA = new maplibregl.Marker({ element: mk("var(--a)") }).setLngLat(ll).addTo(map);
-    document.getElementById("instructions").innerHTML =
-      '<span class="dot" style="background:var(--b)"></span><b>Now click a destination.</b>';
-  } else {
-    B = ll;
-    markerB = new maplibregl.Marker({ element: mk("var(--b)") }).setLngLat(ll).addTo(map);
-    document.getElementById("swap").disabled = false;
-    document.getElementById("clear").disabled = false;
+// --- setting endpoints (shared by map clicks and address search) ---
+function setStart(lngLat, label) {
+  A = lngLat;
+  if (markerA) markerA.setLngLat(A);
+  else markerA = new maplibregl.Marker({ element: mk("var(--a)") }).setLngLat(A).addTo(map);
+  if (label !== undefined) document.getElementById("startInput").value = label;
+  afterSet();
+}
+function setEnd(lngLat, label) {
+  B = lngLat;
+  if (markerB) markerB.setLngLat(B);
+  else markerB = new maplibregl.Marker({ element: mk("var(--b)") }).setLngLat(B).addTo(map);
+  if (label !== undefined) document.getElementById("endInput").value = label;
+  afterSet();
+}
+function afterSet() {
+  document.getElementById("swap").disabled = !(A && B);
+  document.getElementById("clear").disabled = !(A || B);
+  const inst = document.getElementById("instructions");
+  if (A && B) {
+    inst.innerHTML = 'Drag the <b>scenery preference</b> slider to trade time for beauty.';
     route();
+  } else if (A) {
+    inst.innerHTML = '<span class="dot" style="background:var(--b)"></span> <b>Now set a destination.</b>';
   }
+}
+
+// --- map click (guarded so double-click zooms instead of dropping a point) ---
+let clickTimer = null;
+map.on("click", (e) => {
+  clearTimeout(clickTimer);
+  const ll = [e.lngLat.lng, e.lngLat.lat];
+  clickTimer = setTimeout(() => {
+    if (!A || (A && B)) { clearAll(); setStart(ll, ""); }
+    else setEnd(ll, "");
+  }, 240);
 });
+map.on("dblclick", () => clearTimeout(clickTimer));
 
 document.getElementById("clear").onclick = () => {
-  clearAll(); A = B = null;
+  clearAll(); A = null;
+  if (markerA) { markerA.remove(); markerA = null; }
+  document.getElementById("startInput").value = "";
+  document.getElementById("endInput").value = "";
   document.getElementById("instructions").innerHTML =
-    '<span class="dot" style="background:var(--a)"></span><b>Click the map</b> to set a start, then click again for a destination.';
+    'Type an address above, or <b>click the map</b> to drop a start and destination.';
   document.getElementById("swap").disabled = true;
   document.getElementById("clear").disabled = true;
 };
@@ -173,6 +229,8 @@ document.getElementById("swap").onclick = () => {
   if (!A || !B) return;
   [A, B] = [B, A];
   markerA.setLngLat(A); markerB.setLngLat(B);
+  const si = document.getElementById("startInput"), ei = document.getElementById("endInput");
+  [si.value, ei.value] = [ei.value, si.value];
   route();
 };
 
@@ -187,6 +245,45 @@ function clearAll() {
   document.getElementById("results").style.display = "none";
 }
 
+// --- address autocomplete (Nominatim via our backend, MA-biased) ---
+function wireSearch(inputId, sugId, setter) {
+  const input = document.getElementById(inputId);
+  const box = document.getElementById(sugId);
+  let timer = null;
+  const hide = () => { box.style.display = "none"; box.innerHTML = ""; };
+
+  input.addEventListener("input", () => {
+    clearTimeout(timer);
+    const q = input.value.trim();
+    if (q.length < 3) return hide();
+    timer = setTimeout(async () => {
+      try {
+        const r = await fetch(`${API}/api/geocode?q=${encodeURIComponent(q)}`);
+        const { results } = await r.json();
+        if (!results || !results.length) return hide();
+        box.innerHTML = "";
+        for (const res of results) {
+          const d = document.createElement("div");
+          d.textContent = res.name;
+          d.title = res.name;
+          d.onclick = () => {
+            const short = res.name.split(",").slice(0, 2).join(",");
+            setter([res.lon, res.lat], short);
+            map.flyTo({ center: [res.lon, res.lat], zoom: Math.max(map.getZoom(), 11) });
+            hide();
+          };
+          box.appendChild(d);
+        }
+        box.style.display = "block";
+      } catch { hide(); }
+    }, 350);
+  });
+  input.addEventListener("blur", () => setTimeout(hide, 180));
+}
+wireSearch("startInput", "startSug", setStart);
+wireSearch("endInput", "endSug", setEnd);
+
+// --- routing ---
 function drawLine(id, feature, color, width, glow) {
   if (map.getSource(id)) { map.getSource(id).setData(feature); return; }
   map.addSource(id, { type: "geojson", data: feature });
@@ -202,6 +299,7 @@ function drawLine(id, feature, color, width, glow) {
 }
 
 async function route() {
+  if (!A || !B) return;
   document.getElementById("spinner").style.display = "block";
   document.getElementById("results").style.display = "none";
   try {
@@ -219,7 +317,6 @@ async function route() {
 }
 
 function render({ fastest, scenic }) {
-  // fastest drawn first (under), scenic on top
   drawLine("fastest", fastest, "#8b98a8", 3, false);
   drawLine("scenic", scenic, "#38d39f", 5, true);
 
@@ -238,14 +335,15 @@ function render({ fastest, scenic }) {
     `scenery score from <b>${f.mean_score.toFixed(1)}</b> to <b>${s.mean_score.toFixed(1)}</b>.`;
 
   const sk = s.scenery_km, max = Math.max(1, ...Object.values(sk));
-  document.getElementById("bars").innerHTML = Object.entries(sk).map(([k, v]) =>
+  document.getElementById("bars").innerHTML = Object.entries(sk)
+    .filter(([, v]) => v > 0)
+    .map(([k, v]) =>
     `<div class="bar"><span class="name">${k}</span>
        <div class="track"><div class="fill" style="width:${100 * v / max}%"></div></div>
        <span>${v} km</span></div>`).join("");
 
   document.getElementById("results").style.display = "block";
 
-  // fit both routes
   const b = new maplibregl.LngLatBounds();
   for (const fc of [fastest, scenic])
     for (const c of fc.geometry.coordinates) b.extend(c);

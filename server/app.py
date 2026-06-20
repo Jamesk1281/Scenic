@@ -10,8 +10,10 @@ Run:  python server/app.py [processed_dir]   (default: data/processed)
 """
 
 import sys
+from functools import lru_cache
 from pathlib import Path
 
+import requests
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 
@@ -59,6 +61,35 @@ def api_route():
 @app.get("/api/health")
 def health():
     return jsonify(status="ok", nodes=ROUTER.n)
+
+
+# Massachusetts bounding box, biases geocoding to local results.
+_MA_VIEWBOX = "-73.55,42.92,-69.85,41.18"
+
+
+@lru_cache(maxsize=512)
+def _geocode(q: str):
+    r = requests.get(
+        "https://nominatim.openstreetmap.org/search",
+        params={"q": q, "format": "jsonv2", "limit": 5, "countrycodes": "us",
+                "viewbox": _MA_VIEWBOX, "bounded": 1},
+        headers={"User-Agent": "ScenicRoutingDemo/0.1 (scenic-routes demo app)"},
+        timeout=10,
+    )
+    r.raise_for_status()
+    return [{"name": d["display_name"], "lat": float(d["lat"]), "lon": float(d["lon"])}
+            for d in r.json()]
+
+
+@app.get("/api/geocode")
+def geocode():
+    q = request.args.get("q", "").strip()
+    if len(q) < 3:
+        return jsonify(results=[])
+    try:
+        return jsonify(results=_geocode(q))
+    except requests.RequestException:
+        return jsonify(results=[], error="geocoder unavailable"), 502
 
 
 @app.get("/")
