@@ -1,0 +1,8 @@
+osmium
+geopandas>=1.0
+shapely>=2.1
+pyarrow
+numpy
+matplotlib
+folium
+pyproj
