@@ -16,9 +16,9 @@ a web demo and (planned) a native iOS app.
 - [x] Routable graph (~402k edges) split at intersections, scenic-scored
 - [x] Scenic router: Dijkstra with a time-vs-scenery preference knob
 - [x] Web demo: MapLibre map, click two points, compare fastest vs scenic
+- [x] iOS app (SwiftUI + MapKit) on the same API (`ios/`, builds + runs)
 - [ ] Land cover (NLCD) feature; official scenic-byway calibration
-- [ ] iOS app (SwiftUI + MapKit) on the same API
-- [ ] Hosting (small VPS) + public domain
+- [ ] Hosting (small VPS) + public domain (see `server/DEPLOY.md`)
 
 ## Architecture
 
