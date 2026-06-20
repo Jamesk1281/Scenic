@@ -1,0 +1,10 @@
+# Minimal deps to *serve* routes (graph already built). No osmium/matplotlib.
+geopandas>=1.0
+shapely>=2.1
+pyarrow
+numpy
+scipy
+pyproj
+flask
+flask-cors
+gunicorn

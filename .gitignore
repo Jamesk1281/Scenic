@@ -8,3 +8,10 @@ __pycache__/
 # editor/OS cruft
 .claude/launch.json
 *.log
+
+# iOS build artifacts (xcodeproj regenerated from project.yml)
+ios/build/
+ios/Scenic.xcodeproj/
+ios/Generated/
+ios/DerivedData/
+*.xcuserstate
