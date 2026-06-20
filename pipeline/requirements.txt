@@ -6,3 +6,9 @@ numpy
 matplotlib
 folium
 pyproj
+rasterio
+scipy
+requests
+pillow
+flask
+flask-cors

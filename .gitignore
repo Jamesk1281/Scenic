@@ -4,3 +4,7 @@ out/
 __pycache__/
 *.pyc
 .DS_Store
+
+# editor/OS cruft
+.claude/launch.json
+*.log

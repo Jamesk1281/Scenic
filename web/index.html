@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Scenic — beautiful routes, not fast ones</title>
+<link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --line: #30363d;
+    --fg: #e6edf3; --muted: #8b949e;
+    --fast: #8b98a8; --scenic: #38d39f; --accent: #f0b429;
+    --a: #3fb950; --b: #f85149;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  #app { display: flex; height: 100%; background: var(--bg); color: var(--fg); }
+  #panel { width: 360px; min-width: 360px; padding: 22px; overflow-y: auto;
+           border-right: 1px solid var(--line); background: var(--panel); }
+  #map { flex: 1; }
+  h1 { font-size: 22px; margin: 0 0 2px; letter-spacing: -.3px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .step { font-size: 13px; color: var(--muted); line-height: 1.5; margin-bottom: 18px; }
+  .step b { color: var(--fg); }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 5px; vertical-align: middle; }
+  label { font-size: 12px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); }
+  .slider-row { margin: 8px 0 4px; display: flex; align-items: center; gap: 10px; }
+  input[type=range] { flex: 1; accent-color: var(--scenic); }
+  #prefVal { font-variant-numeric: tabular-nums; font-weight: 600; min-width: 34px; text-align: right; }
+  .scale { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); margin-bottom: 18px; }
+  .btns { display: flex; gap: 8px; margin-bottom: 18px; }
+  button { flex: 1; background: #21262d; color: var(--fg); border: 1px solid var(--line);
+           padding: 9px; border-radius: 8px; font-size: 13px; cursor: pointer; }
+  button:hover { border-color: var(--scenic); }
+  button:disabled { opacity: .4; cursor: default; }
+  .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 16px; }
+  .card { border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+  .card.fast { border-left: 3px solid var(--fast); }
+  .card.scenic { border-left: 3px solid var(--scenic); }
+  .card h3 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); }
+  .big { font-size: 24px; font-weight: 700; line-height: 1; }
+  .big small { font-size: 13px; font-weight: 400; color: var(--muted); }
+  .row { display: flex; justify-content: space-between; font-size: 13px; margin-top: 7px; }
+  .row span:last-child { font-variant-numeric: tabular-nums; }
+  .delta { background: #1c2333; border: 1px solid var(--line); border-radius: 10px;
+           padding: 11px 13px; font-size: 13px; margin-bottom: 16px; line-height: 1.5; }
+  .delta b { color: var(--accent); }
+  .bars { margin-top: 6px; }
+  .bar { display: flex; align-items: center; gap: 8px; margin: 6px 0; font-size: 12px; }
+  .bar .name { width: 78px; color: var(--muted); }
+  .track { flex: 1; height: 7px; background: #21262d; border-radius: 4px; overflow: hidden; }
+  .fill { height: 100%; background: var(--scenic); }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 18px; line-height: 1.5; }
+  #spinner { display: none; color: var(--scenic); font-size: 13px; margin-bottom: 12px; }
+  .muted { color: var(--muted); }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="panel">
+    <h1>Scenic</h1>
+    <div class="sub">Beautiful routes, not fast ones · Massachusetts</div>
+
+    <div class="step" id="instructions">
+      <span class="dot" style="background:var(--a)"></span><b>Click the map</b> to set a start,
+      then click again for a destination.
+    </div>
+
+    <label>Scenery preference</label>
+    <div class="slider-row">
+      <input type="range" id="pref" min="0" max="100" value="50" />
+      <span id="prefVal">0.50</span>
+    </div>
+    <div class="scale"><span>Fastest</span><span>Balanced</span><span>Most scenic</span></div>
+
+    <div class="btns">
+      <button id="swap" disabled>⇄ Swap</button>
+      <button id="clear" disabled>✕ Clear</button>
+    </div>
+
+    <div id="spinner">Finding routes…</div>
+    <div id="results" style="display:none">
+      <div class="cards">
+        <div class="card fast">
+          <h3>Fastest</h3>
+          <div class="big"><span id="fMin">–</span><small> min</small></div>
+          <div class="row"><span class="muted">distance</span><span id="fKm">–</span></div>
+          <div class="row"><span class="muted">scenic</span><span id="fScore">–</span></div>
+        </div>
+        <div class="card scenic">
+          <h3>Scenic</h3>
+          <div class="big"><span id="sMin">–</span><small> min</small></div>
+          <div class="row"><span class="muted">distance</span><span id="sKm">–</span></div>
+          <div class="row"><span class="muted">scenic</span><span id="sScore">–</span></div>
+        </div>
+      </div>
+      <div class="delta" id="delta"></div>
+      <label>Scenic route passes</label>
+      <div class="bars" id="bars"></div>
+    </div>
+
+    <div class="hint">
+      Routes come from a scenic score computed for every road in Massachusetts
+      using open geodata — land cover, water, coastline, terrain relief, and
+      road curvature. No Google or Apple data involved.
+    </div>
+  </div>
+  <div id="map"></div>
+</div>
+
+<script>
+const API = "";
+const MA = { center: [-71.8, 42.15], zoom: 7.6 };
+const map = new maplibregl.Map({
+  container: "map",
+  style: {
+    version: 8,
+    sources: { carto: {
+      type: "raster",
+      tiles: ["https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
+              "https://b.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
+              "https://c.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png"],
+      tileSize: 256,
+      attribution: "© OpenStreetMap © CARTO" } },
+    layers: [{ id: "bg", type: "raster", source: "carto" }],
+  },
+  center: MA.center, zoom: MA.zoom,
+});
+
+let A = null, B = null, markerA = null, markerB = null;
+const prefEl = document.getElementById("pref");
+const prefVal = document.getElementById("prefVal");
+
+function pref() { return (prefEl.value / 100).toFixed(2); }
+prefEl.addEventListener("input", () => {
+  prefVal.textContent = pref();
+});
+prefEl.addEventListener("change", () => { if (A && B) route(); });
+
+function mk(color) {
+  const el = document.createElement("div");
+  el.style.cssText = `width:16px;height:16px;border-radius:50%;background:${color};
+    border:2px solid #fff;box-shadow:0 0 0 2px ${color}66`;
+  return el;
+}
+
+map.on("click", (e) => {
+  const ll = [e.lngLat.lng, e.lngLat.lat];
+  if (!A || (A && B)) {                 // start fresh
+    clearAll();
+    A = ll;
+    markerA = new maplibregl.Marker({ element: mk("var(--a)") }).setLngLat(ll).addTo(map);
+    document.getElementById("instructions").innerHTML =
+      '<span class="dot" style="background:var(--b)"></span><b>Now click a destination.</b>';
+  } else {
+    B = ll;
+    markerB = new maplibregl.Marker({ element: mk("var(--b)") }).setLngLat(ll).addTo(map);
+    document.getElementById("swap").disabled = false;
+    document.getElementById("clear").disabled = false;
+    route();
+  }
+});
+
+document.getElementById("clear").onclick = () => {
+  clearAll(); A = B = null;
+  document.getElementById("instructions").innerHTML =
+    '<span class="dot" style="background:var(--a)"></span><b>Click the map</b> to set a start, then click again for a destination.';
+  document.getElementById("swap").disabled = true;
+  document.getElementById("clear").disabled = true;
+};
+document.getElementById("swap").onclick = () => {
+  if (!A || !B) return;
+  [A, B] = [B, A];
+  markerA.setLngLat(A); markerB.setLngLat(B);
+  route();
+};
+
+function clearAll() {
+  for (const id of ["fastest", "scenic"]) {
+    if (map.getLayer(id)) map.removeLayer(id);
+    if (map.getLayer(id + "-glow")) map.removeLayer(id + "-glow");
+    if (map.getSource(id)) map.removeSource(id);
+  }
+  if (markerB) { markerB.remove(); markerB = null; }
+  B = null;
+  document.getElementById("results").style.display = "none";
+}
+
+function drawLine(id, feature, color, width, glow) {
+  if (map.getSource(id)) { map.getSource(id).setData(feature); return; }
+  map.addSource(id, { type: "geojson", data: feature });
+  if (glow) {
+    map.addLayer({ id: id + "-glow", type: "line", source: id,
+      paint: { "line-color": color, "line-width": width + 6, "line-opacity": 0.18, "line-blur": 3 },
+      layout: { "line-cap": "round", "line-join": "round" } });
+  }
+  map.addLayer({ id, type: "line", source: id,
+    paint: { "line-color": color, "line-width": width,
+             "line-dasharray": id === "fastest" ? [2, 2] : [1, 0] },
+    layout: { "line-cap": "round", "line-join": "round" } });
+}
+
+async function route() {
+  document.getElementById("spinner").style.display = "block";
+  document.getElementById("results").style.display = "none";
+  try {
+    const url = `${API}/api/route?from=${A[1]},${A[0]}&to=${B[1]},${B[0]}&pref=${pref()}`;
+    const r = await fetch(url);
+    const data = await r.json();
+    if (data.error) throw new Error(data.error);
+    render(data);
+  } catch (err) {
+    document.getElementById("instructions").innerHTML =
+      `<span class="muted">Couldn't route: ${err.message}. Try points nearer roads.</span>`;
+  } finally {
+    document.getElementById("spinner").style.display = "none";
+  }
+}
+
+function render({ fastest, scenic }) {
+  // fastest drawn first (under), scenic on top
+  drawLine("fastest", fastest, "#8b98a8", 3, false);
+  drawLine("scenic", scenic, "#38d39f", 5, true);
+
+  const f = fastest.properties, s = scenic.properties;
+  document.getElementById("fMin").textContent = Math.round(f.minutes);
+  document.getElementById("sMin").textContent = Math.round(s.minutes);
+  document.getElementById("fKm").textContent = f.km + " km";
+  document.getElementById("sKm").textContent = s.km + " km";
+  document.getElementById("fScore").textContent = f.mean_score.toFixed(1) + " / 10";
+  document.getElementById("sScore").textContent = s.mean_score.toFixed(1) + " / 10";
+
+  const dt = Math.round(s.minutes - f.minutes);
+  const pct = Math.round(100 * (s.minutes - f.minutes) / Math.max(f.minutes, 1));
+  document.getElementById("delta").innerHTML =
+    `The scenic route adds <b>${dt} min</b> (${pct}% longer) and raises the ` +
+    `scenery score from <b>${f.mean_score.toFixed(1)}</b> to <b>${s.mean_score.toFixed(1)}</b>.`;
+
+  const sk = s.scenery_km, max = Math.max(1, ...Object.values(sk));
+  document.getElementById("bars").innerHTML = Object.entries(sk).map(([k, v]) =>
+    `<div class="bar"><span class="name">${k}</span>
+       <div class="track"><div class="fill" style="width:${100 * v / max}%"></div></div>
+       <span>${v} km</span></div>`).join("");
+
+  document.getElementById("results").style.display = "block";
+
+  // fit both routes
+  const b = new maplibregl.LngLatBounds();
+  for (const fc of [fastest, scenic])
+    for (const c of fc.geometry.coordinates) b.extend(c);
+  map.fitBounds(b, { padding: 70, duration: 600 });
+}
+</script>
+</body>
+</html>
