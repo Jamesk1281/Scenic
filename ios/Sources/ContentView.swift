@@ -77,6 +77,21 @@ struct ContentView: View {
             .shadow(radius: 2)
     }
 
+    private func addressField(
+        _ prompt: String, text: Binding<String>, dot: Color, role: Endpoint
+    ) -> some View {
+        HStack(spacing: 8) {
+            Circle().fill(dot).frame(width: 9, height: 9)
+            TextField(prompt, text: text)
+                .textFieldStyle(.plain)
+                .submitLabel(.search)
+                .autocorrectionDisabled()
+                .onSubmit { Task { await model.search(text.wrappedValue, into: role) } }
+        }
+        .padding(.horizontal, 12).padding(.vertical, 10)
+        .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
+    }
+
     private var controlCard: some View {
         VStack(spacing: 14) {
             HStack {
@@ -90,6 +105,13 @@ struct ContentView: View {
                         .disabled(model.end == nil)
                     Button { model.clear() } label: { Image(systemName: "xmark.circle") }
                 }
+            }
+
+            VStack(spacing: 8) {
+                addressField("Start address or place", text: $model.startQuery,
+                             dot: .green, role: .start)
+                addressField("Destination address or place", text: $model.endQuery,
+                             dot: .red, role: .end)
             }
 
             VStack(spacing: 2) {
