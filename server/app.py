@@ -61,4 +61,6 @@ def health():
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5057, debug=False)
+    # 0.0.0.0 listens on all interfaces so a phone on the same Wi-Fi can reach
+    # this dev server. (127.0.0.1 would only be reachable from this Mac.)
+    app.run(host="0.0.0.0", port=5057, debug=False)

@@ -29,3 +29,8 @@ targets:
         SWIFT_VERSION: "5.0"
         GENERATE_INFOPLIST_FILE: NO
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    # Points the app at the dev server when run from Xcode (device or simulator).
+    # Change this to a hosted https URL once the backend is deployed.
+    scheme:
+      environmentVariables:
+        SCENIC_API: http://Jamess-MacBook-Air-24.local:5057
