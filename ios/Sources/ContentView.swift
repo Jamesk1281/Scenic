@@ -103,6 +103,12 @@ struct ContentView: View {
 struct RoutePanel: View {
     @Bindable var model: RouteModel
 
+    /// Drives the live autocomplete dropdown.
+    @State private var completer = SearchCompleter()
+    /// Which field (if any) the user is typing in — so suggestions show under
+    /// the right one.
+    @FocusState private var focused: Endpoint?
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
@@ -144,19 +150,67 @@ struct RoutePanel: View {
         }
     }
 
-    /// One address row: a colored dot and a field that searches on submit.
+    /// One address row: a colored dot, a field that drives live autocomplete as
+    /// the user types, and (when focused) a dropdown of suggestions beneath it.
     private func searchField(
         _ prompt: String, _ text: Binding<String>, dot: Color, role: Endpoint
     ) -> some View {
-        HStack(spacing: 8) {
-            Circle().fill(dot).frame(width: 9, height: 9)
-            TextField(prompt, text: text)
-                .submitLabel(.search)
-                .autocorrectionDisabled()
-                .onSubmit { Task { await model.search(text.wrappedValue, into: role) } }
+        VStack(spacing: 6) {
+            HStack(spacing: 8) {
+                Circle().fill(dot).frame(width: 9, height: 9)
+                TextField(prompt, text: text)
+                    .focused($focused, equals: role)
+                    .submitLabel(.search)
+                    .autocorrectionDisabled()
+                    // Feed each keystroke to the completer (only for the field
+                    // actually being typed in, not programmatic label updates).
+                    .onChange(of: text.wrappedValue) { _, newValue in
+                        if focused == role { completer.update(for: newValue) }
+                    }
+                    // Return key still works as a fallback for a raw query.
+                    .onSubmit {
+                        focused = nil
+                        completer.clear()
+                        Task { await model.search(text.wrappedValue, into: role) }
+                    }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 11)
+            .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
+
+            if focused == role && !completer.suggestions.isEmpty {
+                suggestionList(for: role)
+            }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 11)
+    }
+
+    /// The autocomplete dropdown. Tapping a row resolves it to a place, sets the
+    /// endpoint, and routes immediately once both ends are filled.
+    private func suggestionList(for role: Endpoint) -> some View {
+        let rows = Array(completer.suggestions.prefix(5).enumerated())
+        return VStack(spacing: 0) {
+            ForEach(rows, id: \.offset) { index, suggestion in
+                Button {
+                    focused = nil
+                    completer.clear()
+                    Task { await model.choose(suggestion, into: role) }
+                } label: {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(suggestion.title)
+                        if !suggestion.subtitle.isEmpty {
+                            Text(suggestion.subtitle)
+                                .font(.caption2).foregroundStyle(.secondary)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 8)
+                    .padding(.horizontal, 12)
+                }
+                .buttonStyle(.plain)
+
+                if index < rows.count - 1 { Divider() }
+            }
+        }
         .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
     }
 

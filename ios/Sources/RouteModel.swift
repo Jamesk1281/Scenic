@@ -48,8 +48,7 @@ final class RouteModel {
         }
     }
 
-    /// Resolve a typed address to a coordinate with Apple's MapKit search, set
-    /// the matching endpoint, and route once both ends are known.
+    /// Resolve a free-text query (the user pressed return) to a place and set it.
     func search(_ query: String, into role: Endpoint) async {
         let trimmed = query.trimmingCharacters(in: .whitespaces)
         guard trimmed.count >= 3 else { return }   // ignore tiny/partial queries
@@ -57,23 +56,36 @@ final class RouteModel {
         let request = MKLocalSearch.Request()
         request.naturalLanguageQuery = trimmed
         request.region = Self.maRegion
+        await resolve(request, label: trimmed, into: role)
+    }
 
+    /// Resolve a tapped autocomplete suggestion to a place and set it. The
+    /// suggestion is only a label, so we run a MapKit search on it to get the
+    /// precise coordinate.
+    func choose(_ completion: MKLocalSearchCompletion, into role: Endpoint) async {
+        await resolve(MKLocalSearch.Request(completion: completion),
+                      label: completion.title, into: role)
+    }
+
+    /// Run a MapKit search, set the matching endpoint, and route if both ends
+    /// are now known. Shared by the typed and the autocomplete paths.
+    private func resolve(_ request: MKLocalSearch.Request, label: String, into role: Endpoint) async {
         do {
             let result = try await MKLocalSearch(request: request).start()
             guard let match = result.mapItems.first else {
-                errorText = "No match for “\(trimmed)”"
+                errorText = "No match for “\(label)”"
                 return
             }
             let coordinate = match.placemark.coordinate
-            let label = match.name ?? trimmed
+            let name = match.name ?? label
             switch role {
-            case .start: start = coordinate; startQuery = label
-            case .end:   end = coordinate;   endQuery = label
+            case .start: start = coordinate; startQuery = name
+            case .end:   end = coordinate;   endQuery = name
             }
             errorText = nil
             if start != nil, end != nil { await computeRoute() }
         } catch {
-            errorText = "Couldn’t find “\(trimmed)”"
+            errorText = "Couldn’t find “\(label)”"
         }
     }
 
