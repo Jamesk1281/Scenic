@@ -136,17 +136,17 @@ struct ContentView: View {
     /// route yet) and becomes scrollable, capped at `maxHeight`, once a route
     /// fills it with cards and bars — so it never pushes off-screen.
     private func bottomPanel(maxHeight: CGFloat) -> some View {
-        Group {
-            if model.response == nil {
-                panelContent
-            } else {
-                ScrollView {
-                    panelContent
-                }
-                .frame(maxHeight: maxHeight)
-            }
+        // ViewThatFits tries the first child and uses it if it fits the
+        // available height; otherwise it falls through to the next. So the
+        // panel sizes to its content (no dead space) when everything fits, and
+        // only becomes a capped, scrollable view when the content is genuinely
+        // too tall for the screen (e.g. a full result on a small phone).
+        ViewThatFits(in: .vertical) {
+            panelContent
+            ScrollView { panelContent }
         }
-        .padding(16)
+        .frame(maxHeight: maxHeight)
+        .padding(14)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 24))
         .padding(.horizontal, 12)
         .padding(.bottom, 8)
@@ -154,7 +154,7 @@ struct ContentView: View {
 
     /// Everything inside the panel: title, address fields, slider, and results.
     private var panelContent: some View {
-        VStack(spacing: 14) {
+        VStack(spacing: 11) {
             header
             addressFields
             preferenceSlider
@@ -295,7 +295,7 @@ struct ContentView: View {
         // Longest feature distance, used to scale every bar's fill width.
         let maxKm = max(1, scenic.sceneryBreakdown.map(\.km).max() ?? 1)
 
-        return VStack(spacing: 10) {
+        return VStack(spacing: 8) {
             HStack(spacing: 10) {
                 routeCard("Fastest", fastest, tint: .gray)
                 routeCard("Scenic", scenic, tint: .scenic)
@@ -362,25 +362,42 @@ struct ContentView: View {
         }
     }
 
-    /// Zoom and pan the camera so the whole scenic route fits, with a little
-    /// padding (extra on top/bottom to clear the panel and the notch).
+    /// Zoom and pan the camera so the whole scenic route fits *in the map area
+    /// above the control panel* — not just centered on screen.
     private func frameRoute() {
         guard let coords = model.response?.scenic.coordinates, !coords.isEmpty else { return }
 
-        // Build the smallest map rectangle that contains every point.
+        // Build the smallest map rectangle that contains every route point.
         var bounds = MKMapRect.null
         for coord in coords {
             let point = MKMapPoint(coord)
             bounds = bounds.union(MKMapRect(x: point.x, y: point.y, width: 0, height: 0))
         }
 
-        // Negative insets grow the rectangle outward, adding breathing room.
-        let padded = bounds.insetBy(
-            dx: -bounds.size.width * 0.15,
-            dy: -bounds.size.height * 0.25
+        // The panel covers the bottom of the screen, so simply centering the
+        // route would tuck it behind the panel. Instead we pad the bounding
+        // rect asymmetrically — a little on the sides and top, a lot on the
+        // bottom. MapKit centers the *padded* rect, and that big bottom margin
+        // pushes the actual route up into the visible map area above the panel.
+        // (MKMapPoint y grows southward, so adding height extends the rect south.)
+        let w = bounds.size.width
+        let h = bounds.size.height
+        let sidePad = w * 0.15
+        let topPad = h * 0.25
+        // The on-screen zoom is driven by whichever dimension is larger relative
+        // to the (tall, portrait) screen — usually the width for an east-west
+        // route. Base the bottom margin on the larger dimension so even a very
+        // wide route gets lifted clear of the panel, not just a tall one.
+        let bottomPad = max(h * 1.6, w * 1.1)
+
+        let framed = MKMapRect(
+            x: bounds.origin.x - sidePad,
+            y: bounds.origin.y - topPad,
+            width: w + sidePad * 2,
+            height: h + topPad + bottomPad
         )
         withAnimation {
-            camera = .rect(padded)
+            camera = .rect(framed)
         }
     }
 }
