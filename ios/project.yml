@@ -20,6 +20,9 @@ targets:
         # Allow http to the local Flask dev server (simulator -> host).
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
+        # Shown in the system prompt when we ask to use the device location.
+        NSLocationWhenInUseUsageDescription: >-
+          Scenic uses your location to start a route from where you are.
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.scenic.demo
