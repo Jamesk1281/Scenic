@@ -52,6 +52,11 @@ CLASS_ADJ = {
 UNPAVED = {"unpaved", "dirt", "gravel", "ground", "grass", "sand", "earth", "mud", "fine_gravel"}
 UNPAVED_ADJ = -0.25
 
+# Official MA scenic byways that OSM doesn't tag scenic=yes — matched by road
+# name (case-insensitive substring). Treated like an OSM scenic designation.
+# Names are distinctive enough to avoid false positives statewide.
+BYWAY_NAMES = ["mohawk trail", "jacob's ladder trail", "jacobs ladder trail"]
+
 
 def load_layer(d: Path, name: str) -> gpd.GeoDataFrame:
     gdf = gpd.read_parquet(d / f"{name}.parquet")
@@ -177,7 +182,9 @@ def main(processed_dir: str):
     chunks["c_green"] = near_flags(green_tree, geoms, DIST["green"]).astype(float)
     chunks["c_farm"] = near_flags(farm_tree, geoms, DIST["farm"]).astype(float)
     chunks["c_views"] = near_flags(view_tree, geoms, DIST["view"]).astype(float)
-    chunks["c_scenic_tag"] = chunks["scenic"].astype(float)
+    name_l = chunks["name"].str.lower()
+    is_byway = name_l.apply(lambda s: any(b in s for b in BYWAY_NAMES))
+    chunks["c_scenic_tag"] = (chunks["scenic"] | is_byway).astype(float)
     chunks["c_relief"] = sample_relief(chunks, d / "relief.tif")
     print(f"features computed in {time.time() - t0:.0f}s")
 
