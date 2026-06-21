@@ -18,7 +18,6 @@ RUN pip install --no-cache-dir -r requirements-serve.txt
 
 COPY pipeline/router.py pipeline/
 COPY server/app.py server/
-COPY web/ web/
 COPY data/processed/graph_edges.parquet data/processed/graph_nodes.parquet data/processed/
 
 EXPOSE 5057

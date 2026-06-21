@@ -9,7 +9,7 @@ per-user: the same box serves 3 or 3,000 people.
 Only two artifacts are needed to *serve* routes (not the whole pipeline):
 
 - `data/processed/graph_edges.parquet` + `graph_nodes.parquet` (~tens of MB)
-- `server/app.py` + `pipeline/router.py` + `web/`
+- `server/app.py` + `pipeline/router.py`
 
 Regenerate the graph locally with the pipeline (see top-level README), then ship
 it; the server never touches OSM/elevation data at runtime.
@@ -37,8 +37,9 @@ Notes:
 - First request after boot is slow (graph load on first route); hit `/api/health`
   on deploy to warm it.
 
-## Hosting the web demo
+## Pointing the iOS app at it
 
-`web/index.html` is static and can live on **GitHub Pages / Cloudflare Pages**
-(free). Point `const API` in `index.html` at the VPS origin and enable CORS
-(already on via flask-cors). The resume link is then just that Pages URL.
+The app reads its API base from the `SCENIC_API` env var (defaults to
+`http://127.0.0.1:5057` for the simulator). For a hosted backend, set it to the
+VPS's **https** origin — App Transport Security requires TLS for a real device,
+so put the API behind Cloudflare or a reverse proxy with a certificate.

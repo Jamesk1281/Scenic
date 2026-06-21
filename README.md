@@ -3,8 +3,8 @@
 Scenic-route navigation: pick a destination, get a route that's beautiful instead
 of fast. Massachusetts first. A scenic score is computed for every road in the
 state from **open geodata only** (no Google/Apple data), a routing engine trades
-travel time for beauty via a single preference knob, and the same backend drives
-a web demo and (planned) a native iOS app.
+travel time for beauty via a single preference knob, and a native iOS app
+(SwiftUI + MapKit) is the front end on top of the routing API.
 
 ![heatmap](out/ma_scenic_heatmap.png)
 
@@ -15,10 +15,13 @@ a web demo and (planned) a native iOS app.
 - [x] Terrain relief from free Terrarium elevation tiles
 - [x] Routable graph (~402k edges) split at intersections, scenic-scored
 - [x] Scenic router: Dijkstra with a time-vs-scenery preference knob
-- [x] Web demo: MapLibre map, click two points, compare fastest vs scenic
-- [x] iOS app (SwiftUI + MapKit) on the same API (`ios/`, builds + runs)
-- [ ] Land cover (NLCD) feature; official scenic-byway calibration
-- [ ] Hosting (small VPS) + public domain (see `server/DEPLOY.md`)
+- [x] iOS app (SwiftUI + MapKit) on the routing API (`ios/`, builds + runs)
+- [x] Scenic-byway calibration (Mohawk Trail, Jacob's Ladder)
+- [ ] Land cover (NLCD/ESA WorldCover) feature for better score accuracy
+- [ ] Host the API (small VPS) so the app works off-device (see `server/DEPLOY.md`)
+
+> The early MapLibre web demo was retired to focus on iOS; it lives in git
+> history (`git show 82044e2`) and is cheap to revive on the same API if needed.
 
 ## Architecture
 
@@ -29,7 +32,7 @@ OSM PBF ─┐
                 │                                         │                     │
                 └─> elevation.py ─> relief.tif ──────────┘            router.py (Dijkstra)
                                                                               │
-                                                          server/app.py (Flask API) ─> web/ (MapLibre)
+                                                          server/app.py (Flask API) ─> ios/ (SwiftUI app)
 ```
 
 ## Run the pipeline
@@ -51,17 +54,14 @@ curl -L -o data/raw/massachusetts-latest.osm.pbf \
 .venv/bin/python pipeline/graph.py     data/raw/massachusetts-latest.osm.pbf data/processed
 ```
 
-## Run the demo
+## Run the API
 
 ```sh
-.venv/bin/python server/app.py        # serves http://127.0.0.1:5057
+.venv/bin/python server/app.py        # serves the routing API on http://127.0.0.1:5057
 ```
 
-Open the URL, click a start and a destination, drag the **scenery preference**
-slider, and the map compares the fastest route against the scenic one with a
-time delta and a breakdown of how many km pass coast / forest / water / hills.
-
-Command-line equivalent:
+The iOS app (`ios/`, open in Xcode) calls `GET /api/route?from=LAT,LON&to=LAT,LON&pref=0..1`
+and renders the fastest vs scenic routes. Command-line equivalent:
 
 ```sh
 .venv/bin/python pipeline/router.py data/processed "42.2626,-71.8023" "42.3551,-71.0657" 0.6
