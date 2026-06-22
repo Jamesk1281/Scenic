@@ -145,6 +145,7 @@ def main(pbf_path: str, processed_dir: str):
     idx = nearest if nearest.ndim == 1 else nearest[1]
     src = chunks.iloc[idx].reset_index(drop=True)
     edges["score"] = src["score"].values
+    edges["score_adj"] = src["score_adj"].values  # for live per-preference re-scoring
     # Carry every per-segment "beauty vector" column (c_water, c_coast, ...)
     # from the nearest chunk onto the edge. Auto-detecting the c_-prefixed
     # columns (rather than a hardcoded list) means a new component added in

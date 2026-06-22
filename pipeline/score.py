@@ -220,7 +220,12 @@ def main(processed_dir: str):
     )
     class_adj = chunks["highway"].map(CLASS_ADJ).fillna(0.0)
     unpaved_adj = np.where(chunks["surface"].isin(UNPAVED), UNPAVED_ADJ, 0.0)
-    chunks["score"] = 10 * np.clip(raw * STRETCH + class_adj + unpaved_adj, 0, 1)
+    # Store the road-class/surface adjustment separately from the composite. The
+    # router needs it to re-blend a per-user score live: it recombines the raw
+    # component vector with the user's beauty-type weights, then re-applies this
+    # same adjustment so highways/unpaved roads stay penalized.
+    chunks["score_adj"] = class_adj + unpaved_adj
+    chunks["score"] = 10 * np.clip(raw * STRETCH + chunks["score_adj"], 0, 1)
 
     out_path = d / "scored_chunks.parquet"
     chunks.to_parquet(out_path)
