@@ -24,8 +24,22 @@ final class RouteModel {
     var startQuery = ""
     var endQuery = ""
 
-    /// 0 = fastest, 1 = most scenic.
+    /// 0 = fastest, 1 = most scenic. The *overall* scenery strength; the
+    /// per-type weights below shape *what kind* of scenery.
     var pref: Double = 0.5
+
+    /// Per-beauty-type weights, keyed by `BeautyType.apiName`. Each starts
+    /// neutral (1.0); the tune screen edits them and they're sent to the
+    /// backend on every route request.
+    var weights: [String: Double] = Dictionary(
+        uniqueKeysWithValues: BeautyType.all.map { ($0.apiName, BeautyType.neutralWeight) }
+    )
+
+    /// True once the user has moved any type off neutral — used to highlight the
+    /// Tune button so it's clear a preference is active.
+    var isTuned: Bool {
+        weights.values.contains { abs($0 - BeautyType.neutralWeight) > 0.01 }
+    }
 
     var response: RouteResponse?
     var isLoading = false
@@ -98,6 +112,12 @@ final class RouteModel {
         response = nil; errorText = nil
     }
 
+    /// Put every beauty type back to neutral, then re-route.
+    func resetWeights() {
+        for type in BeautyType.all { weights[type.apiName] = BeautyType.neutralWeight }
+        Task { await computeRoute() }
+    }
+
     /// Ask the backend for the fastest and scenic routes at the current preference.
     func computeRoute() async {
         guard let a = start, let b = end else { return }
@@ -107,7 +127,7 @@ final class RouteModel {
         defer { isLoading = false }
 
         do {
-            response = try await RouteService.route(from: a, to: b, pref: pref)
+            response = try await RouteService.route(from: a, to: b, pref: pref, weights: weights)
         } catch {
             response = nil
             errorText = error.localizedDescription

@@ -103,6 +103,8 @@ struct RoutePanel: View {
     /// Which field (if any) the user is typing in — so suggestions show under
     /// the right one.
     @FocusState private var focused: Endpoint?
+    /// Whether the "Tune scenery" sheet is showing.
+    @State private var showingTune = false
 
     var body: some View {
         ScrollView {
@@ -124,11 +126,15 @@ struct RoutePanel: View {
             }
             .padding(20)
         }
+        .sheet(isPresented: $showingTune) {
+            TuneView(model: model)
+        }
     }
 
-    /// Title + a short hint, with swap/clear buttons once something is set.
+    /// Title + a short hint, with the Tune button and (once something is set)
+    /// swap/clear buttons.
     private var header: some View {
-        HStack {
+        HStack(spacing: 14) {
             VStack(alignment: .leading, spacing: 1) {
                 Text("Scenic").font(.title2.bold())
                 Text(model.response == nil
@@ -137,6 +143,12 @@ struct RoutePanel: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             Spacer()
+            // Tune is always available — the accent tint signals an active
+            // preference so the user knows their routes are being shaped.
+            Button { showingTune = true } label: {
+                Label("Tune", systemImage: "slider.horizontal.3").font(.subheadline)
+            }
+            .tint(model.isTuned ? .scenic : .secondary)
             if model.start != nil || model.end != nil {
                 Button { model.swapEnds() } label: { Image(systemName: "arrow.up.arrow.down") }
                     .disabled(model.start == nil || model.end == nil)

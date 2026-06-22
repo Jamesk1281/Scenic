@@ -24,19 +24,26 @@ enum RouteService {
     }
 
     /// Request the fastest and scenic routes between two points.
-    /// - Parameter pref: 0 = fastest, 1 = most scenic.
+    /// - Parameters:
+    ///   - pref: 0 = fastest, 1 = most scenic (overall scenery strength).
+    ///   - weights: per-beauty-type weights keyed by `BeautyType.apiName`
+    ///     (1.0 = neutral). Sent as `w_<type>` params; omitted types default to
+    ///     neutral on the server, so an empty dictionary is the plain behavior.
     static func route(
         from start: CLLocationCoordinate2D,
         to end: CLLocationCoordinate2D,
-        pref: Double
+        pref: Double,
+        weights: [String: Double] = [:]
     ) async throws -> RouteResponse {
-        // Build the URL: /api/route?from=lat,lon&to=lat,lon&pref=0.50
+        // Build the URL: /api/route?from=lat,lon&to=lat,lon&pref=0.50&w_coast=...
         var components = URLComponents(string: "\(baseURL)/api/route")!
         components.queryItems = [
             URLQueryItem(name: "from", value: "\(start.latitude),\(start.longitude)"),
             URLQueryItem(name: "to", value: "\(end.latitude),\(end.longitude)"),
             URLQueryItem(name: "pref", value: String(format: "%.2f", pref)),
-        ]
+        ] + weights.map { type, weight in
+            URLQueryItem(name: "w_\(type)", value: String(format: "%.2f", weight))
+        }
 
         let (data, response) = try await URLSession.shared.data(from: components.url!)
 
