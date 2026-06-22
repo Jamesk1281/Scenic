@@ -120,6 +120,17 @@ class Router:
         self.km = e["length_m"].to_numpy() / 1000.0   # per undirected edge
         self.d_minutes = minutes[self.eidx]
 
+        # Parallel edges: more than one directed edge can join the same
+        # (tail, head) — parallel roads between the same two junctions. scipy's
+        # csr_matrix *sums* duplicate coordinates, which would over-charge those
+        # hops, so route() collapses each node-pair to its single cheapest edge.
+        # Precompute the unique pairs and a slot -> pair-index map once here.
+        pairs = np.stack([self.tail, self.head], axis=1)
+        unique_pairs, slot_pair = np.unique(pairs, axis=0, return_inverse=True)
+        self.u_tail, self.u_head = unique_pairs[:, 0], unique_pairs[:, 1]
+        self.slot_pair = slot_pair.ravel()
+        self.n_pairs = len(unique_pairs)
+
         # Inputs for re-scoring each edge live under a user's beauty weights (see
         # _edge_scores). We split the score.py formula into pieces that let us
         # recompute it as one matrix-vector product per request:
@@ -158,7 +169,11 @@ class Router:
 
     def route(self, src_idx: int, dst_idx: int, pref: float, weights: dict = None):
         w = self._weights(pref, weights or {})
-        g = csr_matrix((w, (self.tail, self.head)), shape=(self.n, self.n))
+        # Collapse parallel edges to the cheapest weight per node-pair, so the
+        # cost matrix has one entry per pair (no summed duplicates).
+        pair_w = np.full(self.n_pairs, np.inf)
+        np.minimum.at(pair_w, self.slot_pair, w)
+        g = csr_matrix((pair_w, (self.u_tail, self.u_head)), shape=(self.n, self.n))
         dist, pred = dijkstra(g, directed=True, indices=src_idx,
                               return_predecessors=True)
         if not np.isfinite(dist[dst_idx]):
@@ -173,16 +188,18 @@ class Router:
             return None
         path.append(src_idx)
         path.reverse()
-        return self._collect(path)
+        return self._collect(path, w)
 
-    def _collect(self, path):
+    def _collect(self, path, w):
         """Turn a Dijkstra node path into the chosen edges, in travel order.
 
         Dijkstra hands back a sequence of node indices. For each hop (a -> b) we
-        look up the directed edge(s) joining them and keep the fastest, then
+        look up the directed edge(s) joining them and keep the one the cost
+        actually used — the cheapest under the same weights `w` Dijkstra saw, so
+        the drawn geometry and scenery match the chosen parallel road — then
         gather that edge's row and geometry (reversed if we drove it backwards).
-        The edges come out in travel order, which is exactly what a future
-        turn-by-turn step list would walk over to emit "turn onto X" maneuvers.
+        The edges come out in travel order, which is exactly what the
+        turn-by-turn step list walks over to emit "turn onto X" maneuvers.
         """
         # Build the (tail, head) -> directed-edge-slot lookup once, then cache
         # it. Two nodes can be joined by more than one edge (parallel roads), so
@@ -198,7 +215,7 @@ class Router:
             slots = self._adj.get((a, b))
             if not slots:
                 continue
-            chosen.append(min(slots, key=lambda s: self.d_minutes[s]))
+            chosen.append(min(slots, key=lambda s: w[s]))
 
         # The undirected edge rows (stats, names, geometry) in travel order.
         rows = self.edges.iloc[[self.eidx[k] for k in chosen]]
