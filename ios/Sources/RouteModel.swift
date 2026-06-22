@@ -45,6 +45,10 @@ final class RouteModel {
     var isLoading = false
     var errorText: String?
 
+    /// The live navigation session, non-nil while the user is driving a route.
+    /// The screen switches to the nav view whenever this is set.
+    var nav: NavigationModel?
+
     init() {
         // Demo mode (launch with SCENIC_DEMO set) preloads a route via the real
         // search path, so a screenshot doubles as an end-to-end check.
@@ -116,6 +120,19 @@ final class RouteModel {
     func resetWeights() {
         for type in BeautyType.all { weights[type.apiName] = BeautyType.neutralWeight }
         Task { await computeRoute() }
+    }
+
+    /// Begin live navigation along one of the computed routes (the scenic one by
+    /// default). Carries the current preference + weights so any mid-trip
+    /// re-route still reflects what the user wanted.
+    func startNavigation(_ feature: RouteFeature) {
+        guard let end else { return }
+        nav = NavigationModel(route: feature, destination: end, pref: pref, weights: weights)
+    }
+
+    /// Leave navigation and return to route planning.
+    func endNavigation() {
+        nav = nil
     }
 
     /// Ask the backend for the fastest and scenic routes at the current preference.

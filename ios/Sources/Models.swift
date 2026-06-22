@@ -31,6 +31,20 @@ struct Geometry: Decodable {
     let coordinates: [[Double]]
 }
 
+/// One turn-by-turn maneuver: what to do and where it happens.
+struct RouteStep: Decodable, Identifiable {
+    let instruction: String
+    let lat: Double
+    let lon: Double
+    /// How far this instruction carries you (the length of its road leg).
+    let distance_m: Double
+
+    var id: String { "\(lat),\(lon),\(instruction)" }
+    var coordinate: CLLocationCoordinate2D {
+        CLLocationCoordinate2D(latitude: lat, longitude: lon)
+    }
+}
+
 /// The per-route stats the backend computes.
 struct RouteProps: Decodable {
     let km: Double
@@ -40,6 +54,8 @@ struct RouteProps: Decodable {
     /// Kilometers of the route that pass each scenery feature, e.g.
     /// `["forest/park": 36.0, "water": 27.0, ...]`.
     let scenery_km: [String: Double]
+    /// Turn-by-turn maneuvers from start to destination, for live navigation.
+    let steps: [RouteStep]
 
     /// The scenery features in display order, dropping any the route never
     /// actually touches (0 km), so the breakdown only shows what's relevant.

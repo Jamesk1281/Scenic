@@ -22,6 +22,7 @@ writes out/route_fastest.geojson and out/route_scenic.geojson.
 """
 
 import json
+import math
 import sys
 from collections import defaultdict
 from functools import cached_property
@@ -210,7 +211,9 @@ class Router:
             if self.flip[k]:
                 c = c[::-1]
             coords.append(c)
-        return RouteResult(rows, stitch(coords))
+        # `coords` is the per-edge geometry in travel order; the steps generator
+        # uses it (with the edge names) to build maneuvers.
+        return RouteResult(rows, stitch(coords), coords)
 
 
 def stitch(coord_arrays):
@@ -222,10 +225,49 @@ def stitch(coord_arrays):
     return shapely.LineString(np.vstack(out))
 
 
+# --- Turn-by-turn maneuver helpers ------------------------------------------
+
+_COMPASS = ["north", "northeast", "east", "southeast",
+            "south", "southwest", "west", "northwest"]
+
+
+def _bearing(p, q):
+    """Compass bearing in degrees (0=N, 90=E) along the ground from lon/lat
+    point p to point q."""
+    lon1, lat1, lon2, lat2 = map(math.radians, [p[0], p[1], q[0], q[1]])
+    dlon = lon2 - lon1
+    y = math.sin(dlon) * math.cos(lat2)
+    x = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(dlon)
+    return (math.degrees(math.atan2(y, x)) + 360) % 360
+
+
+def _compass(bearing):
+    """Nearest of the 8 compass directions for a bearing."""
+    return _COMPASS[int((bearing + 22.5) % 360 // 45)]
+
+
+def _turn_phrase(bearing_in, bearing_out):
+    """Describe the turn from one heading to the next, e.g. 'Turn left'. A
+    positive change is a right turn (bearings increase clockwise)."""
+    delta = (bearing_out - bearing_in + 180) % 360 - 180   # -180..180
+    magnitude = abs(delta)
+    if magnitude < 20:
+        return "Continue"
+    side = "right" if delta > 0 else "left"
+    if magnitude < 45:
+        return f"Slight {side}"
+    if magnitude < 120:
+        return f"Turn {side}"
+    return f"Sharp {side}"
+
+
 class RouteResult:
-    def __init__(self, edge_rows: gpd.GeoDataFrame, line):
+    def __init__(self, edge_rows: gpd.GeoDataFrame, line, edge_coords=None):
         self.edges = edge_rows
         self.line = line
+        # Per-edge [lon, lat] arrays in travel order (parallel to edge_rows),
+        # used to build turn-by-turn steps. None for callers that don't need them.
+        self.edge_coords = edge_coords or []
 
     @cached_property
     def km(self):
@@ -249,6 +291,51 @@ class RouteResult:
             out[label] = float(length_km[self.edges[column] >= threshold].sum())
         return out
 
+    def steps(self):
+        """Turn-by-turn maneuvers for the client to follow.
+
+        Consecutive edges on the same road are merged into one "leg", then we
+        emit a step at the start of each: the first tells you which way to set
+        off, the rest are turns onto the next road, and a final step announces
+        arrival. Each step carries the coordinate of its maneuver and the
+        distance that instruction then carries you (the leg's length).
+        """
+        if not self.edge_coords:
+            return []
+        names = self.edges["name"].to_numpy()
+        refs = self.edges["ref"].to_numpy()
+        lengths = self.edges["length_m"].to_numpy()
+        label = lambda i: names[i] or refs[i] or "the road"
+
+        # Merge consecutive same-road edges into legs (label, coords, length).
+        legs = []
+        for i, pts in enumerate(self.edge_coords):
+            if legs and label(i) == legs[-1]["label"]:
+                legs[-1]["coords"].extend(pts[1:].tolist())   # drop shared vertex
+                legs[-1]["length_m"] += lengths[i]
+            else:
+                legs.append({"label": label(i), "coords": pts.tolist(),
+                             "length_m": float(lengths[i])})
+
+        steps = []
+        for i, leg in enumerate(legs):
+            pts = leg["coords"]
+            if i == 0:
+                instruction = f"Head {_compass(_bearing(pts[0], pts[1]))} on {leg['label']}"
+            else:
+                prev = legs[i - 1]["coords"]
+                phrase = _turn_phrase(_bearing(prev[-2], prev[-1]), _bearing(pts[0], pts[1]))
+                preposition = "on" if phrase == "Continue" else "onto"
+                instruction = f"{phrase} {preposition} {leg['label']}"
+            steps.append({"instruction": instruction,
+                          "lat": round(pts[0][1], 6), "lon": round(pts[0][0], 6),
+                          "distance_m": round(leg["length_m"])})
+
+        end = legs[-1]["coords"][-1]
+        steps.append({"instruction": "Arrive at your destination",
+                      "lat": round(end[1], 6), "lon": round(end[0], 6), "distance_m": 0})
+        return steps
+
     def geojson(self):
         return {
             "type": "Feature",
@@ -257,6 +344,7 @@ class RouteResult:
                 "km": round(self.km, 1), "minutes": round(self.minutes, 1),
                 "mean_score": round(self.mean_score, 2),
                 "scenery_km": {k: round(v, 1) for k, v in self.scenery_km().items()},
+                "steps": self.steps(),
             },
         }
 

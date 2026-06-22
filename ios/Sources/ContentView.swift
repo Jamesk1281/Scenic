@@ -26,7 +26,20 @@ struct ContentView: View {
     /// exists, then it rises to show the comparison.
     @State private var sheetHeight: PresentationDetent = .height(260)
 
+    /// Owns the user's location; only started once navigation begins.
+    @State private var locationManager = LocationManager()
+
     var body: some View {
+        // A live navigation session takes over the whole screen; otherwise we
+        // show the route-planning map and its bottom sheet.
+        if let nav = model.nav {
+            NavView(nav: nav, locationManager: locationManager) { model.endNavigation() }
+        } else {
+            planningView
+        }
+    }
+
+    private var planningView: some View {
         Map(position: $camera) {
             // Fastest route (gray, dashed) sits under the scenic route (green).
             if let fastest = model.response?.fastest {
@@ -122,6 +135,15 @@ struct RoutePanel: View {
                 }
                 if let response = model.response {
                     RouteResults(response: response)
+                    Button {
+                        model.startNavigation(response.scenic)
+                    } label: {
+                        Label("Start scenic drive", systemImage: "location.north.line.fill")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.scenic)
+                    .padding(.top, 4)
                 }
             }
             .padding(20)

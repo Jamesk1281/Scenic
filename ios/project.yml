@@ -17,6 +17,8 @@ targets:
         UILaunchScreen: {}
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
+        # Shown when navigation asks for location to follow the route.
+        NSLocationWhenInUseUsageDescription: "Scenic uses your location to follow your route, turn by turn, while you drive."
         # Allow http to the local Flask dev server (simulator -> host).
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
