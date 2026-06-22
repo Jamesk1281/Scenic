@@ -9,6 +9,7 @@ Scoring components (the per-segment "beauty vector"):
   farm    - adjacency to farmland/orchards/meadows
   views   - proximity to mapped viewpoints
   scenic  - explicit scenic=yes tag
+  urban   - proximity to town/village centers and retail/commercial districts
 
 The relief component is read from data/processed/relief.tif if present
 (run elevation.py first); otherwise it is zero and a notice is printed.
@@ -35,11 +36,18 @@ from common import CRS_METERS
 CHUNK_LEN = 400.0  # max road chunk length in meters
 
 # --- TUNABLE: distances (m), minimum polygon sizes (m^2), weights ---
-DIST = {"water": 120, "water_mid": 350, "coast": 800, "green": 80, "farm": 80, "view": 400}
+DIST = {
+    "water": 120, "water_mid": 350, "coast": 800, "green": 80, "farm": 80,
+    "view": 400,
+    # urban: full credit inside/near a retail-commercial district or close to a
+    # town-center node; partial credit out to place_mid (the town's wider orbit).
+    "urban": 100, "place": 500, "place_mid": 1200,
+}
 MIN_AREA = {"water": 20_000, "green": 30_000, "farm": 20_000}
 WEIGHTS = {
     "water": 0.22, "coast": 0.13, "green": 0.18, "curves": 0.13,
     "relief": 0.16, "farm": 0.06, "views": 0.05, "scenic_tag": 0.07,
+    "urban": 0.14,
 }
 STRETCH = 1.35           # expands the composite so great roads land near 10
 CURVE_FULL = 120.0       # deg/km that counts as maximally twisty
@@ -174,6 +182,8 @@ def main(processed_dir: str):
     green_tree = build_tree(load_layer(d, "green_areas"), MIN_AREA["green"])
     farm_tree = build_tree(load_layer(d, "farm_areas"), MIN_AREA["farm"])
     view_tree = build_tree(load_layer(d, "viewpoints"))
+    urban_tree = build_tree(load_layer(d, "urban_areas"))
+    place_tree = build_tree(load_layer(d, "place_points"))
 
     near_water = near_flags(water_tree, geoms, DIST["water"])
     mid_water = near_flags(water_tree, geoms, DIST["water_mid"])
@@ -186,6 +196,14 @@ def main(processed_dir: str):
     is_byway = name_l.apply(lambda s: any(b in s for b in BYWAY_NAMES))
     chunks["c_scenic_tag"] = (chunks["scenic"] | is_byway).astype(float)
     chunks["c_relief"] = sample_relief(chunks, d / "relief.tif")
+
+    # Townscape: full credit inside a retail/commercial district or close to a
+    # town-center node, tapering to partial credit across the town's wider orbit.
+    in_urban = near_flags(urban_tree, geoms, DIST["urban"])
+    near_place = near_flags(place_tree, geoms, DIST["place"])
+    mid_place = near_flags(place_tree, geoms, DIST["place_mid"])
+    chunks["c_urban"] = np.where(in_urban | near_place, 1.0,
+                                 np.where(mid_place, 0.5, 0.0))
     print(f"features computed in {time.time() - t0:.0f}s")
 
     # Composite score
@@ -198,6 +216,7 @@ def main(processed_dir: str):
         + WEIGHTS["farm"] * chunks["c_farm"]
         + WEIGHTS["views"] * chunks["c_views"]
         + WEIGHTS["scenic_tag"] * chunks["c_scenic_tag"]
+        + WEIGHTS["urban"] * chunks["c_urban"]
     )
     class_adj = chunks["highway"].map(CLASS_ADJ).fillna(0.0)
     unpaved_adj = np.where(chunks["surface"].isin(UNPAVED), UNPAVED_ADJ, 0.0)
@@ -237,6 +256,13 @@ def main(processed_dir: str):
             print(f"benchmark {label}: mean {sel['score'].mean():.2f} over {sel['length_m'].sum()/1000:.0f} km")
         else:
             print(f"benchmark {label}: no match")
+
+    # Townscape coverage: how much of the network the new urban component lit up,
+    # and how those town-center roads score on average.
+    urban = chunks[chunks["c_urban"] >= 1.0]
+    print(f"\nurban (c_urban=1): {len(urban):,} chunks, "
+          f"mean score {urban['score'].mean():.2f}, "
+          f"{urban['length_m'].sum() / 1000:.0f} km of network")
 
 
 if __name__ == "__main__":

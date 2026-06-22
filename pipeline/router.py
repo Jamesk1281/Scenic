@@ -53,6 +53,7 @@ SCENERY_BREAKDOWN = [
     ("water", "c_water", 0.5),
     ("hills", "c_relief", 0.5),
     ("farmland", "c_farm", 0.5),
+    ("town", "c_urban", 0.5),
 ]
 
 _TO_M = Transformer.from_crs(4326, CRS_METERS, always_xy=True)

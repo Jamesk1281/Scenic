@@ -8,6 +8,8 @@ Reads a Geofabrik state extract and writes GeoParquet layers:
   green_areas    - woods, forests, parks, reserves (MultiPolygon)
   farm_areas     - farmland, orchards, meadows (MultiPolygon)
   viewpoints     - tourism=viewpoint (Point)
+  place_points   - city/town/village/hamlet/square centers (Point)
+  urban_areas    - retail and commercial districts / downtowns (MultiPolygon)
 
 Usage: python extract.py <input.osm.pbf> <output_dir>
 """
@@ -33,6 +35,14 @@ WATER_LANDUSE = {"reservoir", "basin"}
 WATER_LINE = {"river", "canal"}
 FARM_LANDUSE = {"farmland", "orchard", "vineyard", "meadow"}
 
+# "Townscape" signal — the heart of a settlement and its main-street fabric.
+# PLACE_CENTERS are point nodes marking a town/village center; URBAN_LANDUSE are
+# the retail/commercial districts (downtowns, shopping streets). We deliberately
+# leave out `residential` (would reward generic suburbs) and `industrial` (ugly);
+# add "residential" here later if you want broader "urban fabric".
+PLACE_CENTERS = {"city", "town", "village", "hamlet", "square"}
+URBAN_LANDUSE = {"retail", "commercial"}
+
 
 class Handler(osmium.SimpleHandler):
     def __init__(self):
@@ -41,17 +51,24 @@ class Handler(osmium.SimpleHandler):
         self.water_lines = []
         self.coastline = []
         self.viewpoints = []
+        self.place_points = []
         self.water_areas = []
         self.green_areas = []
         self.farm_areas = []
+        self.urban_areas = []
         self.errors = 0
+
+    def _add_point(self, bucket, n):
+        try:
+            bucket.append({"wkb": WKB.create_point(n)})
+        except Exception:
+            self.errors += 1
 
     def node(self, n):
         if n.tags.get("tourism") == "viewpoint":
-            try:
-                self.viewpoints.append({"wkb": WKB.create_point(n)})
-            except Exception:
-                self.errors += 1
+            self._add_point(self.viewpoints, n)
+        elif n.tags.get("place") in PLACE_CENTERS:
+            self._add_point(self.place_points, n)
 
     def way(self, w):
         tags = w.tags
@@ -97,6 +114,8 @@ class Handler(osmium.SimpleHandler):
             bucket = self.green_areas
         elif tags.get("landuse") in FARM_LANDUSE:
             bucket = self.farm_areas
+        elif tags.get("landuse") in URBAN_LANDUSE:
+            bucket = self.urban_areas
         else:
             return
         try:
@@ -131,6 +150,8 @@ def main(pbf_path: str, out_dir: str):
         "green_areas": h.green_areas,
         "farm_areas": h.farm_areas,
         "viewpoints": h.viewpoints,
+        "place_points": h.place_points,
+        "urban_areas": h.urban_areas,
     }
     for name, rows in layers.items():
         gdf = to_gdf(rows)
