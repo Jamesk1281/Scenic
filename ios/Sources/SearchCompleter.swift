@@ -21,10 +21,7 @@ final class SearchCompleter: NSObject, MKLocalSearchCompleterDelegate {
         completer.delegate = self
         completer.resultTypes = [.address, .pointOfInterest]
         // Bias results toward Massachusetts so "northea" surfaces Northeastern.
-        completer.region = MKCoordinateRegion(
-            center: CLLocationCoordinate2D(latitude: 42.15, longitude: -71.8),
-            span: MKCoordinateSpan(latitudeDelta: 2.6, longitudeDelta: 2.6)
-        )
+        completer.region = .massachusetts
     }
 
     /// Refresh suggestions for the current text. Very short fragments are

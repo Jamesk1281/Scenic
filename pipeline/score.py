@@ -30,7 +30,7 @@ import shapely
 from shapely.ops import substring
 from shapely.strtree import STRtree
 
-CRS_METERS = 26986  # NAD83 / Massachusetts Mainland (meters)
+from common import CRS_METERS
 
 CHUNK_LEN = 400.0  # max road chunk length in meters
 

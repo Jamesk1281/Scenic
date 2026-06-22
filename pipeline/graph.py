@@ -26,23 +26,16 @@ import shapely
 from pyproj import Transformer
 from shapely.strtree import STRtree
 
-CRS_METERS = 26986
+from common import CRS_METERS, DRIVABLE, PRIVATE_ACCESS
 
-DRIVABLE = {
-    "motorway", "motorway_link", "trunk", "trunk_link",
-    "primary", "primary_link", "secondary", "secondary_link",
-    "tertiary", "tertiary_link", "unclassified", "residential",
-    "living_street",
-}
-PRIVATE_ACCESS = {"private", "no"}
+# Assumed driving speed (km/h) per road class, used to turn edge length into
+# travel time when OSM has no maxspeed tag.
 SPEED_KMH = {
     "motorway": 105, "motorway_link": 60, "trunk": 85, "trunk_link": 50,
     "primary": 65, "primary_link": 45, "secondary": 55, "secondary_link": 40,
     "tertiary": 50, "tertiary_link": 38, "unclassified": 45, "residential": 30,
     "living_street": 12,
 }
-COMPONENTS = ["c_water", "c_coast", "c_green", "c_curves", "c_relief",
-              "c_farm", "c_views", "c_scenic_tag"]
 
 
 def parse_maxspeed(v: str) -> float | None:
@@ -152,9 +145,14 @@ def main(pbf_path: str, processed_dir: str):
     idx = nearest if nearest.ndim == 1 else nearest[1]
     src = chunks.iloc[idx].reset_index(drop=True)
     edges["score"] = src["score"].values
-    for c in COMPONENTS:
+    # Carry every per-segment "beauty vector" column (c_water, c_coast, ...)
+    # from the nearest chunk onto the edge. Auto-detecting the c_-prefixed
+    # columns (rather than a hardcoded list) means a new component added in
+    # score.py flows through to the router with no change needed here.
+    component_cols = [c for c in chunks.columns if c.startswith("c_")]
+    for c in component_cols:
         edges[c] = src[c].values
-    print(f"scored edges in {time.time() - t0:.0f}s")
+    print(f"scored edges ({len(component_cols)} components) in {time.time() - t0:.0f}s")
 
     # --- keep largest connected component (undirected reachability) ---
     edges = largest_component(edges)

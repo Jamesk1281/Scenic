@@ -27,13 +27,16 @@ travel time for beauty via a single preference knob, and a native iOS app
 
 ```
 OSM PBF ─┐
-3DEP/Terrarium ─┼─> score.py ──> scored_chunks.parquet ─┐
-                │                                         ├─> graph.py ─> graph_*.parquet
-                │                                         │                     │
-                └─> elevation.py ─> relief.tif ──────────┘            router.py (Dijkstra)
-                                                                              │
+Terrarium tiles ─┼─> score.py ──> scored_chunks.parquet ─┐
+                 │                                         ├─> graph.py ─> graph_*.parquet
+                 │                                         │                     │
+                 └─> elevation.py ─> relief.tif ──────────┘            router.py (Dijkstra)
+                                                                               │
                                                           server/app.py (Flask API) ─> ios/ (SwiftUI app)
 ```
+
+`pipeline/common.py` holds the constants shared across these stages (what counts
+as a drivable road, the Massachusetts projection).
 
 ## Run the pipeline
 
@@ -75,3 +78,23 @@ terrain relief. A weighted blend (tunable constants at the top of `score.py`)
 produces a 0–10 composite, with penalties for highways and unpaved surfaces.
 The router charges a minutes-equivalent penalty per km of *unscenic* road, so the
 preference knob smoothly trades extra time for scenery.
+
+## Where the next features plug in
+
+Two planned features have seams already prepared in the code, so they can be
+added without re-architecting:
+
+- **Per-beauty-type preferences** (let a user weight coast vs. forest vs. hills).
+  `graph.py` already carries every component column (`c_water`, `c_coast`, …) onto
+  each edge, so the data is in place. The change lands in `router.py`: instead of
+  baking the penalty from the single composite `score`, blend the components with
+  the user's weights per edge. The exact spot is marked `SEAM` in
+  `Router._build_directed`.
+- **Turn-by-turn directions.** `Router._collect` returns the chosen edges *in
+  travel order*, each with its `name`/`ref`/`highway` and geometry. Walking that
+  sequence — watching for name changes and heading changes at junctions — is
+  enough to emit "turn onto X" maneuvers; no new graph data is required.
+
+The user-facing scenery labels live in one place per language: `SCENERY_BREAKDOWN`
+in `router.py` (server) and `RouteProps.sceneryBreakdown` in `Models.swift`
+(client). Keep those two in sync when adding a type.

@@ -20,15 +20,9 @@ import geopandas as gpd
 import osmium
 import pandas as pd
 
-WKB = osmium.geom.WKBFactory()
+from common import DRIVABLE, PRIVATE_ACCESS
 
-DRIVABLE = {
-    "motorway", "motorway_link", "trunk", "trunk_link",
-    "primary", "primary_link", "secondary", "secondary_link",
-    "tertiary", "tertiary_link", "unclassified", "residential",
-    "living_street",
-}
-PRIVATE_ACCESS = {"private", "no"}
+WKB = osmium.geom.WKBFactory()
 
 GREEN_NATURAL = {"wood"}
 GREEN_LANDUSE = {"forest"}

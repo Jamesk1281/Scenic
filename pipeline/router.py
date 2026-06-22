@@ -18,29 +18,49 @@ writes out/route_fastest.geojson and out/route_scenic.geojson.
 
 import json
 import sys
+from collections import defaultdict
 from functools import cached_property
 from pathlib import Path
 
 import geopandas as gpd
 import numpy as np
+import pandas as pd
 import shapely
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import dijkstra
 from scipy.spatial import cKDTree
 from pyproj import Transformer
 
+from common import CRS_METERS
+
 BETA = 7.0  # minutes-equivalent penalty per km of fully-unscenic road at pref=1
 ONEWAY_FWD = {"yes", "true", "1"}
 ONEWAY_REV = {"-1", "reverse"}
-COMPONENTS = ["c_water", "c_coast", "c_green", "c_curves", "c_relief",
-              "c_farm", "c_views", "c_scenic_tag"]
-_TO_M = Transformer.from_crs(4326, 26986, always_xy=True)
+
+# The user-facing "scenery breakdown": how many km of a route pass each kind of
+# landscape. This is a curated *subset* of the eight scoring components — only
+# the ones a driver would recognize as scenery (not curves/viewpoints/scenic
+# tags, which are quality signals rather than places you pass through). Each
+# entry is (label, edge column, threshold): a stretch of road counts toward a
+# label when that component is >= the threshold.
+#
+# The label strings are mirrored on the client in ios/Sources/Models.swift
+# (RouteProps.sceneryBreakdown), which also decides their display order — keep
+# the two label sets in sync.
+SCENERY_BREAKDOWN = [
+    ("coast", "c_coast", 0.5),
+    ("forest/park", "c_green", 0.5),
+    ("water", "c_water", 0.5),
+    ("hills", "c_relief", 0.5),
+    ("farmland", "c_farm", 0.5),
+]
+
+_TO_M = Transformer.from_crs(4326, CRS_METERS, always_xy=True)
 
 
 class Router:
     def __init__(self, processed_dir: str):
         d = Path(processed_dir)
-        import pandas as pd
         self.edges = gpd.read_parquet(d / "graph_edges.parquet")
         self.nodes = pd.read_parquet(d / "graph_nodes.parquet")
 
@@ -49,6 +69,10 @@ class Router:
         self.n = len(ids)
         nx, ny = _TO_M.transform(self.nodes["lon"].values, self.nodes["lat"].values)
         self._kdt = cKDTree(np.column_stack([nx, ny]))
+
+        # Lazily-built (tail, head) -> directed-edge-slot lookup, used to map a
+        # node path back to edges in _collect. Built on first route, then reused.
+        self._adj = None
 
         self._build_directed()
 
@@ -74,6 +98,17 @@ class Router:
         self.flip = np.concatenate(flip)
         km = e["length_m"].to_numpy() / 1000.0
         self.d_minutes = minutes[self.eidx]
+
+        # Penalty term, per directed edge: kilometers of road weighted by how
+        # *unscenic* it is (1 - score/10). _weights multiplies this by pref*BETA
+        # so a higher preference charges more "minutes" per km of ugly road.
+        #
+        # SEAM — future per-beauty-type preferences: this bakes the penalty from
+        # the single precomputed composite `score`. To let a user weight beauty
+        # types differently (more coast, less farmland), compute the score per
+        # edge here from the component columns (c_water, c_coast, ... already
+        # carried on every edge by graph.py) dotted with the user's weights,
+        # then derive d_penalty from that blended score instead.
         self.d_penalty = km[self.eidx] * (1.0 - np.clip(score[self.eidx], 0, 10) / 10.0)
 
     def _weights(self, pref: float) -> np.ndarray:
@@ -103,34 +138,42 @@ class Router:
         return self._collect(path)
 
     def _collect(self, path):
-        """Turn a node-index path into chosen undirected-edge rows + geometry."""
-        # map (tail,head) -> directed slot for quick lookup along the path
-        chosen = []
-        # build adjacency lookup once is heavy; instead, for each hop find the
-        # cheapest directed edge connecting the two nodes
-        from collections import defaultdict
-        if not hasattr(self, "_adj"):
+        """Turn a Dijkstra node path into the chosen edges, in travel order.
+
+        Dijkstra hands back a sequence of node indices. For each hop (a -> b) we
+        look up the directed edge(s) joining them and keep the fastest, then
+        gather that edge's row and geometry (reversed if we drove it backwards).
+        The edges come out in travel order, which is exactly what a future
+        turn-by-turn step list would walk over to emit "turn onto X" maneuvers.
+        """
+        # Build the (tail, head) -> directed-edge-slot lookup once, then cache
+        # it. Two nodes can be joined by more than one edge (parallel roads), so
+        # each key holds a list of slots and we pick the fastest per hop below.
+        if self._adj is None:
             adj = defaultdict(list)
             for k in range(len(self.tail)):
                 adj[(self.tail[k], self.head[k])].append(k)
             self._adj = adj
-        coords = []
+
+        chosen = []
         for a, b in zip(path[:-1], path[1:]):
             slots = self._adj.get((a, b))
             if not slots:
                 continue
-            k = min(slots, key=lambda s: self.d_minutes[s])
-            chosen.append(k)
+            chosen.append(min(slots, key=lambda s: self.d_minutes[s]))
+
+        # The undirected edge rows (stats, names, geometry) in travel order.
         rows = self.edges.iloc[[self.eidx[k] for k in chosen]]
-        # geometry in travel order
+
+        # Stitch the per-edge geometries into one line, flipping any edge we
+        # traversed against its stored direction so the points run start -> end.
+        coords = []
         for k in chosen:
-            geom = self.edges.geometry.values[self.eidx[k]]
-            c = shapely.get_coordinates(geom)
+            c = shapely.get_coordinates(self.edges.geometry.values[self.eidx[k]])
             if self.flip[k]:
                 c = c[::-1]
             coords.append(c)
-        line = stitch(coords)
-        return RouteResult(rows, line)
+        return RouteResult(rows, stitch(coords))
 
 
 def stitch(coord_arrays):
@@ -161,14 +204,12 @@ class RouteResult:
         return float((self.edges["score"] * L).sum() / max(L.sum(), 1))
 
     def scenery_km(self):
-        L = self.edges["length_m"] / 1000.0
+        """Kilometers of this route that pass each kind of scenery (the labels
+        in SCENERY_BREAKDOWN), for the breakdown bars in the app."""
+        length_km = self.edges["length_m"] / 1000.0
         out = {}
-        for label, col, thr in [
-            ("coast", "c_coast", 0.5), ("forest/park", "c_green", 0.5),
-            ("water", "c_water", 0.5), ("hills", "c_relief", 0.5),
-            ("farmland", "c_farm", 0.5),
-        ]:
-            out[label] = float(L[self.edges[col] >= thr].sum())
+        for label, column, threshold in SCENERY_BREAKDOWN:
+            out[label] = float(length_km[self.edges[column] >= threshold].sum())
         return out
 
     def geojson(self):

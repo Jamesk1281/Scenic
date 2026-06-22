@@ -20,12 +20,7 @@ struct ContentView: View {
 
     /// The map camera. Starts framed on Massachusetts; we refit it when a route
     /// comes back.
-    @State private var camera: MapCameraPosition = .region(
-        MKCoordinateRegion(
-            center: CLLocationCoordinate2D(latitude: 42.15, longitude: -71.8),
-            span: MKCoordinateSpan(latitudeDelta: 2.6, longitudeDelta: 2.6)
-        )
-    )
+    @State private var camera: MapCameraPosition = .region(.massachusetts)
 
     /// How tall the sheet is. Compact (just the search controls) until a route
     /// exists, then it rises to show the comparison.

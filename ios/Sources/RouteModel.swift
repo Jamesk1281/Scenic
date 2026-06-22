@@ -31,12 +31,6 @@ final class RouteModel {
     var isLoading = false
     var errorText: String?
 
-    /// Massachusetts, used to bias address search toward local results.
-    private static let maRegion = MKCoordinateRegion(
-        center: CLLocationCoordinate2D(latitude: 42.15, longitude: -71.8),
-        span: MKCoordinateSpan(latitudeDelta: 2.6, longitudeDelta: 2.6)
-    )
-
     init() {
         // Demo mode (launch with SCENIC_DEMO set) preloads a route via the real
         // search path, so a screenshot doubles as an end-to-end check.
@@ -55,7 +49,7 @@ final class RouteModel {
 
         let request = MKLocalSearch.Request()
         request.naturalLanguageQuery = trimmed
-        request.region = Self.maRegion
+        request.region = .massachusetts
         await resolve(request, label: trimmed, into: role)
     }
 
