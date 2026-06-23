@@ -11,14 +11,20 @@ travel time for beauty via a single preference knob, and a native iOS app
 ## Status
 
 - [x] Scoring pipeline: per-road-segment "beauty vector" (water, coastline,
-      forest/parks, curvature, terrain relief, farmland, viewpoints, scenic tags)
+      forest/parks, curvature, terrain relief, farmland, viewpoints, scenic tags,
+      town/urban)
 - [x] Terrain relief from free Terrarium elevation tiles
 - [x] Routable graph (~402k edges) split at intersections, scenic-scored
 - [x] Scenic router: Dijkstra with a time-vs-scenery preference knob
-- [x] iOS app (SwiftUI + MapKit) on the routing API (`ios/`, builds + runs)
+- [x] Per-beauty-type preferences — weight scenery types live per request
+- [x] iOS app (SwiftUI + MapKit): route planning, tunable scenery, turn-by-turn
+      live navigation with a switch-to-fastest escape hatch
 - [x] Scenic-byway calibration (Mohawk Trail, Jacob's Ladder)
 - [ ] Land cover (NLCD/ESA WorldCover) feature for better score accuracy
-- [ ] Host the API (small VPS) so the app works off-device (see `server/DEPLOY.md`)
+- [ ] More accurate travel times (currently free-flow: speed limit ÷ distance,
+      no stops or traffic — optimistic on short/local trips)
+- [ ] Host the API (spare laptop or VPS) so the app works off-device — see
+      [`server/DEPLOY.md`](server/DEPLOY.md)
 
 > The early MapLibre web demo was retired to focus on iOS; it lives in git
 > history (`git show 82044e2`) and is cheap to revive on the same API if needed.
@@ -60,8 +66,11 @@ curl -L -o data/raw/massachusetts-latest.osm.pbf \
 ## Run the API
 
 ```sh
-.venv/bin/python server/app.py        # serves the routing API on http://127.0.0.1:5057
+.venv/bin/python server/app.py        # local dev server on http://127.0.0.1:5057
 ```
+
+To *host* it (spare laptop or VPS, with a production server + tunnel), see
+[`server/DEPLOY.md`](server/DEPLOY.md) — that path runs `server/serve.py`.
 
 The iOS app (`ios/`, open in Xcode) calls `GET /api/route?from=LAT,LON&to=LAT,LON&pref=0..1`
 and renders the fastest vs scenic routes. Command-line equivalent:

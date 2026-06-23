@@ -31,8 +31,8 @@ from router import BEAUTY_TYPES, Router  # noqa: E402
 WEIGHT_MIN, WEIGHT_MAX = 0.0, 4.0
 
 # Where the prebuilt graph lives. An env var (not a CLI arg) so it works
-# identically when run directly (python server/app.py) or under gunicorn, which
-# owns sys.argv. Defaults to the repo's data/processed.
+# identically whether run directly (python server/app.py) or via the waitress
+# entrypoint (server/serve.py). Defaults to the repo's data/processed.
 PROCESSED = os.environ.get("SCENIC_DATA", str(ROOT / "data" / "processed"))
 
 app = Flask(__name__, static_folder=None)

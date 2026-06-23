@@ -105,4 +105,3 @@ put **Caddy** or **Cloudflare** in front for HTTPS.
   `https://api.jameskouvlis.com/api/route` endpoint — a live, clickable resume
   artifact backed by the laptop. (The old MapLibre demo lives in git history at
   commit `82044e2` and is cheap to revive on this API.)
-```
