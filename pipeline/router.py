@@ -92,10 +92,6 @@ class Router:
         nx, ny = _TO_M.transform(self.nodes["lon"].values, self.nodes["lat"].values)
         self._kdt = cKDTree(np.column_stack([nx, ny]))
 
-        # Lazily-built (tail, head) -> directed-edge-slot lookup, used to map a
-        # node path back to edges in _collect. Built on first route, then reused.
-        self._adj = None
-
         self._build_directed()
 
     def _build_directed(self):
@@ -143,6 +139,14 @@ class Router:
         self.pref_matrix = np.column_stack(
             [w * e[col].to_numpy() for _, _, col, w in BEAUTY_TYPES]
         )
+
+        # (tail, head) -> directed-edge slots, used in _collect to map a node
+        # path back to edges. Built once here (eagerly) so the server is fully
+        # warm after startup — no slow first request. Parallel roads mean a pair
+        # can hold several slots.
+        self._adj = defaultdict(list)
+        for k in range(len(self.tail)):
+            self._adj[(self.tail[k], self.head[k])].append(k)
 
     def _edge_scores(self, weights: dict) -> np.ndarray:
         """Per *undirected* edge 0-10 scenic score under the given beauty weights.
@@ -201,15 +205,6 @@ class Router:
         The edges come out in travel order, which is exactly what the
         turn-by-turn step list walks over to emit "turn onto X" maneuvers.
         """
-        # Build the (tail, head) -> directed-edge-slot lookup once, then cache
-        # it. Two nodes can be joined by more than one edge (parallel roads), so
-        # each key holds a list of slots and we pick the fastest per hop below.
-        if self._adj is None:
-            adj = defaultdict(list)
-            for k in range(len(self.tail)):
-                adj[(self.tail[k], self.head[k])].append(k)
-            self._adj = adj
-
         chosen = []
         for a, b in zip(path[:-1], path[1:]):
             slots = self._adj.get((a, b))

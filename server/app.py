@@ -14,10 +14,12 @@ BEAUTY_TYPES in router.py.
 Run:  python server/app.py [processed_dir]   (default: data/processed)
 """
 
+import os
 import sys
 from pathlib import Path
 
 from flask import Flask, jsonify, request
+from flask_compress import Compress
 from flask_cors import CORS
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -28,10 +30,17 @@ from router import BEAUTY_TYPES, Router  # noqa: E402
 # keeps one cranked slider from completely swamping the others.
 WEIGHT_MIN, WEIGHT_MAX = 0.0, 4.0
 
-PROCESSED = sys.argv[1] if len(sys.argv) > 1 else str(ROOT / "data" / "processed")
+# Where the prebuilt graph lives. An env var (not a CLI arg) so it works
+# identically when run directly (python server/app.py) or under gunicorn, which
+# owns sys.argv. Defaults to the repo's data/processed.
+PROCESSED = os.environ.get("SCENIC_DATA", str(ROOT / "data" / "processed"))
 
 app = Flask(__name__, static_folder=None)
 CORS(app)
+# Gzip responses. Route GeoJSON is large and very repetitive (coordinate
+# digits), so it compresses ~5x — which directly eases the home-upload
+# bottleneck when the server runs on a laptop behind a tunnel.
+Compress(app)
 
 print(f"loading graph from {PROCESSED} ...")
 ROUTER = Router(PROCESSED)

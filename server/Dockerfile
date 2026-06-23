@@ -16,7 +16,9 @@ WORKDIR /app
 COPY server/requirements-serve.txt .
 RUN pip install --no-cache-dir -r requirements-serve.txt
 
-COPY pipeline/router.py pipeline/
+# router.py imports common.py (shared constants) and score.py (WEIGHTS/STRETCH
+# it re-blends scores from), so all three must ship.
+COPY pipeline/router.py pipeline/common.py pipeline/score.py pipeline/
 COPY server/app.py server/
 COPY data/processed/graph_edges.parquet data/processed/graph_nodes.parquet data/processed/
 
