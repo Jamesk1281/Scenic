@@ -24,20 +24,26 @@ A laptop that stays on can be the backend, with a tunnel exposing it publicly
 without touching your router or opening any ports (the laptop dials *out* to
 Cloudflare, which relays traffic back — and provides HTTPS, which iOS requires).
 
-**One-time setup on the serving laptop:**
+**One-time setup on the serving laptop** (works on Windows, macOS, and Linux —
+the server uses waitress, which is cross-platform):
 
 ```sh
-git clone <repo> && cd Scenic
-python3 -m venv .venv
-.venv/bin/pip install -r server/requirements-serve.txt
-# copy the two graph parquets from your dev machine into data/processed/, e.g.:
-#   scp data/processed/graph_*.parquet you@laptop:~/Scenic/data/processed/
+# get the project + the two graph parquets into data/processed/ (any method:
+# git clone, AirDrop, copy/paste — the parquets are gitignored so copy them too)
+cd Scenic
+
+# macOS / Linux:
+python3 -m venv .venv && .venv/bin/pip install -r server/requirements-serve.txt
+
+# Windows (PowerShell):
+#   python -m venv .venv ; .venv\Scripts\pip install -r server\requirements-serve.txt
 ```
 
-**Run the API:**
+**Run the API** (warm and ready on `0.0.0.0:5057`):
 
 ```sh
-server/serve.sh            # gunicorn on 0.0.0.0:5057, warm and ready
+.venv/bin/python server/serve.py          # macOS / Linux
+# .venv\Scripts\python server\serve.py    # Windows
 ```
 
 **Expose it** (second terminal). Quick, throwaway URL for testing:
@@ -53,22 +59,17 @@ want it permanent: add the domain to a free Cloudflare account, then
 to `http://localhost:5057`, and run `cloudflared tunnel run scenic`. Cloudflare's
 docs walk it step by step.
 
-**Keep it running across reboots/crashes (macOS launchd).** Save this as
-`~/Library/LaunchAgents/app.scenic.api.plist`, edit the paths, then
-`launchctl load` it:
+**Keep it running across reboots/crashes, and stop the laptop sleeping:**
 
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<plist version="1.0"><dict>
-  <key>Label</key>            <string>app.scenic.api</string>
-  <key>ProgramArguments</key> <array><string>/Users/YOU/Scenic/server/serve.sh</string></array>
-  <key>KeepAlive</key>        <true/>   <!-- restart if it dies -->
-  <key>RunAtLoad</key>        <true/>   <!-- start on login -->
-</dict></plist>
-```
-
-(Do the same for `cloudflared tunnel run scenic` so the tunnel comes up too.)
-Also set the laptop to never sleep on power: System Settings → Battery → Options.
+- **Windows:** the simplest is **Task Scheduler** — create a task that runs
+  `…\.venv\Scripts\python …\server\serve.py` "at log on" with "restart on
+  failure", and a second one for the `cloudflared` command. Then Settings →
+  System → Power → set "When plugged in, turn off screen / sleep" to **Never**.
+  (For a hands-off service that runs even when logged out, [NSSM](https://nssm.cc)
+  wraps either command as a Windows service.)
+- **macOS:** a `launchd` agent in `~/Library/LaunchAgents/` with `RunAtLoad` +
+  `KeepAlive` running `…/server/serve.py`, plus System Settings → Battery →
+  Options → never sleep on power.
 
 ## Option B — Docker
 
@@ -79,23 +80,21 @@ docker run -p 5057:5057 --restart unless-stopped scenic-api
 
 ## Option C — Bare VPS
 
-Same as the laptop, minus the tunnel. Run `server/serve.sh` (or the gunicorn
-line inside it) under systemd, and put **Caddy** or **Cloudflare** in front for
-HTTPS.
+Same as the laptop, minus the tunnel. Run `server/serve.py` under systemd, and
+put **Caddy** or **Cloudflare** in front for HTTPS.
 
 ## Notes
 
-- **One worker.** Each gunicorn worker loads the full graph (~1–1.5 GB
-  resident), so `serve.sh` uses `--workers 1 --threads 4`: threads let requests
-  overlap (scipy releases the GIL during routing) without a second copy of the
-  graph. Add workers only if you have RAM to spare. ~2 GB RAM is plenty.
+- **One process, a few threads.** waitress loads the ~1–1.5 GB graph once and
+  serves with 4 threads; scipy releases the GIL during routing, so requests
+  overlap without a second copy of the graph. ~2 GB RAM is plenty.
 - **Responses are gzipped** (`flask-compress`), ~3–4× smaller. Route GeoJSON is
   large and repetitive, and on a home connection your *upload* bandwidth is the
   real ceiling — compression multiplies how many routes the laptop can serve.
 - **Warm at startup.** The graph and its lookups are built when the server boots,
   so the first request is already fast (no cold penalty after a restart).
 - **Data location** comes from the `SCENIC_DATA` env var (default
-  `data/processed`); it's not a CLI arg, so it works the same under gunicorn.
+  `data/processed`); set it only if your parquets live elsewhere.
 
 ## Pointing the clients at it
 

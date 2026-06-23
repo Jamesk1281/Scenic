@@ -19,10 +19,9 @@ RUN pip install --no-cache-dir -r requirements-serve.txt
 # router.py imports common.py (shared constants) and score.py (WEIGHTS/STRETCH
 # it re-blends scores from), so all three must ship.
 COPY pipeline/router.py pipeline/common.py pipeline/score.py pipeline/
-COPY server/app.py server/
+COPY server/app.py server/serve.py server/
 COPY data/processed/graph_edges.parquet data/processed/graph_nodes.parquet data/processed/
 
 EXPOSE 5057
-# gunicorn with a long timeout; the graph loads once per worker at boot.
-CMD ["gunicorn", "--chdir", "server", "--workers", "1", "--threads", "4", \
-     "--timeout", "120", "--bind", "0.0.0.0:5057", "app:app"]
+# waitress (cross-platform); the graph loads once at startup.
+CMD ["python", "server/serve.py"]

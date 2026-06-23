@@ -8,4 +8,4 @@ pyproj
 flask
 flask-cors
 flask-compress
-gunicorn
+waitress
