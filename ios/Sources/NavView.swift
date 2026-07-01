@@ -39,6 +39,13 @@ struct NavView: View {
             if nav.arrived {
                 Text("You've arrived 🎉").font(.title2.bold())
                     .frame(maxWidth: .infinity)
+            } else if locationManager.authorization == .denied
+                        || locationManager.authorization == .restricted {
+                // Without location we can't follow the drive at all — say so
+                // instead of sitting silently on the first instruction.
+                Label("Location access is off — allow it in Settings to navigate.",
+                      systemImage: "location.slash")
+                    .font(.subheadline).frame(maxWidth: .infinity)
             } else if nav.isRerouting {
                 Label("Rerouting…", systemImage: "arrow.triangle.2.circlepath")
                     .font(.headline).frame(maxWidth: .infinity)

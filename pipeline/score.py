@@ -55,7 +55,8 @@ RELIEF_FULL = 160.0      # local relief (m within ~1 km) that counts as maximal
 CLASS_ADJ = {
     "motorway": -0.45, "motorway_link": -0.40, "trunk": -0.10, "trunk_link": -0.18,
     "primary": -0.04, "primary_link": -0.10, "secondary": 0.0, "secondary_link": -0.10,
-    "tertiary": 0.0, "unclassified": 0.0, "residential": -0.05, "living_street": -0.08,
+    "tertiary": 0.0, "tertiary_link": -0.05, "unclassified": 0.0,
+    "residential": -0.05, "living_street": -0.08,
 }
 UNPAVED = {"unpaved", "dirt", "gravel", "ground", "grass", "sand", "earth", "mud", "fine_gravel"}
 UNPAVED_ADJ = -0.25

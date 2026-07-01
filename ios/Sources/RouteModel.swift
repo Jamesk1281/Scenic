@@ -45,6 +45,11 @@ final class RouteModel {
     var isLoading = false
     var errorText: String?
 
+    /// Ticks up on every route request, so a slow response that comes back
+    /// after a newer request has started can be recognized as stale and
+    /// dropped — otherwise the older route could overwrite the newer one.
+    private var requestGeneration = 0
+
     /// The live navigation session, non-nil while the user is driving a route.
     /// The screen switches to the nav view whenever this is set.
     var nav: NavigationModel?
@@ -139,15 +144,20 @@ final class RouteModel {
     func computeRoute() async {
         guard let a = start, let b = end else { return }
 
+        requestGeneration += 1
+        let generation = requestGeneration
         isLoading = true
         errorText = nil
-        defer { isLoading = false }
 
         do {
-            response = try await RouteService.route(from: a, to: b, pref: pref, weights: weights)
+            let result = try await RouteService.route(from: a, to: b, pref: pref, weights: weights)
+            guard generation == requestGeneration else { return }   // a newer request superseded us
+            response = result
         } catch {
+            guard generation == requestGeneration else { return }
             response = nil
             errorText = error.localizedDescription
         }
+        isLoading = false
     }
 }
