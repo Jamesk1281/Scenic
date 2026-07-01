@@ -6,7 +6,12 @@ state from **open geodata only** (no Google/Apple data), a routing engine trades
 travel time for beauty via a single preference knob, and a native iOS app
 (SwiftUI + MapKit) is the front end on top of the routing API.
 
-![heatmap](out/ma_scenic_heatmap.png)
+![heatmap](docs/ma_scenic_heatmap.png)
+
+<!-- docs/ holds committed showcase images (out/ is gitignored build output;
+     referencing it here would render a broken image on GitHub). Refresh with:
+     sips -Z 1800 out/ma_scenic_heatmap.png --out docs/ma_scenic_heatmap.png -->
+
 
 ## Status
 
@@ -90,19 +95,21 @@ preference knob smoothly trades extra time for scenery.
 
 ## Where the next features plug in
 
-Two planned features have seams already prepared in the code, so they can be
-added without re-architecting:
+The component pipeline is deliberately open-ended: `score.py` writes every
+`c_<component>` column it computes, `graph.py` auto-detects those columns and
+carries them onto edges, and `router.py` re-blends them live per request. So:
 
-- **Per-beauty-type preferences** (let a user weight coast vs. forest vs. hills).
-  `graph.py` already carries every component column (`c_water`, `c_coast`, …) onto
-  each edge, so the data is in place. The change lands in `router.py`: instead of
-  baking the penalty from the single composite `score`, blend the components with
-  the user's weights per edge. The exact spot is marked `SEAM` in
-  `Router._build_directed`.
-- **Turn-by-turn directions.** `Router._collect` returns the chosen edges *in
-  travel order*, each with its `name`/`ref`/`highway` and geometry. Walking that
-  sequence — watching for name changes and heading changes at junctions — is
-  enough to emit "turn onto X" maneuvers; no new graph data is required.
+- **A new scenery signal** (e.g. land cover from NLCD/ESA WorldCover) is one new
+  `c_...` column plus a `WEIGHTS` entry in `score.py`, then a score + graph
+  rebuild. Add it to `BEAUTY_TYPES` in `router.py` only if users should be able
+  to tune it (otherwise list it in `BASELINE`).
+- **More realistic travel times** land in `graph.py` (the `minutes` column):
+  free-flow speed is optimistic on local roads; a small per-junction stop
+  penalty is the cheap first fix, real traffic data the expensive one.
+- **A second region** is the same pipeline run on another Geofabrik extract.
+  The MA-specific bits to generalize: the projection in `common.py`, the BBOX
+  in `elevation.py`, the byway names in `score.py`, and the
+  `Region.massachusetts` search bias in the iOS app.
 
 The user-facing scenery labels live in one place per language: `SCENERY_BREAKDOWN`
 in `router.py` (server) and `RouteProps.sceneryBreakdown` in `Models.swift`

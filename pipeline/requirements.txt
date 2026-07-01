@@ -12,3 +12,5 @@ requests
 pillow
 flask
 flask-cors
+flask-compress
+waitress

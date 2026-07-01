@@ -7,9 +7,8 @@
 # at runtime with -v $(pwd)/data:/app/data and drop the COPY data line.
 FROM python:3.11-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgdal-dev gdal-bin && rm -rf /var/lib/apt/lists/*
-
+# No system GDAL needed: the server only reads parquet (pyarrow) and does
+# geometry via shapely/pyproj, whose wheels bundle their own native libs.
 WORKDIR /app
 
 # Runtime-only deps (no osmium/matplotlib needed to *serve* routes)

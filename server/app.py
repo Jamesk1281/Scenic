@@ -30,6 +30,11 @@ from router import BEAUTY_TYPES, Router  # noqa: E402
 # keeps one cranked slider from completely swamping the others.
 WEIGHT_MIN, WEIGHT_MAX = 0.0, 4.0
 
+# Reject a request whose endpoint snaps farther than this from any road node —
+# it's outside the covered region (currently Massachusetts), and the "nearest"
+# node would be an arbitrary border town, yielding a nonsense route.
+SNAP_MAX_M = 5000.0
+
 # Where the prebuilt graph lives. An env var (not a CLI arg) so it works
 # identically whether run directly (python server/app.py) or via the waitress
 # entrypoint (server/serve.py). Defaults to the repo's data/processed.
@@ -72,15 +77,22 @@ def api_route():
     except (KeyError, ValueError):
         return jsonify(error="need from=lat,lon&to=lat,lon[&pref=0..1][&w_<type>=...]"), 400
 
-    s = ROUTER.snap(*a)
-    t = ROUTER.snap(*b)
+    s, s_off = ROUTER.snap(*a)
+    t, t_off = ROUTER.snap(*b)
+    if max(s_off, t_off) > SNAP_MAX_M:
+        return jsonify(error="point is outside the covered road network "
+                             "(currently Massachusetts)"), 400
     if s == t:
         return jsonify(error="start and end snap to the same point"), 400
 
     # Fastest ignores beauty weights (pref 0 zeroes the scenery term anyway);
     # the scenic route applies the user's overall strength and per-type weights.
+    # At pref 0 the scenic weights collapse to the fastest ones, so reuse that
+    # result instead of running Dijkstra twice — this halves the latency of
+    # mid-drive "switch to fastest" reroutes.
+    pref = max(0.0, min(1.0, pref))
     fastest = ROUTER.route(s, t, 0.0)
-    scenic = ROUTER.route(s, t, max(0.0, min(1.0, pref)), weights)
+    scenic = fastest if pref == 0.0 else ROUTER.route(s, t, pref, weights)
     if fastest is None or scenic is None:
         return jsonify(error="no route found between those points"), 404
     return jsonify(fastest=fastest.geojson(), scenic=scenic.geojson())

@@ -30,6 +30,11 @@ final class NavigationModel {
     private var pref: Double
     private let weights: [String: Double]
 
+    /// When the last reroute was attempted. Off-route checks run on every GPS
+    /// tick (~every 5 m), so without a cooldown a failed reroute — server briefly
+    /// unreachable, say — would retry several times a second.
+    private var lastRerouteAttempt: Date = .distantPast
+
     init(route: RouteFeature, destination: CLLocationCoordinate2D,
          pref: Double, weights: [String: Double]) {
         self.route = route
@@ -49,7 +54,13 @@ final class NavigationModel {
     func update(_ location: CLLocation) {
         guard !steps.isEmpty, !arrived else { return }
 
-        if location.distance(to: destination) < 40 {
+        // Arrived when close to the searched destination — or to the route's
+        // own final point. The two can differ: the search pin may sit off-road
+        // (a town green, a mall's rooftop), while the route necessarily ends at
+        // the nearest road node. Without the second check a driver could reach
+        // the end of the line yet never trigger arrival.
+        let routeEnd = steps[steps.count - 1].coordinate
+        if location.distance(to: destination) < 40 || location.distance(to: routeEnd) < 40 {
             arrived = true
             return
         }
@@ -64,7 +75,10 @@ final class NavigationModel {
 
         // Strayed well off the line — re-route from here, keeping the same
         // scenic intent (or fastest, if that's what we're already following).
-        if !isRerouting, distanceToPolyline(location.coordinate, route.coordinates) > 60 {
+        // The cooldown stops a failed attempt from retrying on every GPS tick.
+        if !isRerouting,
+           Date().timeIntervalSince(lastRerouteAttempt) > 8,
+           distanceToPolyline(location.coordinate, route.coordinates) > 60 {
             Task { await reroute(from: location.coordinate) }
         }
     }
@@ -80,6 +94,7 @@ final class NavigationModel {
 
     private func reroute(from origin: CLLocationCoordinate2D) async {
         isRerouting = true
+        lastRerouteAttempt = Date()
         defer { isRerouting = false }
 
         guard let response = try? await RouteService.route(

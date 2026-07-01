@@ -167,9 +167,16 @@ class Router:
         penalty = self.km * (1.0 - score / 10.0)            # km of "unscenic" road
         return self.d_minutes + pref * BETA * penalty[self.eidx]
 
-    def snap(self, lat: float, lon: float) -> int:
+    def snap(self, lat: float, lon: float) -> tuple[int, float]:
+        """Nearest graph node to a lat/lon: (node index, distance in meters).
+
+        The distance lets callers reject points that aren't really on the
+        network — e.g. a request from outside Massachusetts would otherwise
+        silently snap to a border town and return a nonsense route.
+        """
         x, y = _TO_M.transform(lon, lat)
-        return int(self._kdt.query([x, y])[1])
+        dist, idx = self._kdt.query([x, y])
+        return int(idx), float(dist)
 
     def route(self, src_idx: int, dst_idx: int, pref: float, weights: dict = None):
         w = self._weights(pref, weights or {})
@@ -258,10 +265,15 @@ def _compass(bearing):
     return _COMPASS[int((bearing + 22.5) % 360 // 45)]
 
 
+def _turn_delta(bearing_in, bearing_out):
+    """Signed heading change in degrees, -180..180. Positive = right turn
+    (bearings increase clockwise)."""
+    return (bearing_out - bearing_in + 180) % 360 - 180
+
+
 def _turn_phrase(bearing_in, bearing_out):
-    """Describe the turn from one heading to the next, e.g. 'Turn left'. A
-    positive change is a right turn (bearings increase clockwise)."""
-    delta = (bearing_out - bearing_in + 180) % 360 - 180   # -180..180
+    """Describe the turn from one heading to the next, e.g. 'Turn left'."""
+    delta = _turn_delta(bearing_in, bearing_out)
     magnitude = abs(delta)
     if magnitude < 20:
         return "Continue"
@@ -320,14 +332,22 @@ class RouteResult:
         label = lambda i: names[i] or refs[i] or "the road"
 
         # Merge consecutive same-road edges into legs (label, coords, length).
+        # Same label alone isn't enough to merge: a road can turn sharply at a
+        # junction while keeping its name (and two different unnamed roads both
+        # label as "the road"), and a silent merge there would swallow a real
+        # turn. So a sharp heading change at the seam always starts a new leg.
         legs = []
         for i, pts in enumerate(self.edge_coords):
             if legs and label(i) == legs[-1]["label"]:
-                legs[-1]["coords"].extend(pts[1:].tolist())   # drop shared vertex
-                legs[-1]["length_m"] += lengths[i]
-            else:
-                legs.append({"label": label(i), "coords": pts.tolist(),
-                             "length_m": float(lengths[i])})
+                prev = legs[-1]["coords"]
+                seam_turn = _turn_delta(_bearing(prev[-2], prev[-1]),
+                                        _bearing(pts[0], pts[1]))
+                if abs(seam_turn) < 45:
+                    legs[-1]["coords"].extend(pts[1:].tolist())   # drop shared vertex
+                    legs[-1]["length_m"] += lengths[i]
+                    continue
+            legs.append({"label": label(i), "coords": pts.tolist(),
+                         "length_m": float(lengths[i])})
 
         steps = []
         for i, leg in enumerate(legs):
@@ -335,10 +355,17 @@ class RouteResult:
             if i == 0:
                 instruction = f"Head {_compass(_bearing(pts[0], pts[1]))} on {leg['label']}"
             else:
-                prev = legs[i - 1]["coords"]
-                phrase = _turn_phrase(_bearing(prev[-2], prev[-1]), _bearing(pts[0], pts[1]))
-                preposition = "on" if phrase == "Continue" else "onto"
-                instruction = f"{phrase} {preposition} {leg['label']}"
+                prev = legs[i - 1]
+                phrase = _turn_phrase(_bearing(prev["coords"][-2], prev["coords"][-1]),
+                                      _bearing(pts[0], pts[1]))
+                if phrase == "Continue":
+                    instruction = f"Continue on {leg['label']}"
+                elif leg["label"] == "the road":
+                    instruction = phrase                       # "Turn left" — no useful name
+                elif leg["label"] == prev["label"]:
+                    instruction = f"{phrase} to stay on {leg['label']}"
+                else:
+                    instruction = f"{phrase} onto {leg['label']}"
             steps.append({"instruction": instruction,
                           "lat": round(pts[0][1], 6), "lon": round(pts[0][0], 6),
                           "distance_m": round(leg["length_m"])})
@@ -364,8 +391,8 @@ class RouteResult:
 def main(processed_dir, a, b, pref=1.0):
     r = Router(processed_dir)
     (lat1, lon1), (lat2, lon2) = parse_ll(a), parse_ll(b)
-    s, t = r.snap(lat1, lon1), r.snap(lat2, lon2)
-    print(f"snapped to node idx {s} -> {t}")
+    (s, s_off), (t, t_off) = r.snap(lat1, lon1), r.snap(lat2, lon2)
+    print(f"snapped to node idx {s} ({s_off:.0f} m off) -> {t} ({t_off:.0f} m off)")
 
     fast = r.route(s, t, 0.0)
     scenic = r.route(s, t, float(pref))

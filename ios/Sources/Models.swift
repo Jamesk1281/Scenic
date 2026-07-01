@@ -59,8 +59,10 @@ struct RouteProps: Decodable {
 
     /// The scenery features in display order, dropping any the route never
     /// actually touches (0 km), so the breakdown only shows what's relevant.
+    /// Keep this list in sync with SCENERY_BREAKDOWN in pipeline/router.py —
+    /// a label missing here silently vanishes from the app's breakdown.
     var sceneryBreakdown: [(label: String, km: Double)] {
-        let displayOrder = ["forest/park", "water", "coast", "hills", "farmland"]
+        let displayOrder = ["forest/park", "water", "coast", "hills", "farmland", "town"]
         return displayOrder.compactMap { key in
             guard let km = scenery_km[key], km > 0 else { return nil }
             return (key, km)

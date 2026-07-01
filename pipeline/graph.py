@@ -78,6 +78,14 @@ class GraphHandler(osmium.SimpleHandler):
         if len(ids) < 2:
             return
         oneway = w.tags.get("oneway", "")
+        # OSM convention: roundabouts and motorways are one-way even when no
+        # oneway tag is present (mappers rely on the implication). MA has ~160
+        # untagged rotary ways; without this rule the router would happily send
+        # a driver the wrong way around one.
+        if not oneway and (
+            w.tags.get("junction") in ("roundabout", "circular") or hw == "motorway"
+        ):
+            oneway = "yes"
         meta = {
             "highway": hw,
             "name": w.tags.get("name", ""),
