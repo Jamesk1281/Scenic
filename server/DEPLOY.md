@@ -33,11 +33,16 @@ the server uses waitress, which is cross-platform):
 cd Scenic
 
 # macOS / Linux:
-python3 -m venv .venv && .venv/bin/pip install -r server/requirements-serve.txt
+python3 -m venv .venv
+.venv/bin/python -m pip install -r server/requirements-serve.txt
 
 # Windows (PowerShell):
-#   python -m venv .venv ; .venv\Scripts\pip install -r server\requirements-serve.txt
+#   python -m venv .venv ; .venv\Scripts\python -m pip install -r server\requirements-serve.txt
 ```
+
+(`python -m pip` rather than the `pip` script: a venv's console scripts hard-code
+their interpreter path, so they break if the project folder is ever moved or has
+a space in its name.)
 
 **Run the API** (warm and ready on `0.0.0.0:5057`):
 
@@ -85,9 +90,13 @@ put **Caddy** or **Cloudflare** in front for HTTPS.
 
 ## Notes
 
-- **One process, a few threads.** waitress loads the ~1–1.5 GB graph once and
-  serves with 4 threads; scipy releases the GIL during routing, so requests
-  overlap without a second copy of the graph. ~2 GB RAM is plenty.
+- **One process, a few threads.** waitress loads the graph once (~1.7 GB
+  resident, measured) and serves with 4 threads; scipy releases the GIL during
+  routing, so requests overlap without a second copy of the graph. Give it 2.5 GB.
+- **~85 ms per route**, so a request for both options lands under 200 ms. Nearly
+  all of that is the Dijkstra itself, which solves to every node in the state;
+  point-to-point search (A*/bidirectional) is where a further speedup would come
+  from, if it is ever needed.
 - **Responses are gzipped** (`flask-compress`), ~3–4× smaller. Route GeoJSON is
   large and repetitive, and on a home connection your *upload* bandwidth is the
   real ceiling — compression multiplies how many routes the laptop can serve.

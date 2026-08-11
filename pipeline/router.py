@@ -3,7 +3,7 @@
 Loads graph_edges/graph_nodes, expands directed edges (honoring oneway), and
 runs a Dijkstra whose edge weight blends travel time with an "unscenic" penalty:
 
-    weight = minutes + pref * BETA * km * (1 - score/10)
+    weight = minutes + pref**PREF_CURVE * BETA * km * (1 - score/10)
 
 The penalty is a minutes-equivalent cost charged per kilometer of *unscenic*
 road (BETA min/km at full ugliness), so the router trades extra distance for
@@ -38,9 +38,19 @@ from scipy.spatial import cKDTree
 from pyproj import Transformer
 
 from common import CRS_METERS
-from score import STRETCH, WEIGHTS
+from score import WEIGHTS, composite
 
 BETA = 7.0  # minutes-equivalent penalty per km of fully-unscenic road at pref=1
+
+# The scenery penalty saturates — past a few minutes-per-km the router has taken
+# every detour worth taking — which used to leave the slider's top half handing
+# back an identical route. Most of that was really the compressed score scale
+# (see RAW_BASE in score.py): with the full 0-10 range in play the penalty
+# discriminates enough that a near-linear slider already spreads well. This mild
+# exponent evens out what remains. Measured over four routes, exponents above
+# ~1.5 overcorrect, trading the dead top for a dead bottom.
+PREF_CURVE = 1.3
+
 ONEWAY_FWD = {"yes", "true", "1"}
 ONEWAY_REV = {"-1", "reverse"}
 
@@ -153,19 +163,21 @@ class Router:
 
         `weights` maps a BEAUTY_TYPES api-name to a multiplier (1.0 = the
         calibrated default, >1 leans in, 0 ignores); missing types default to
-        1.0. The math mirrors score.py: blend the components, stretch, add the
-        road-class/surface adjustment, clamp to 0-10. At all-1.0 weights this
-        equals the precomputed `score` column exactly.
+        1.0. Blending the components is the only part done here — the 0-10
+        transform is score.py's `composite`, imported rather than re-derived so
+        the live score and the precomputed column cannot drift apart. At
+        all-1.0 weights this equals the precomputed `score` column exactly.
         """
         w = np.array([weights.get(name, 1.0) for name, *_ in BEAUTY_TYPES])
         raw = self.base_score + self.pref_matrix @ w
-        return 10.0 * np.clip(raw * STRETCH + self.score_adj, 0.0, 1.0)
+        return composite(raw, self.score_adj)
 
     def _weights(self, pref: float, weights: dict) -> np.ndarray:
         """Directed-edge Dijkstra weights: travel time + a scenery detour cost."""
         score = self._edge_scores(weights)                  # per undirected edge
         penalty = self.km * (1.0 - score / 10.0)            # km of "unscenic" road
-        return self.d_minutes + pref * BETA * penalty[self.eidx]
+        strength = pref ** PREF_CURVE
+        return self.d_minutes + strength * BETA * penalty[self.eidx]
 
     def snap(self, lat: float, lon: float) -> tuple[int, float]:
         """Nearest graph node to a lat/lon: (node index, distance in meters).

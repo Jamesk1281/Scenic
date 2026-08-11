@@ -1,5 +1,12 @@
 import CoreLocation
 
+extension Double {
+    /// The backend speaks metric; the app is Massachusetts-only, so every
+    /// distance the user sees is in miles. Converted at the view layer so the
+    /// numbers coming off the API stay in their original units.
+    var milesFromKm: Double { self * 0.621371 }
+}
+
 extension CLLocation {
     /// Straight-line distance in meters from this location to a coordinate.
     func distance(to coordinate: CLLocationCoordinate2D) -> Double {

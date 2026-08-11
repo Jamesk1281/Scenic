@@ -25,9 +25,12 @@ travel time for beauty via a single preference knob, and a native iOS app
 - [x] iOS app (SwiftUI + MapKit): route planning, tunable scenery, turn-by-turn
       live navigation with a switch-to-fastest escape hatch
 - [x] Scenic-byway calibration (Mohawk Trail, Jacob's Ladder)
+- [x] Scoring calibrated against the score distribution, with tests that guard
+      it (`tests/`) — see [How scoring works](#how-scoring-works)
 - [ ] Land cover (NLCD/ESA WorldCover) feature for better score accuracy
 - [ ] More accurate travel times (currently free-flow: speed limit ÷ distance,
-      no stops or traffic — optimistic on short/local trips)
+      no stops or traffic — measured 10-25% optimistic against real drive times,
+      and worst on the surface roads scenic routes prefer)
 - [ ] Host the API (spare laptop or VPS) so the app works off-device — see
       [`server/DEPLOY.md`](server/DEPLOY.md)
 
@@ -52,7 +55,8 @@ as a drivable road, the Massachusetts projection).
 ## Run the pipeline
 
 ```sh
-python3 -m venv .venv && .venv/bin/pip install -r pipeline/requirements.txt
+python3 -m venv .venv
+.venv/bin/python -m pip install -r pipeline/requirements.txt
 
 # 1. data (free): MA OpenStreetMap extract
 curl -L -o data/raw/massachusetts-latest.osm.pbf \
@@ -91,7 +95,36 @@ coastline, forest/parks, farmland and viewpoints, plus road curvature and local
 terrain relief. A weighted blend (tunable constants at the top of `score.py`)
 produces a 0–10 composite, with penalties for highways and unpaved surfaces.
 The router charges a minutes-equivalent penalty per km of *unscenic* road, so the
-preference knob smoothly trades extra time for scenery.
+preference knob trades extra time for scenery.
+
+Every constant in that blend is fitted to the *distribution* it produces, not
+guessed, because a single number silently reshapes 66,000 km of road. `score.py`
+prints a calibration report on each run — scale percentiles, per-component
+coverage, and benchmark roads — and the current numbers are: median road 4.0,
+p90 6.8, p99 9.2, with Greylock's Notch Road at 6.6 and the Mass Pike at 0.6.
+Three things that report is specifically there to catch, all of which were live
+at some point:
+
+- **a component pinned at its ceiling** — curvature is measured between chords
+  60 m apart rather than between raw ~20 m OSM vertices, because summing
+  vertex-to-vertex heading change measures digitizing jitter (it reached 3,500
+  deg/km, ten rotations per kilometre) and rated cul-de-sacs above the Mohawk
+  Trail;
+- **a component with no range left** — relief is scaled to Massachusetts
+  terrain, not alpine, or the Hills slider has nothing to grab;
+- **a compressed scale** — no real road collects every component, so the blend
+  needs an explicit stretch or "8/10" is unreachable.
+
+## Tests
+
+```sh
+.venv/bin/python -m pip install pytest
+.venv/bin/python -m pytest tests/
+```
+
+The geometry and scoring maths run anywhere; the calibration, routing and API
+tests need a built graph and skip cleanly without one. Point them at a graph
+elsewhere with `SCENIC_DATA=/path/to/processed`.
 
 ## Where the next features plug in
 

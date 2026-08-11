@@ -41,7 +41,9 @@ DIST = {
     "view": 400,
     # urban: full credit inside/near a retail-commercial district or close to a
     # town-center node; partial credit out to place_mid (the town's wider orbit).
-    "urban": 100, "place": 500, "place_mid": 1200,
+    # Kept tight: Massachusetts is dense enough that a wider orbit tagged half
+    # the state's road-km as "town", which made the label meaningless.
+    "urban": 100, "place": 400, "place_mid": 900,
 }
 MIN_AREA = {"water": 20_000, "green": 30_000, "farm": 20_000}
 WEIGHTS = {
@@ -49,9 +51,31 @@ WEIGHTS = {
     "relief": 0.16, "farm": 0.06, "views": 0.05, "scenic_tag": 0.07,
     "urban": 0.14,
 }
-STRETCH = 1.35           # expands the composite so great roads land near 10
-CURVE_FULL = 120.0       # deg/km that counts as maximally twisty
-RELIEF_FULL = 160.0      # local relief (m within ~1 km) that counts as maximal
+# Composite calibration: score = 10 * ((raw + RAW_BASE) * STRETCH + score_adj).
+# The weights sum to 1.14, but no real road collects them all (a coastal road
+# isn't farmland), so `raw` tops out near 0.65 in practice — leaving the old
+# scale bunched into 0–6 with "8/10" unreachable. RAW_BASE is the baseline
+# pleasantness of an ordinary road with no standout feature; STRETCH then opens
+# the rest of the range. Fitted so p50 lands near 4.5 and p99 near 9.5 (see
+# calibration_report). Roads that are actively unpleasant are driven back down
+# by the negative score_adj below, not by the base.
+RAW_BASE = 0.143
+STRETCH = 1.20
+
+# Twistiness, measured between chords CURVE_D apart rather than between raw
+# vertices. OSM digitizes roads at ~20 m spacing, where a couple of metres of
+# position error swings the heading several degrees; summing those swings
+# measured mapping noise, not curves (the old metric peaked at 3,500 deg/km —
+# ten full rotations per km — and rated a cul-de-sac above the Mohawk Trail).
+CURVE_D = 60.0           # chord sampling distance (m)
+CURVE_CAP = 25.0         # max heading change credited per step (deg)
+CURVE_MIN_LEN = 300.0    # denominator floor (m), so short stubs can't explode
+CURVE_FULL = 160.0       # deg/km that counts as maximally twisty
+
+# Local relief (m within ~1 km) that counts as maximal. Massachusetts tops out
+# well below alpine terrain: only 2.5% of the state reaches 160 m, so that
+# threshold left the hills component — and the app's Hills slider — inert.
+RELIEF_FULL = 100.0
 CLASS_ADJ = {
     "motorway": -0.45, "motorway_link": -0.40, "trunk": -0.10, "trunk_link": -0.18,
     "primary": -0.04, "primary_link": -0.10, "secondary": 0.0, "secondary_link": -0.10,
@@ -96,22 +120,39 @@ def chunk_roads(roads: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 
 
 def curvature_deg_per_km(geoms: np.ndarray) -> np.ndarray:
-    """Total absolute heading change per km, vectorized over all geometries."""
-    coords = shapely.get_coordinates(geoms)
-    counts = shapely.get_num_coordinates(geoms)
-    gidx = np.repeat(np.arange(len(geoms)), counts)
+    """Sustained heading change per km — twistiness as a driver actually feels it.
 
-    d = np.diff(coords, axis=0)
-    seg_same = gidx[1:] == gidx[:-1]  # segment stays within one geometry
-    headings = np.arctan2(d[:, 1], d[:, 0])
-    dh = np.diff(headings)
-    dh = (dh + np.pi) % (2 * np.pi) - np.pi
-    pair_same = seg_same[1:] & seg_same[:-1]  # both segments in same geometry
+    Samples each line every CURVE_D metres and sums the heading change between
+    consecutive chords. Sampling at driving scale averages out vertex jitter
+    (see CURVE_D above); capping each step at CURVE_CAP keeps a junction corner
+    or cul-de-sac bulb from outweighing a real sweeping curve; and flooring the
+    denominator at CURVE_MIN_LEN stops a 25 m stub with one bend from dividing
+    its way to thousands of deg/km.
+    """
+    lengths = shapely.length(geoms)
+    n_steps = int(np.ceil(lengths.max() / CURVE_D)) + 1
 
-    turn = np.zeros(len(geoms))
-    np.add.at(turn, gidx[1:-1][pair_same], np.abs(dh[pair_same]))
-    lengths_km = shapely.length(geoms) / 1000.0
-    return np.degrees(turn) / np.maximum(lengths_km, 1e-6)
+    # Point k sits CURVE_D * k along the line (clamped to its end).
+    pts = np.empty((n_steps, len(geoms), 2))
+    for k in range(n_steps):
+        along = shapely.line_interpolate_point(geoms, np.minimum(k * CURVE_D, lengths))
+        pts[k] = shapely.get_coordinates(along)
+    # Samples past the end all clamp to the same endpoint, and those degenerate
+    # chords must not count as turns. The *first* clamped sample is the genuine
+    # end of the line, though, so it is kept — dropping it would discard the
+    # last (partial) chord of every line, and zero out anything shorter than
+    # two full steps.
+    steps_before_end = (np.arange(n_steps)[:, None] - 1) * CURVE_D
+    real = steps_before_end < lengths[None, :]
+
+    chords = np.diff(pts, axis=0)
+    chord_ok = real[1:] & real[:-1]
+    headings = np.arctan2(chords[:, :, 1], chords[:, :, 0])
+    dh = np.degrees((np.diff(headings, axis=0) + np.pi) % (2 * np.pi) - np.pi)
+    turn = np.where(chord_ok[1:] & chord_ok[:-1],
+                    np.minimum(np.abs(dh), CURVE_CAP), 0.0).sum(axis=0)
+
+    return turn / (np.maximum(lengths, CURVE_MIN_LEN) / 1000.0)
 
 
 def near_flags(tree: STRtree | None, geoms: np.ndarray, dist: float) -> np.ndarray:
@@ -137,6 +178,16 @@ def sample_relief(chunks: gpd.GeoDataFrame, relief_path: Path) -> np.ndarray:
         )
     vals = np.nan_to_num(vals, nan=0.0)
     return np.clip(vals / RELIEF_FULL, 0, 1)
+
+
+def composite(raw, score_adj):
+    """Blend the weighted component sum into the 0–10 scenic score.
+
+    The single definition of the scale: router.py imports this so a live
+    per-user re-blend lands on exactly the same numbers as the precomputed
+    `score` column, and re-calibrating here moves both at once.
+    """
+    return 10.0 * np.clip((raw + RAW_BASE) * STRETCH + score_adj, 0.0, 1.0)
 
 
 def build_tree(gdf: gpd.GeoDataFrame, min_area: float | None = None) -> STRtree | None:
@@ -226,7 +277,8 @@ def main(processed_dir: str):
     # component vector with the user's beauty-type weights, then re-applies this
     # same adjustment so highways/unpaved roads stay penalized.
     chunks["score_adj"] = class_adj + unpaved_adj
-    chunks["score"] = 10 * np.clip(raw * STRETCH + chunks["score_adj"], 0, 1)
+    chunks["raw"] = raw
+    chunks["score"] = composite(raw, chunks["score_adj"])
 
     out_path = d / "scored_chunks.parquet"
     chunks.to_parquet(out_path)
@@ -251,24 +303,53 @@ def main(processed_dir: str):
     )
     print("top named roads (>=3 km):\n", top.round(2), "\n")
 
-    for label, mask in [
-        ("Mohawk Trail", named["name"].str.contains("Mohawk Trail", case=False)),
-        ("Route 6A (Old King's Hwy)", chunks["ref"].str.contains("6A", na=False)),
-        ("I-90 (Mass Pike)", chunks["ref"].str.fullmatch("I 90", na=False)),
-        ("I-95", chunks["ref"].str.contains("I 95", na=False)),
-    ]:
-        sel = named[mask] if label == "Mohawk Trail" else chunks[mask]
-        if len(sel):
-            print(f"benchmark {label}: mean {sel['score'].mean():.2f} over {sel['length_m'].sum()/1000:.0f} km")
-        else:
-            print(f"benchmark {label}: no match")
+    calibration_report(chunks)
 
-    # Townscape coverage: how much of the network the new urban component lit up,
-    # and how those town-center roads score on average.
-    urban = chunks[chunks["c_urban"] >= 1.0]
-    print(f"\nurban (c_urban=1): {len(urban):,} chunks, "
-          f"mean score {urban['score'].mean():.2f}, "
-          f"{urban['length_m'].sum() / 1000:.0f} km of network")
+
+def calibration_report(chunks: gpd.GeoDataFrame):
+    """Is the 0–10 scale actually used, and do known roads land in the right
+    order? A regression here means a constant at the top of this file needs
+    refitting — every number below is length-weighted, since a score is only as
+    important as the kilometres it covers."""
+    km = chunks["length_m"] / 1000.0
+    total = km.sum()
+    lw = lambda col, mask: float((chunks[col][mask] * km[mask]).sum()
+                                 / max(km[mask].sum(), 1e-9))
+    everything = np.ones(len(chunks), dtype=bool)
+
+    pct = np.percentile(np.repeat(chunks["score"], np.maximum((km * 10).astype(int), 1)),
+                        [10, 50, 90, 99])
+    print(f"scale (len-weighted): p10 {pct[0]:.1f}  p50 {pct[1]:.1f}  "
+          f"p90 {pct[2]:.1f}  p99 {pct[3]:.1f}  mean {lw('score', everything):.2f}")
+    print(f"      raw blend: p50 {np.percentile(chunks['raw'], 50):.3f}  "
+          f"p99 {np.percentile(chunks['raw'], 99):.3f}   "
+          f"(RAW_BASE {RAW_BASE}, STRETCH {STRETCH})")
+    pinned = 100 * km[chunks["score"] >= 9.99].sum() / total
+    floored = 100 * km[chunks["score"] <= 0.01].sum() / total
+    print(f"      clipped: {floored:.1f}% of km at 0, {pinned:.1f}% at 10")
+
+    print("component coverage (% of network km at >= 0.5, and mean):")
+    for c in sorted(col for col in chunks.columns if col.startswith("c_")):
+        print(f"      {c:14s} {100 * km[chunks[c] >= 0.5].sum() / total:5.1f}%   "
+              f"mean {chunks[c].mean():.3f}")
+
+    name = chunks["name"].fillna("").str.lower()
+    ref = chunks["ref"].fillna("")
+    print("benchmarks (scenic roads should sit far above the interstates):")
+    for label, mask in [
+        ("Greylock Notch/Rockwell", name.str.contains("notch road|rockwell road")),
+        ("Jacob's Ladder Trail", name.str.contains("jacob")),
+        ("Mohawk Trail", name.str.contains("mohawk trail")),
+        ("Route 6A (Old King's Hwy)", ref.str.contains("6A", na=False)),
+        ("I-90 (Mass Pike)", ref.str.fullmatch("I 90", na=False)),
+        ("I-95", ref.str.contains("I 95", na=False)),
+    ]:
+        m = mask.to_numpy()
+        if m.any():
+            print(f"      {label:26s} {lw('score', m):5.2f}   "
+                  f"({km[m].sum():5.0f} km)")
+        else:
+            print(f"      {label:26s}  no match")
 
 
 if __name__ == "__main__":

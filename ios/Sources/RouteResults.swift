@@ -29,7 +29,7 @@ struct RouteResults: View {
         VStack(alignment: .leading, spacing: 3) {
             Text(title.uppercased()).font(.caption2).foregroundStyle(.secondary)
             Text("\(Int(p.minutes.rounded())) min").font(.title3.bold())
-            Text("\(Int(p.km)) km · \(p.mean_score, format: .number.precision(.fractionLength(1)))/10")
+            Text("\(Int(p.km.milesFromKm)) mi · \(p.mean_score, format: .number.precision(.fractionLength(1)))/10")
                 .font(.caption2).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -45,7 +45,7 @@ struct RouteResults: View {
     }
 }
 
-/// One labeled bar in the scenery breakdown ("forest  36 km"), filled in
+/// One labeled bar in the scenery breakdown ("forest  22 mi"), filled in
 /// proportion to the longest feature so lengths are easy to compare.
 struct SceneryBar: View {
     let label: String
@@ -62,7 +62,8 @@ struct SceneryBar: View {
                     .frame(maxHeight: .infinity, alignment: .center)
             }
             .frame(height: 10)
-            Text("\(Int(km)) km").font(.caption2).frame(width: 40, alignment: .trailing)
+            Text("\(Int(km.milesFromKm)) mi").font(.caption2)
+                .frame(width: 40, alignment: .trailing)
         }
     }
 }
