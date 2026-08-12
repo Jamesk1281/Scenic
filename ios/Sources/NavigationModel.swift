@@ -1,6 +1,11 @@
 import CoreLocation
 import Observation
 
+/// How a replacement route is fetched. A seam so the navigation logic can be
+/// driven in tests without a backend; production leaves it at the real service.
+typealias RouteFetcher = (CLLocationCoordinate2D, CLLocationCoordinate2D,
+                          Double, [String: Double]) async throws -> RouteResponse
+
 /// Drives one live navigation session: which route we're following, which step
 /// is current, how far to the next maneuver, and how much trip is left. It's
 /// fed a stream of locations from `LocationManager` (via `update`) and reshapes
@@ -16,6 +21,18 @@ final class NavigationModel {
     private(set) var route: RouteFeature
     private(set) var steps: [RouteStep]
     private(set) var currentStep = 0
+
+    /// The route line, decoded once per route rather than on every read.
+    /// `RouteFeature.coordinates` rebuilds the whole array of a 70 km route from
+    /// its `[[lon, lat]]` pairs each time it is touched, and this is touched on
+    /// every GPS fix and every SwiftUI body evaluation.
+    private(set) var coordinates: [CLLocationCoordinate2D]
+
+    /// Distance still to drive at each maneuver, measured along the route.
+    /// Non-increasing, so `update` can walk it forward. This is what makes step
+    /// advancement a function of progress rather than of proximity — see
+    /// `update`.
+    private var stepRemaining: [Double] = []
 
     /// Meters from the driver to the next maneuver, refreshed each update.
     private(set) var distanceToNext: Double = 0
@@ -54,25 +71,56 @@ final class NavigationModel {
     /// One threshold rather than two: joining is a latch, so it can't chatter.
     private static let offRouteMeters: Double = 60
 
+    /// How close counts as arriving.
+    private static let arrivalMeters: Double = 40
+
+    /// How little route may be left for a fix near the destination pin to mean
+    /// "arrived" rather than "passing nearby" — see `update`.
+    private static let arrivalTailMeters: Double = 250
+
+    /// How far the match may slide backwards along the route between fixes.
+    /// Enough for GPS jitter and a car rocking at a light; not enough to
+    /// re-match an out-and-back route onto the leg it drove twenty minutes ago.
+    private static let backtrackToleranceMeters: Double = 100
+
+    /// How far along the route the driver has been matched, monotonically.
+    /// Keeps the match moving forwards over a route that crosses itself.
+    private var travelled: Double = 0
+
     /// The scenic preference we re-route with — preserved on off-route reroutes,
     /// dropped to 0 (fastest) when the user switches.
     private var pref: Double
     private let weights: [String: Double]
+
+    /// How replacement routes are fetched. Tests substitute a stub.
+    var fetchRoute: RouteFetcher = { from, to, pref, weights in
+        try await RouteService.route(from: from, to: to, pref: pref, weights: weights)
+    }
 
     /// When the last reroute was attempted. Off-route checks run on every GPS
     /// tick (~every 5 m), so without a cooldown a failed reroute — server briefly
     /// unreachable, say — would retry several times a second.
     private var lastRerouteAttempt: Date = .distantPast
 
+    /// Ticks up on every reroute, so a slow reply that lands after a newer
+    /// request has started can be recognised as stale and dropped. Two can
+    /// genuinely be in flight: `switchToFastest` doesn't wait for an off-route
+    /// reroute to finish, and without this the first to return cleared
+    /// `isRerouting` while the other was still running — re-arming off-route
+    /// recovery for a third, and letting whichever landed last win.
+    private var rerouteGeneration = 0
+
     init(route: RouteFeature, destination: CLLocationCoordinate2D,
          pref: Double, weights: [String: Double]) {
         self.route = route
         self.steps = route.properties.steps
+        self.coordinates = route.coordinates
         self.destination = destination
         self.pref = pref
         self.weights = weights
         self.remainingMeters = route.properties.km * 1000
         self.remainingMinutes = route.properties.minutes
+        self.stepRemaining = Self.remainingAtEachStep(of: steps, along: coordinates)
     }
 
     /// The instruction shown in the banner right now.
@@ -80,42 +128,63 @@ final class NavigationModel {
         currentStep < steps.count ? steps[currentStep].instruction : ""
     }
 
+    /// Where each maneuver sits along the route, as distance-still-to-drive.
+    ///
+    /// Walked in travel order, each step matched only against the road ahead of
+    /// the one before it. That is what places a maneuver on the correct pass
+    /// when a route runs over the same road twice, and it makes the sequence
+    /// non-increasing by construction — which is what `advanceSteps` walks.
+    private static func remainingAtEachStep(of steps: [RouteStep],
+                                            along line: [CLLocationCoordinate2D]) -> [Double] {
+        var floor = 0.0
+        return steps.map { step in
+            let match = progress(of: step.coordinate, along: line, notBefore: floor)
+            floor = match.travelled
+            return match.remaining
+        }
+    }
+
     // MARK: - Driven by each location update
 
     func update(_ location: CLLocation) {
-        guard !steps.isEmpty, !arrived else { return }
+        guard !steps.isEmpty, !arrived, coordinates.count >= 2 else { return }
 
-        // Arrived when close to the searched destination — or to the route's
-        // own final point. The two can differ: the search pin may sit off-road
-        // (a town green, a mall's rooftop), while the route necessarily ends at
-        // the nearest road node. Without the second check a driver could reach
-        // the end of the line yet never trigger arrival.
-        let routeEnd = steps[steps.count - 1].coordinate
-        if location.distance(to: destination) < 40 || location.distance(to: routeEnd) < 40 {
+        // Match forwards from where the driver already is, with a little slack
+        // for GPS jitter — see `progress`. Before they have joined the route
+        // nothing is known, so the whole line is fair game.
+        let floor = hasJoinedRoute ? max(0, travelled - Self.backtrackToleranceMeters) : 0
+        let here = progress(of: location.coordinate, along: coordinates, notBefore: floor)
+
+        if !hasJoinedRoute {
+            if here.offRoute <= Self.offRouteMeters {
+                hasJoinedRoute = true
+            } else if let lineStart = coordinates.first {
+                distanceToRouteStart = location.distance(to: lineStart)
+            }
+        }
+        if hasJoinedRoute {
+            travelled = max(travelled, here.travelled)
+        }
+
+        // Arrival is having driven the line, not being near a particular point.
+        // The searched pin can sit off-road (a town green, a mall's rooftop)
+        // while the route necessarily ends at the nearest road node, so being
+        // beside the pin counts too — but only once the trip is nearly spent.
+        // `arrived` never un-latches, and a scenic route that loops out and back
+        // passes its own destination, and its own final coordinate, long before
+        // the drive is over.
+        let drivenTheLine = hasJoinedRoute && here.remaining < Self.arrivalMeters
+        let stoppedAtThePin = hasJoinedRoute
+            && location.distance(to: destination) < Self.arrivalMeters
+            && here.remaining < Self.arrivalTailMeters
+        if drivenTheLine || stoppedAtThePin {
             arrived = true
             remainingMeters = 0
             remainingMinutes = 0
             return
         }
 
-        let here = progress(of: location.coordinate, along: route.coordinates)
-
-        if !hasJoinedRoute {
-            if here.offRoute <= Self.offRouteMeters {
-                hasJoinedRoute = true
-            } else if let lineStart = route.coordinates.first {
-                distanceToRouteStart = location.distance(to: lineStart)
-            }
-        }
-
-        // Tick past any maneuvers we've now reached (more than one can fall
-        // within a single update if they're close together).
-        while currentStep < steps.count - 1,
-              location.distance(to: steps[currentStep].coordinate) < 25 {
-            currentStep += 1
-        }
-        distanceToNext = location.distance(to: steps[currentStep].coordinate)
-
+        advanceSteps(here, from: location)
         updateRemaining(here)
 
         // Strayed well off the line — re-route from here, keeping the same
@@ -127,6 +196,33 @@ final class NavigationModel {
            here.offRoute > Self.offRouteMeters {
             Task { await reroute(from: location.coordinate) }
         }
+    }
+
+    /// Move the banner past every maneuver the driver has already driven
+    /// through, and measure how far the next one is.
+    ///
+    /// By distance *along the route*, not by proximity to the maneuver's point.
+    /// Proximity was a latch with no way back: it advanced only while within
+    /// 25 m of the current step, which is a 50 m window, and at 65 mph fixes
+    /// arrive about 29 m apart. One fix rejected for poor accuracy — under an
+    /// overpass, in an interchange, exactly where maneuvers are — opens a 58 m
+    /// gap that can straddle the window. You only ever approach a maneuver
+    /// once, so a missed one was missed permanently: `currentStep` stopped
+    /// advancing and the banner showed a stale instruction for the rest of the
+    /// drive, with no reroute to rescue it because the driver was still on
+    /// route. Progress only ever increases, so nothing can be skipped.
+    private func advanceSteps(_ here: RouteProgress, from location: CLLocation) {
+        guard hasJoinedRoute else {
+            // Before joining, the projection onto the line is meaningless (it
+            // can land anywhere), so leave the step where it is.
+            distanceToNext = location.distance(to: steps[currentStep].coordinate)
+            return
+        }
+        while currentStep < steps.count - 1,
+              stepRemaining[currentStep] >= here.remaining {
+            currentStep += 1
+        }
+        distanceToNext = max(0, here.remaining - stepRemaining[currentStep])
     }
 
     /// Distance and time still to drive.
@@ -160,23 +256,34 @@ final class NavigationModel {
     }
 
     private func reroute(from origin: CLLocationCoordinate2D) async {
+        rerouteGeneration += 1
+        let generation = rerouteGeneration
+        let wantFastest = pref == 0
         isRerouting = true
         lastRerouteAttempt = Date()
-        defer { isRerouting = false }
+        // Only the newest attempt may clear the flag; an older one finishing
+        // must not advertise the newer one as done.
+        defer { if generation == rerouteGeneration { isRerouting = false } }
 
-        guard let response = try? await RouteService.route(
-            from: origin, to: destination, pref: pref, weights: weights
-        ) else { return }
+        guard let response = try? await fetchRoute(origin, destination, pref, weights),
+              generation == rerouteGeneration
+        else { return }
 
-        // pref 0 means we want the fastest line; otherwise the scenic one.
-        let feature = pref == 0 ? response.fastest : response.scenic
-        route = feature
-        steps = feature.properties.steps
-        currentStep = 0
+        adopt(wantFastest ? response.fastest : response.scenic)
         // The new route starts from where the driver is standing, so they are
         // on it by construction — arm off-route recovery for the rest of the
         // drive even if they never reached the originally planned start.
         hasJoinedRoute = true
+    }
+
+    /// Follow a different route from here on.
+    private func adopt(_ feature: RouteFeature) {
+        route = feature
+        steps = feature.properties.steps
+        coordinates = feature.coordinates
+        stepRemaining = Self.remainingAtEachStep(of: steps, along: coordinates)
+        currentStep = 0
+        travelled = 0
         remainingMeters = feature.properties.km * 1000
         remainingMinutes = feature.properties.minutes
     }

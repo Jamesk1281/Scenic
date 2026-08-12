@@ -78,9 +78,11 @@ the first two are the usual Windows build headaches.
 .venv/bin/python -m pytest tests/
 ```
 
-With only the two graph parquets present, expect **79 passed, 2 skipped** — the
-skips are curvature checks that need `scored_chunks.parquet`, a pipeline artifact
-the server never reads. Anything else means the data and code disagree.
+With only the two graph parquets present, expect **125 passed, 3 skipped** — the
+skips need `scored_chunks.parquet`, a pipeline artifact the server never reads.
+What matters is that nothing *fails*: a failure here means the data and the code
+disagree. (Count the skips, not the passes — the pass count moves whenever a
+test is added, and a stale number in this file is its own false alarm.)
 
 ### 4. Run the API
 
@@ -217,10 +219,11 @@ exception at roughly €4).
 
 - **One process, a few threads.** waitress loads the graph once and serves with
   4 threads; scipy releases the GIL during routing, so requests overlap without a
-  second copy of the graph. Measured **~1.0 GB physical footprint** (1.03 GB
-  peak); plan for 2 GB free, so a 4 GB machine is fine and 8 GB comfortable.
-  Note that plain RSS understates this badly on macOS, which compresses much of
-  it out — the process writes ~1.1 GB.
+  second copy of the graph. Measured **~0.8 GB physical footprint**; plan for
+  2 GB free, so a 4 GB machine is fine and 8 GB comfortable. Note that plain RSS
+  understates this badly on macOS, which compresses much of it out.
+  (It was ~1.0 GB until the router's node-pair lookup stopped being a dict of
+  three quarters of a million boxed tuples — that alone was 204 MB.)
 - **~85 ms per route**, so a request for both options lands under 200 ms locally
   and ~500 ms through the tunnel. Nearly all of that is the Dijkstra itself,
   which solves to every node in the state; point-to-point search

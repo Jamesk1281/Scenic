@@ -52,10 +52,17 @@ struct SceneryBar: View {
     let km: Double
     let maxKm: Double
 
+    // The label and value columns line the bars up, but a width in fixed points
+    // clips its own text as soon as the user raises the system text size.
+    // @ScaledMetric grows them with it, so the column survives and the bars stay
+    // aligned.
+    @ScaledMetric(relativeTo: .caption2) private var labelWidth: CGFloat = 74
+    @ScaledMetric(relativeTo: .caption2) private var valueWidth: CGFloat = 40
+
     var body: some View {
         HStack(spacing: 8) {
             Text(label).font(.caption2).foregroundStyle(.secondary)
-                .frame(width: 74, alignment: .leading)
+                .frame(width: labelWidth, alignment: .leading)
             GeometryReader { geo in
                 Capsule().fill(Color.scenic)
                     .frame(width: geo.size.width * (km / maxKm), height: 6)
@@ -63,7 +70,11 @@ struct SceneryBar: View {
             }
             .frame(height: 10)
             Text("\(Int(km.milesFromKm)) mi").font(.caption2)
-                .frame(width: 40, alignment: .trailing)
+                .frame(width: valueWidth, alignment: .trailing)
         }
+        // Read as one fact. Left to itself VoiceOver announces the label, then a
+        // decorative bar, then the number, as three separate stops.
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(label), \(Int(km.milesFromKm)) miles")
     }
 }

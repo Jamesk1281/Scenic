@@ -35,13 +35,35 @@ enum RouteService {
     /// An error carrying the backend's own message (e.g. "no route found").
     enum ServiceError: LocalizedError {
         case server(String)
+        case badResponse
 
         var errorDescription: String? {
             switch self {
             case let .server(message): return message
+            // A decode failure otherwise surfaces as Foundation's "The data
+            // couldn't be read because it isn't in the correct format", which
+            // tells a driver nothing about what to do.
+            case .badResponse: return "The routing server sent something unreadable."
             }
         }
     }
+
+    /// Requests time out well inside a drive's patience.
+    ///
+    /// `URLSession.shared` waits 60 seconds, and mid-drive that is the worst of
+    /// both worlds: `NavigationModel` holds `isRerouting` for the whole minute,
+    /// which both pins "Rerouting…" on the banner and blocks every retry — the
+    /// 8-second reroute cooldown cannot fire while a request is still in flight.
+    /// Failing fast and retrying is what recovers a drive on a patchy signal.
+    private static let session: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        configuration.timeoutIntervalForRequest = 15
+        configuration.timeoutIntervalForResource = 20
+        // Never park a request waiting for the network to come back: the driver
+        // has moved on and the answer would be for where they used to be.
+        configuration.waitsForConnectivity = false
+        return URLSession(configuration: configuration)
+    }()
 
     /// Request the fastest and scenic routes between two points.
     /// - Parameters:
@@ -65,14 +87,20 @@ enum RouteService {
             URLQueryItem(name: "w_\(type)", value: String(format: "%.2f", weight))
         }
 
-        let (data, response) = try await URLSession.shared.data(from: components.url!)
+        let (data, response) = try await session.data(from: components.url!)
 
         // On an error status, surface the backend's JSON {"error": "..."} message.
         if let http = response as? HTTPURLResponse, http.statusCode != 200 {
             let body = try? JSONDecoder().decode([String: String].self, from: data)
+            // A rate limiter or a tunnel answers in HTML, not our JSON shape,
+            // so there is often no message to lift.
             throw ServiceError.server(body?["error"] ?? "HTTP \(http.statusCode)")
         }
 
-        return try JSONDecoder().decode(RouteResponse.self, from: data)
+        do {
+            return try JSONDecoder().decode(RouteResponse.self, from: data)
+        } catch {
+            throw ServiceError.badResponse
+        }
     }
 }

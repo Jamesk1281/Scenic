@@ -115,6 +115,16 @@ final class LocationManager: NSObject, CLLocationManagerDelegate {
         if let known = location, Self.isUsable(known) { return known }
 
         let fix = await withCheckedContinuation { (continuation: CheckedContinuation<CLLocation?, Never>) in
+            // A second request supersedes the first, and the first has to be
+            // answered on its way out. Replacing `pendingFix` while its
+            // continuation was unresumed left that caller suspended forever —
+            // its timeout task bails out on seeing itself superseded — so
+            // `useMyLocation` never returned, and the spinner in the field
+            // never stopped. Two taps could do it: the button and the
+            // "My Location" row in the suggestion list are separate controls.
+            if let superseded = pendingFix {
+                superseded.finish(with: superseded.best)
+            }
             let pending = PendingFix(continuation)
             pendingFix = pending
             manager.startUpdatingLocation()

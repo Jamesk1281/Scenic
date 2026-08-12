@@ -45,3 +45,35 @@ targets:
     # SCENIC_API to the Run action's environment in Xcode's scheme editor —
     # http://127.0.0.1:5057 in the simulator, or http://<your-mac>.local:5057
     # for a device on the same Wi-Fi.
+
+  # Unit tests for the logic that a simulator cannot exercise and a drive can
+  # only test once: where the driver is on the route, when a maneuver has been
+  # passed, when the trip has actually ended, and which of two overlapping
+  # reroutes wins. `NavigationModel.fetchRoute` is the seam that lets these run
+  # with no backend.
+  ScenicTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - Tests
+    dependencies:
+      - target: Scenic
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.scenic.demo.tests
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: YES
+
+schemes:
+  Scenic:
+    build:
+      targets:
+        Scenic: all
+        ScenicTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - ScenicTests

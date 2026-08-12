@@ -20,6 +20,23 @@ WORCESTER = (42.2626, -71.8023)
 CONCORD = (42.4604, -71.3489)
 
 
+class TestClientContract:
+    """The iOS app hardcodes these strings. A rename on one side has to fail a
+    suite rather than quietly drop a bar from the app's breakdown."""
+
+    def test_the_client_and_server_agree_on_the_scenery_labels(self):
+        # Mirrored by `serverLabels` in ios/Tests/ModelsTests.swift and by
+        # RouteProps.sceneryBreakdown's displayOrder in ios/Sources/Models.swift.
+        from router import SCENERY_BREAKDOWN
+        assert [label for label, *_ in SCENERY_BREAKDOWN] == [
+            "water", "coast", "forest/park", "hills", "farmland", "town"]
+
+    def test_the_client_and_server_agree_on_the_beauty_type_names(self):
+        # Mirrored by BeautyType.all in ios/Sources/BeautyType.swift; these are
+        # what the app's `w_<name>` query parameters are built from.
+        assert set(ALL_TYPES) == {"water", "coast", "forest", "hills", "farm", "town"}
+
+
 class TestBearings:
     def test_cardinal_directions(self):
         assert _bearing((0, 0), (0, 1)) == pytest.approx(0, abs=1)      # north

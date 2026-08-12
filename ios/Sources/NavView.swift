@@ -18,9 +18,13 @@ struct NavView: View {
     /// Whether the "switch to fastest?" confirmation is up.
     @State private var confirmingFastest = false
 
+    /// Tap target for the two corner buttons. Scaled, so the glyph inside still
+    /// fits when the driver runs a larger system text size.
+    @ScaledMetric(relativeTo: .body) private var controlSize: CGFloat = 30
+
     var body: some View {
         Map(position: $camera) {
-            MapPolyline(coordinates: nav.route.coordinates)
+            MapPolyline(coordinates: nav.coordinates)
                 .stroke(nav.followingFastest ? .gray : Color.scenic, lineWidth: 6)
             Marker("Destination", coordinate: nav.destination).tint(.red)
             UserAnnotation()
@@ -113,7 +117,7 @@ struct NavView: View {
         HStack(alignment: .center) {
             Button(role: .destructive) { onEnd() } label: {
                 Label("End", systemImage: "xmark").labelStyle(.iconOnly)
-                    .frame(width: 30, height: 30)
+                    .frame(width: controlSize, height: controlSize)
             }
             .buttonStyle(.bordered)
             .accessibilityLabel("End the drive")
@@ -132,14 +136,14 @@ struct NavView: View {
             if !nav.followingFastest && !nav.arrived {
                 Button { confirmingFastest = true } label: {
                     Label("Fastest", systemImage: "bolt.fill").labelStyle(.iconOnly)
-                        .frame(width: 30, height: 30)
+                        .frame(width: controlSize, height: controlSize)
                 }
                 .buttonStyle(.bordered)
                 .tint(.secondary)
                 .accessibilityLabel("Switch to the fastest route")
             } else {
                 // Keep the stats centered when the button isn't there.
-                Color.clear.frame(width: 30, height: 30)
+                Color.clear.frame(width: controlSize, height: controlSize)
             }
         }
         .padding(.horizontal)

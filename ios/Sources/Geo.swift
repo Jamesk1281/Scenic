@@ -22,7 +22,7 @@ extension CLLocationCoordinate2D {
     }
 }
 
-/// Where a driver sits relative to a route line. Both values in meters.
+/// Where a driver sits relative to a route line. All values in meters.
 struct RouteProgress {
     /// Perpendicular distance to the nearest point of the line — how far off
     /// route we are.
@@ -32,6 +32,9 @@ struct RouteProgress {
     /// are built from, so it has to follow the road rather than fly straight to
     /// the destination.
     let remaining: Double
+    /// How far along the line the driver has been matched to. Feed this back in
+    /// as `notBefore` on the next fix to keep the match moving forwards.
+    let travelled: Double
 }
 
 /// Project a point onto a polyline: how far off it is, and how much line is
@@ -43,11 +46,22 @@ struct RouteProgress {
 /// per-segment rather than one frame for the whole route, because a 60 km route
 /// spans enough latitude that a single east-west scale factor would misjudge
 /// lengths at the far end by a couple of percent.
-func progress(of point: CLLocationCoordinate2D, along line: [CLLocationCoordinate2D]) -> RouteProgress {
+///
+/// `notBefore` is how far along the driver is already known to be. Segments that
+/// end before it are not considered, which is what makes the match work on a
+/// route that comes back on itself — and scenic routes do that constantly, since
+/// an out-and-back detour is often the prettiest way to spend ten extra minutes.
+/// Without it, a driver on the return leg matches the outbound one they drove
+/// twenty minutes ago, and the distance remaining jumps back up. Pass a little
+/// less than the last known value so GPS jitter can nudge backwards; pass 0
+/// before the driver has joined the route, when nothing is known yet.
+func progress(of point: CLLocationCoordinate2D,
+              along line: [CLLocationCoordinate2D],
+              notBefore: Double = 0) -> RouteProgress {
     guard line.count >= 2 else {
         let here = CLLocation(latitude: point.latitude, longitude: point.longitude)
         let only = line.first.map { here.distance(to: $0) } ?? .infinity
-        return RouteProgress(offRoute: only, remaining: 0)
+        return RouteProgress(offRoute: only, remaining: 0, travelled: 0)
     }
 
     let metersPerDegLat = 111_320.0
@@ -55,7 +69,6 @@ func progress(of point: CLLocationCoordinate2D, along line: [CLLocationCoordinat
     var travelled = 0.0        // length of the line before the current segment
     var bestPrefix = 0.0       // ...at the closest segment
     var bestAlong = 0.0        // how far into the closest segment we project
-    var total = 0.0
 
     for i in 0 ..< line.count - 1 {
         let p = line[i], q = line[i + 1]
@@ -76,14 +89,25 @@ func progress(of point: CLLocationCoordinate2D, along line: [CLLocationCoordinat
         let cx = a.x + t * dx, cy = a.y + t * dy
         let distance = (cx * cx + cy * cy).squareRoot()
 
-        if distance < best {
+        // Segments wholly behind us belong to an earlier pass along the same
+        // road, not to where the driver is now.
+        if distance < best, travelled + length >= notBefore {
             best = distance
             bestPrefix = travelled
             bestAlong = t * length
         }
         travelled += length
-        total += length
     }
 
-    return RouteProgress(offRoute: best, remaining: max(0, total - bestPrefix - bestAlong))
+    // `notBefore` ran past the end of the line: there is nothing ahead to match
+    // against, so the driver is at the end of it.
+    guard best.isFinite else {
+        let here = CLLocation(latitude: point.latitude, longitude: point.longitude)
+        return RouteProgress(offRoute: line.last.map { here.distance(to: $0) } ?? .infinity,
+                             remaining: 0, travelled: travelled)
+    }
+    let along = bestPrefix + bestAlong
+    return RouteProgress(offRoute: best,
+                         remaining: max(0, travelled - along),
+                         travelled: along)
 }

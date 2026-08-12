@@ -134,13 +134,21 @@ at some point:
 ## Tests
 
 ```sh
-.venv/bin/python -m pip install pytest
-.venv/bin/python -m pytest tests/
+.venv/bin/python -m pytest tests/          # backend: 128 tests
 ```
 
 The geometry and scoring maths run anywhere; the calibration, routing and API
 tests need a built graph and skip cleanly without one. Point them at a graph
 elsewhere with `SCENIC_DATA=/path/to/processed`.
+
+The iOS app has its own suite for the parts a simulator can't exercise and a
+drive only tests once — where the driver is on the route, when a maneuver has
+been passed, when the trip has actually ended, and which of two overlapping
+reroutes wins:
+
+```sh
+cd ios && xcodegen generate && xcodebuild test -project Scenic.xcodeproj -scheme Scenic -destination 'platform=iOS Simulator,name=iPhone 17 Pro'
+```
 
 ## Where the next features plug in
 
@@ -162,4 +170,6 @@ carries them onto edges, and `router.py` re-blends them live per request. So:
 
 The user-facing scenery labels live in one place per language: `SCENERY_BREAKDOWN`
 in `router.py` (server) and `RouteProps.sceneryBreakdown` in `Models.swift`
-(client). Keep those two in sync when adding a type.
+(client), with the tunable type names in `BEAUTY_TYPES` and `BeautyType.all`.
+Both suites assert the same lists from their own side, so renaming a type on one
+end fails a test rather than quietly dropping a bar from the app.
