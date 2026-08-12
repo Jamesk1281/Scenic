@@ -19,9 +19,17 @@ targets:
           UIApplicationSupportsMultipleScenes: false
         # Shown when navigation asks for location to follow the route.
         NSLocationWhenInUseUsageDescription: "Scenic uses your location to follow your route, turn by turn, while you drive."
-        # Allow http to the local Flask dev server (simulator -> host).
+        # Allow http to the local Flask dev server (simulator -> host). The
+        # deployed backend is https, so it needs no exception of its own.
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
+        # The deployed backend, baked into the bundle. This has to live in
+        # Info.plist rather than the scheme: a scheme environment variable only
+        # exists while Xcode owns the process, so an app launched from the home
+        # screen (or relaunched by iOS after being jettisoned mid-drive) would
+        # otherwise fall back to localhost and fail every request.
+        # RouteService still prefers SCENIC_API when it is set, for local work.
+        ScenicAPIBaseURL: https://api.jameskouvlis.com
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.scenic.demo
@@ -31,8 +39,9 @@ targets:
         SWIFT_VERSION: "5.0"
         GENERATE_INFOPLIST_FILE: NO
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
-    # Points the app at the dev server when run from Xcode (device or simulator).
-    # Change this to a hosted https URL once the backend is deployed.
-    scheme:
-      environmentVariables:
-        SCENIC_API: http://Jamess-MacBook-Air-24.local:5057
+    # No scheme environment variables on purpose: the app reads its backend from
+    # ScenicAPIBaseURL above, so a build behaves the same whether Xcode launched
+    # it or the user tapped the icon. To develop against a local server, add
+    # SCENIC_API to the Run action's environment in Xcode's scheme editor —
+    # http://127.0.0.1:5057 in the simulator, or http://<your-mac>.local:5057
+    # for a device on the same Wi-Fi.

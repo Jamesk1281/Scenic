@@ -6,11 +6,31 @@ import Foundation
 /// state — it's just a namespace for the `route(...)` function.
 enum RouteService {
 
-    /// Where the backend lives. Defaults to localhost for the simulator (which
-    /// can reach the Flask server running on the Mac). Override with the
-    /// SCENIC_API env var to point at a hosted server on a real device.
-    static let baseURL: String = ProcessInfo.processInfo
-        .environment["SCENIC_API"] ?? "http://127.0.0.1:5057"
+    /// Where the backend lives, in order of precedence:
+    ///
+    ///   1. `SCENIC_API` in the environment — for developing against a local
+    ///      server. Add it to the Run action in Xcode's scheme editor.
+    ///   2. `ScenicAPIBaseURL` from Info.plist — the deployed backend, baked
+    ///      into the bundle at build time (set in `ios/project.yml`).
+    ///   3. localhost, as a last resort.
+    ///
+    /// The Info.plist entry is what makes the app usable away from a Mac. An
+    /// environment variable only exists when *Xcode* launches the process, so
+    /// tapping the icon — or iOS relaunching the app after jettisoning it
+    /// mid-drive — starts it with no environment at all. With only the env var,
+    /// that silently fell back to localhost, i.e. the phone itself, and every
+    /// request failed at the worst possible moment.
+    static let baseURL: String = {
+        if let override = ProcessInfo.processInfo.environment["SCENIC_API"],
+           !override.isEmpty {
+            return override
+        }
+        if let baked = Bundle.main.object(forInfoDictionaryKey: "ScenicAPIBaseURL") as? String,
+           !baked.isEmpty {
+            return baked
+        }
+        return "http://127.0.0.1:5057"
+    }()
 
     /// An error carrying the backend's own message (e.g. "no route found").
     enum ServiceError: LocalizedError {

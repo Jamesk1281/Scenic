@@ -1,5 +1,6 @@
 import MapKit
 import SwiftUI
+import UIKit
 
 /// The live navigation screen: a heading-up map that follows the driver, with
 /// the next maneuver up top and controls (bail to the fastest route, end the
@@ -24,8 +25,21 @@ struct NavView: View {
         .ignoresSafeArea()
         .safeAreaInset(edge: .top) { banner }
         .safeAreaInset(edge: .bottom) { controls }
-        .onAppear { locationManager.start() }
-        .onDisappear { locationManager.stop() }
+        .onAppear {
+            locationManager.start()
+            // Keep the screen awake for the whole drive. iOS otherwise dims and
+            // locks the display after a minute or two without a touch — and
+            // since we hold only when-in-use authorization and declare no
+            // background location mode, locking silently stops the location
+            // updates that `nav.update` runs on. Steps would stop advancing,
+            // off-route detection would stop, and arrival would never fire:
+            // the app appears to hang a couple of minutes into every drive.
+            UIApplication.shared.isIdleTimerDisabled = true
+        }
+        .onDisappear {
+            locationManager.stop()
+            UIApplication.shared.isIdleTimerDisabled = false
+        }
         // CLLocation isn't Equatable, so we watch the fix's timestamp and read
         // the location itself when it changes.
         .onChange(of: locationManager.location?.timestamp) {

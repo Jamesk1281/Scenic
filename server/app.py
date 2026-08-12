@@ -103,6 +103,29 @@ def health():
     return jsonify(status="ok", nodes=ROUTER.n)
 
 
+@app.get("/")
+def index():
+    """Say what this service is, rather than 404ing.
+
+    Flask's default 404 on `/` renders as a page headed "Not Found", which reads
+    as a broken deployment when you open the bare hostname in a browser to check
+    a tunnel — even though the server is answering perfectly. Returning a small
+    description makes a bare visit a useful liveness check and documents the
+    query shape for anyone poking at the API by hand.
+    """
+    return jsonify(
+        service="scenic-api",
+        status="ok",
+        nodes=ROUTER.n,
+        endpoints={
+            "/api/route": "from=LAT,LON&to=LAT,LON[&pref=0..1][&w_<type>=0..4]",
+            "/api/health": "liveness check",
+        },
+        beauty_types=[name for name, *_ in BEAUTY_TYPES],
+        region="Massachusetts",
+    )
+
+
 if __name__ == "__main__":
     # 0.0.0.0 listens on all interfaces so a phone on the same Wi-Fi can reach
     # this dev server. (127.0.0.1 would only be reachable from this Mac.)

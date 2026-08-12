@@ -1,0 +1,23 @@
+# Pinned versions of the serve dependencies, for reproducing a known-good box.
+#
+# These exact versions were verified together on 2026-08-12: full test suite
+# green on macOS (Python 3.10.6) and the deployed Windows server (Python 3.12.10)
+# serving live routes. `requirements-serve.txt` stays unpinned for ordinary
+# installs; use this file when you want the versions that are known to work:
+#
+#   .venv/bin/python -m pip install -r server/requirements-serve.lock.txt
+#
+# Worth pinning because the graph parquets are read back by geopandas/pyarrow: a
+# major version jump in either is the one upgrade that could break loading data
+# you cannot regenerate without re-running the whole pipeline.
+geopandas==1.1.3
+pandas==2.3.3
+shapely==2.1.2
+pyarrow==24.0.0
+numpy==2.2.6
+scipy==1.15.3
+pyproj==3.7.1
+Flask==3.1.3
+flask-cors==6.0.5
+Flask-Compress==1.24
+waitress==3.0.2

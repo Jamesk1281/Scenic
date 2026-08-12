@@ -5,8 +5,9 @@ Linux, and in Docker (unlike gunicorn, which is Unix-only). One worker process
 with a few threads: the ~1 GB graph is loaded once, and threads let requests
 overlap (scipy releases the GIL during the heavy routing).
 
-    python server/serve.py             # serve on 0.0.0.0:5057
-    PORT=8080 python server/serve.py   # custom port
+    python server/serve.py                          # 0.0.0.0:5057
+    PORT=8080 python server/serve.py                # custom port
+    SCENIC_HOST=127.0.0.1 python server/serve.py    # localhost only
 
 Importing `app` below loads the graph immediately, so the server is warm before
 it accepts the first request.
@@ -20,5 +21,11 @@ from app import app  # noqa: E402 — importing builds the graph (warm startup)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5057"))
-    print(f"Scenic API serving on http://0.0.0.0:{port}")
-    serve(app, host="0.0.0.0", port=port, threads=4)
+    # 0.0.0.0 by default so a phone on the same Wi-Fi can reach a dev server.
+    # Behind a tunnel, nothing off-box ever connects directly — cloudflared
+    # reaches the app over loopback — so SCENIC_HOST=127.0.0.1 is worth setting
+    # on a deployed box: it keeps the local network out and sidesteps the
+    # Windows Firewall prompt entirely.
+    host = os.environ.get("SCENIC_HOST", "0.0.0.0")
+    print(f"Scenic API serving on http://{host}:{port}")
+    serve(app, host=host, port=port, threads=4)

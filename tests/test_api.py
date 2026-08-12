@@ -32,6 +32,17 @@ def test_health(client):
     assert body["status"] == "ok" and body["nodes"] > 0
 
 
+def test_root_describes_the_service(client):
+    """A bare visit must not 404 — that reads as a broken deploy when checking
+    a tunnel from a browser."""
+    response = client.get("/")
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["service"] == "scenic-api"
+    assert "/api/route" in body["endpoints"]
+    assert "coast" in body["beauty_types"]
+
+
 def test_route_returns_both_options(client):
     body = client.get(f"/api/route?from={WORCESTER}&to={BOSTON}&pref=0.6").get_json()
     assert set(body) == {"fastest", "scenic"}

@@ -27,12 +27,16 @@ travel time for beauty via a single preference knob, and a native iOS app
 - [x] Scenic-byway calibration (Mohawk Trail, Jacob's Ladder)
 - [x] Scoring calibrated against the score distribution, with tests that guard
       it (`tests/`) — see [How scoring works](#how-scoring-works)
+- [x] Hosted API: self-hosted on a spare laptop behind a Cloudflare tunnel, so
+      the app works off-device on a real phone — see
+      [`server/DEPLOY.md`](server/DEPLOY.md)
 - [ ] Land cover (NLCD/ESA WorldCover) feature for better score accuracy
 - [ ] More accurate travel times (currently free-flow: speed limit ÷ distance,
       no stops or traffic — measured 10-25% optimistic against real drive times,
       and worst on the surface roads scenic routes prefer)
-- [ ] Host the API (spare laptop or VPS) so the app works off-device — see
-      [`server/DEPLOY.md`](server/DEPLOY.md)
+- [ ] Drive the routes and judge them. Scoring is calibrated and the nav code is
+      written, but none of it has met real GPS yet; route *quality* is the one
+      question a laptop cannot answer.
 
 > The early MapLibre web demo was retired to focus on iOS; it lives in git
 > history (`git show 82044e2`) and is cheap to revive on the same API if needed.
@@ -81,8 +85,13 @@ curl -L -o data/raw/massachusetts-latest.osm.pbf \
 To *host* it (spare laptop or VPS, with a production server + tunnel), see
 [`server/DEPLOY.md`](server/DEPLOY.md) — that path runs `server/serve.py`.
 
+`GET /` returns a short description of the service and its endpoints, which
+doubles as a liveness check you can open in a browser.
+
 The iOS app (`ios/`, open in Xcode) calls `GET /api/route?from=LAT,LON&to=LAT,LON&pref=0..1`
-and renders the fastest vs scenic routes. Command-line equivalent:
+and renders the fastest vs scenic routes. It reads the backend URL from the
+`ScenicAPIBaseURL` Info.plist key set in `ios/project.yml`, overridable at
+runtime with a `SCENIC_API` environment variable. Command-line equivalent:
 
 ```sh
 .venv/bin/python pipeline/router.py data/processed "42.2626,-71.8023" "42.3551,-71.0657" 0.6
