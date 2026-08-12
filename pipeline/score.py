@@ -180,6 +180,22 @@ def sample_relief(chunks: gpd.GeoDataFrame, relief_path: Path) -> np.ndarray:
     return np.clip(vals / RELIEF_FULL, 0, 1)
 
 
+def components(df) -> list[str]:
+    """The per-segment "beauty vector" columns present on a frame, in order."""
+    return [c for c in df.columns if c.startswith("c_")]
+
+
+def blend(df):
+    """Weighted sum of every component column, using this file's WEIGHTS.
+
+    The single definition of the blend: score.py builds the precomputed column
+    with it, graph.py re-derives it after averaging components along an edge,
+    and router.py's live re-blend leans on the same weights. Column `c_x` is
+    weighted by `WEIGHTS["x"]`.
+    """
+    return sum(WEIGHTS[c[2:]] * df[c] for c in components(df))
+
+
 def composite(raw, score_adj):
     """Blend the weighted component sum into the 0–10 scenic score.
 
@@ -258,18 +274,13 @@ def main(processed_dir: str):
                                  np.where(mid_place, 0.5, 0.0))
     print(f"features computed in {time.time() - t0:.0f}s")
 
-    # Composite score
-    raw = (
-        WEIGHTS["water"] * chunks["c_water"]
-        + WEIGHTS["coast"] * chunks["c_coast"]
-        + WEIGHTS["green"] * chunks["c_green"]
-        + WEIGHTS["curves"] * chunks["c_curves"]
-        + WEIGHTS["relief"] * chunks["c_relief"]
-        + WEIGHTS["farm"] * chunks["c_farm"]
-        + WEIGHTS["views"] * chunks["c_views"]
-        + WEIGHTS["scenic_tag"] * chunks["c_scenic_tag"]
-        + WEIGHTS["urban"] * chunks["c_urban"]
-    )
+    # Composite score. Blended over whatever c_ columns exist rather than a
+    # written-out sum, because graph.py re-derives the same blend from the same
+    # WEIGHTS when it averages components along an edge — an explicit list here
+    # is a list that can silently fall out of step with that one, and with the
+    # router's live re-blend. A component with no WEIGHTS entry is a KeyError
+    # rather than a term quietly missing from the score.
+    raw = blend(chunks)
     class_adj = chunks["highway"].map(CLASS_ADJ).fillna(0.0)
     unpaved_adj = np.where(chunks["surface"].isin(UNPAVED), UNPAVED_ADJ, 0.0)
     # Store the road-class/surface adjustment separately from the composite. The

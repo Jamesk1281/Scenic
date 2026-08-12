@@ -24,7 +24,6 @@ writes out/route_fastest.geojson and out/route_scenic.geojson.
 import json
 import math
 import sys
-from collections import defaultdict
 from functools import cached_property
 from pathlib import Path
 
@@ -73,6 +72,11 @@ BEAUTY_TYPES = [
     ("town",   "town",        "c_urban",  WEIGHTS["urban"]),
 ]
 
+# The calibrated weight of each tunable type, in BEAUTY_TYPES order. Its sum is
+# the "weight mass" a user's slider settings are renormalized back onto — see
+# Router._edge_scores.
+DEFAULT_WEIGHTS = np.array([w for *_, w in BEAUTY_TYPES])
+
 # Baseline "quality" signals: always on, not user-tunable. Twistiness, mapped
 # viewpoints, and explicit scenic tags form a floor of beauty under every road,
 # so a fine road no one toggled on is never scored flat zero.
@@ -82,10 +86,26 @@ BASELINE = [
     ("c_scenic_tag", WEIGHTS["scenic_tag"]),
 ]
 
+# Minimum component value for a stretch of road to count toward a beauty type in
+# the route summary. It has to sit *below* the smallest partial-credit band any
+# component awards, or that band is silently invisible: score.py gives water 0.45
+# at 120-350 m and towns 0.5 in a settlement's wider orbit, and the old 0.5
+# threshold dropped every metre of the water band — 18% of the network's km — so
+# a route hugging a river 200 m away reported "water: 0 mi".
+#
+# 0.4 rather than exactly 0.45, because graph.py averages components over an
+# edge's length: a stretch that is mostly-but-not-entirely in the band lands
+# just under it. The cost of the margin is that `hills`, the one component
+# that is continuous rather than banded, now counts 40 m of local relief
+# instead of 50 m (25.9% of the network's km rather than 16.0%). That is a
+# taste call either way; the water band being invisible was not.
+# `test_breakdown_threshold_admits_every_partial_credit_band` is the tripwire if
+# a DIST band in score.py is ever retuned below this.
+BREAKDOWN_MIN = 0.4
+
 # The route-summary breakdown: km of road passing each beauty type. Derived from
-# BEAUTY_TYPES so the two never drift; a stretch counts toward a type when its
-# component is >= 0.5.
-SCENERY_BREAKDOWN = [(label, col, 0.5) for _, label, col, _ in BEAUTY_TYPES]
+# BEAUTY_TYPES so the two never drift.
+SCENERY_BREAKDOWN = [(label, col, BREAKDOWN_MIN) for _, label, col, _ in BEAUTY_TYPES]
 
 _TO_M = Transformer.from_crs(4326, CRS_METERS, always_xy=True)
 
@@ -161,12 +181,20 @@ class Router:
         )
 
         # (tail, head) -> directed-edge slots, used in _collect to map a node
-        # path back to edges. Built once here (eagerly) so the server is fully
-        # warm after startup — no slow first request. Parallel roads mean a pair
-        # can hold several slots.
-        self._adj = defaultdict(list)
-        for k in range(len(self.tail)):
-            self._adj[(self.tail[k], self.head[k])].append(k)
+        # path back to edges. Parallel roads mean a pair can hold several slots,
+        # so this is a CSR-style grouping: the slots for pair p live in
+        # _pair_slots[_pair_start[p]:_pair_start[p + 1]], and _pair_key holds
+        # each pair's (tail, head) folded into one sorted integer to bisect on.
+        #
+        # A dict keyed by (tail, head) tuples is the obvious way to write this
+        # and cost ~200 MB of the server's ~1 GB — three quarters of a million
+        # boxed tuples, boxed ints and one-element lists — plus the eager Python
+        # loop that built them at every startup. These arrays are ~18 MB.
+        order = np.argsort(self.slot_pair, kind="stable")
+        self._pair_slots = order
+        self._pair_start = np.searchsorted(self.slot_pair[order],
+                                           np.arange(self.n_pairs + 1))
+        self._pair_key = self.u_tail.astype(np.int64) * self.n + self.u_head
 
     def _edge_scores(self, weights: dict) -> np.ndarray:
         """Per *undirected* edge 0-10 scenic score under the given beauty weights.
@@ -177,16 +205,40 @@ class Router:
         transform is score.py's `composite`, imported rather than re-derived so
         the live score and the precomputed column cannot drift apart. At
         all-1.0 weights this equals the precomputed `score` column exactly.
+
+        The weight vector is renormalized to hold the *total* tunable weight
+        constant, so these knobs change the scenery mix and `pref` alone sets
+        the strength — which is what the tune screen tells the user they do.
+        Without it the sliders quietly destroy the scale they feed: pushing all
+        six to the app's maximum pinned 17% of the state's road-km at exactly
+        10.0, and the router's penalty is `km * (1 - score/10)`, so every pinned
+        road became free and indistinguishable from every other. Cranking
+        everything then returned a route no more scenic than neutral and 5 km
+        longer — the "more of everything" request making the result worse.
+        Renormalizing maps that request back to "no preference", which is what
+        it means. All-1.0 is a fixed point, so the precomputed column is
+        untouched.
         """
-        w = np.array([weights.get(name, 1.0) for name, *_ in BEAUTY_TYPES])
+        w = np.array([weights.get(name, 1.0) for name, *_ in BEAUTY_TYPES], float)
+        mass = float(w @ DEFAULT_WEIGHTS)
+        if mass > 0:
+            w = w * (DEFAULT_WEIGHTS.sum() / mass)
         raw = self.base_score + self.pref_matrix @ w
         return composite(raw, self.score_adj)
 
-    def _weights(self, pref: float, weights: dict) -> np.ndarray:
-        """Directed-edge Dijkstra weights: travel time + a scenery detour cost."""
-        score = self._edge_scores(weights)                  # per undirected edge
-        penalty = self.km * (1.0 - score / 10.0)            # km of "unscenic" road
-        strength = pref ** PREF_CURVE
+    def _weights(self, pref: float, scores: np.ndarray) -> np.ndarray:
+        """Directed-edge Dijkstra weights: travel time + a scenery detour cost.
+
+        `scores` is the per-undirected-edge 0-10 score from `_edge_scores`,
+        passed in rather than recomputed so the route is reported on exactly the
+        scale it was optimized against (see `route`).
+        """
+        penalty = self.km * (1.0 - scores / 10.0)           # km of "unscenic" road
+        # Clamped because a negative pref raised to a fractional power is a
+        # *complex* number in Python ((-0.5) ** 1.3), which would silently poison
+        # the whole cost matrix. The API clamps too; this keeps the class safe
+        # for its other caller, the CLI.
+        strength = max(0.0, min(1.0, pref)) ** PREF_CURVE
         return self.d_minutes + strength * BETA * penalty[self.eidx]
 
     def snap(self, lat: float, lon: float) -> tuple[int, float]:
@@ -217,7 +269,14 @@ class Router:
         return (u if du <= dv else v), float(self._edge_geom_m[e].distance(point))
 
     def route(self, src_idx: int, dst_idx: int, pref: float, weights: dict = None):
-        w = self._weights(pref, weights or {})
+        # Scored once, then used for both jobs: choosing the route and reporting
+        # it. They used to disagree — the router optimized the live re-blend
+        # while RouteResult.mean_score read the stored neutral column, so a user
+        # who asked for coast was shown a number computed as though they hadn't
+        # (measured 1.9 points apart on a 0-10 scale). That number is the whole
+        # output of the tune screen.
+        scores = self._edge_scores(weights or {})
+        w = self._weights(pref, scores)
         # Collapse parallel edges to the cheapest weight per node-pair, so the
         # cost matrix has one entry per pair (no summed duplicates).
         pair_w = np.full(self.n_pairs, np.inf)
@@ -237,9 +296,9 @@ class Router:
             return None
         path.append(src_idx)
         path.reverse()
-        return self._collect(path, w)
+        return self._collect(path, w, scores)
 
-    def _collect(self, path, w):
+    def _collect(self, path, w, scores):
         """Turn a Dijkstra node path into the chosen edges, in travel order.
 
         Dijkstra hands back a sequence of node indices. For each hop (a -> b) we
@@ -250,15 +309,26 @@ class Router:
         The edges come out in travel order, which is exactly what the
         turn-by-turn step list walks over to emit "turn onto X" maneuvers.
         """
+        hops = np.asarray(path, dtype=np.int64)
+        keys = hops[:-1] * self.n + hops[1:]
+        pairs = np.searchsorted(self._pair_key, keys)
+
         chosen = []
-        for a, b in zip(path[:-1], path[1:]):
-            slots = self._adj.get((a, b))
-            if not slots:
-                continue
-            chosen.append(min(slots, key=lambda s: w[s]))
+        for hop, pair in enumerate(pairs):
+            if pair >= self.n_pairs or self._pair_key[pair] != keys[hop]:
+                # Every (tail, head) Dijkstra can traverse was indexed from the
+                # same arrays, so this is unreachable. Skipping the hop silently
+                # would be the worst way to be wrong about that: the drawn line
+                # would jump the gap and the distance would be under-reported,
+                # with nothing anywhere saying so.
+                raise RuntimeError(f"no directed edge for hop {hops[hop]} -> "
+                                   f"{hops[hop + 1]}; graph index is inconsistent")
+            slots = self._pair_slots[self._pair_start[pair]:self._pair_start[pair + 1]]
+            chosen.append(int(slots[np.argmin(w[slots])]))
 
         # The undirected edge rows (stats, names, geometry) in travel order.
-        rows = self.edges.iloc[[self.eidx[k] for k in chosen]]
+        edge_rows = [self.eidx[k] for k in chosen]
+        rows = self.edges.iloc[edge_rows]
 
         # Stitch the per-edge geometries into one line, flipping any edge we
         # traversed against its stored direction so the points run start -> end.
@@ -270,7 +340,7 @@ class Router:
             coords.append(c)
         # `coords` is the per-edge geometry in travel order; the steps generator
         # uses it (with the edge names) to build maneuvers.
-        return RouteResult(rows, stitch(coords), coords)
+        return RouteResult(rows, stitch(coords), coords, scores[edge_rows])
 
 
 def stitch(coord_arrays):
@@ -324,12 +394,17 @@ def _turn_phrase(bearing_in, bearing_out):
 
 
 class RouteResult:
-    def __init__(self, edge_rows: gpd.GeoDataFrame, line, edge_coords=None):
+    def __init__(self, edge_rows: gpd.GeoDataFrame, line, edge_coords=None,
+                 scores=None):
         self.edges = edge_rows
         self.line = line
         # Per-edge [lon, lat] arrays in travel order (parallel to edge_rows),
         # used to build turn-by-turn steps. None for callers that don't need them.
         self.edge_coords = edge_coords or []
+        # Per-edge 0-10 score under the beauty weights this route was chosen
+        # with, aligned to edge_rows. None falls back to the stored neutral
+        # column, which is right only when no weights were applied.
+        self.scores = scores
 
     @cached_property
     def km(self):
@@ -341,8 +416,9 @@ class RouteResult:
 
     @cached_property
     def mean_score(self):
-        L = self.edges["length_m"]
-        return float((self.edges["score"] * L).sum() / max(L.sum(), 1))
+        L = self.edges["length_m"].to_numpy()
+        s = self.edges["score"].to_numpy() if self.scores is None else self.scores
+        return float((s * L).sum() / max(L.sum(), 1))
 
     def scenery_km(self):
         """Kilometers of this route that pass each kind of scenery (the labels

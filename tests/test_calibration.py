@@ -88,6 +88,32 @@ class TestScoreScale:
                            edges["score"].to_numpy(), atol=1e-9)
 
 
+class TestBreakdownThreshold:
+    def test_breakdown_threshold_admits_every_partial_credit_band(self, chunks):
+        """A component's partial-credit band has to clear the route-summary
+        threshold, or score.py credits road the app can never show.
+
+        score.py awards water 0.45 out to 350 m and towns 0.5 across a
+        settlement's wider orbit. The summary asked for >= 0.5, so every metre
+        of the water band — 18% of the network's km — scored for water and
+        reported as zero: a route hugging a river 200 m away said "water: 0 mi".
+        Retuning a DIST band below BREAKDOWN_MIN would bring that back.
+        """
+        from router import BREAKDOWN_MIN, SCENERY_BREAKDOWN
+
+        for label, column, threshold in SCENERY_BREAKDOWN:
+            values = np.unique(chunks[column].to_numpy())
+            # Only the banded components can be checked this way; relief is a
+            # continuous measure whose threshold is a genuine "how hilly counts"
+            # judgement rather than a band boundary.
+            if len(values) > 5:
+                continue
+            bands = values[values > 1e-9]
+            assert bands.min() >= threshold, (
+                f"{label}: score.py awards {column}={bands.min()} but the "
+                f"summary only counts >= {threshold}, so that band is invisible")
+
+
 class TestBenchmarkRoads:
     """Named roads whose relative order is not a matter of taste."""
 

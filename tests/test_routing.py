@@ -10,8 +10,10 @@ import numpy as np
 import pytest
 import shapely
 
-from router import (BEAUTY_TYPES, PREF_CURVE, RouteResult, _bearing, _compass,
-                    _turn_delta, _turn_phrase, stitch)
+from router import (BEAUTY_TYPES, BREAKDOWN_MIN, PREF_CURVE, RouteResult,
+                    _bearing, _compass, _turn_delta, _turn_phrase, stitch)
+
+ALL_TYPES = [name for name, *_ in BEAUTY_TYPES]
 
 BOSTON = (42.3551, -71.0657)
 WORCESTER = (42.2626, -71.8023)
@@ -185,11 +187,100 @@ class TestRoutingOverTheGraph:
         live = router._edge_scores({name: 1.0 for name, *_ in BEAUTY_TYPES})
         assert np.allclose(live, router.edges["score"].to_numpy(), atol=1e-9)
 
+    def test_negative_pref_is_clamped_rather_than_going_complex(self, router):
+        """`(-0.5) ** 1.3` is a complex number in Python, which would poison the
+        whole cost matrix. The API clamps; the class must too, for the CLI."""
+        w = router._weights(-0.5, router._edge_scores({}))
+        assert np.isrealobj(w)
+        assert np.array_equal(w, router._weights(0.0, router._edge_scores({})))
+
+
+class TestReportedScenery:
+    """The number the app puts on screen has to be the one the router used."""
+
+    def _od(self, router, a, b):
+        return router.snap(*a)[0], router.snap(*b)[0]
+
+    def test_mean_score_is_measured_on_the_users_own_scale(self, router):
+        """The defect this guards: the router optimized the live re-blend while
+        the summary read the stored neutral column, so a user who asked for
+        coast was shown a score computed as though they hadn't — 1.9 points
+        apart on a 0-10 scale, on the one number the tune screen exists to move.
+        """
+        weights = {"coast": 4.0, "town": 0.0, "farm": 0.0}
+        s, t = self._od(router, BOSTON, (41.6362, -70.9342))
+        route = router.route(s, t, 0.8, weights)
+
+        live = router._edge_scores(weights)[route.edges.index.to_numpy()]
+        length = route.edges["length_m"].to_numpy()
+        expected = (live * length).sum() / length.sum()
+        assert route.mean_score == pytest.approx(expected, rel=1e-12)
+
+        stored = route.edges["score"].to_numpy()
+        assert route.mean_score != pytest.approx(
+            (stored * length).sum() / length.sum(), abs=0.05), \
+            "weights that reshape the route must reshape its reported score"
+
+    def test_neutral_requests_still_report_the_precomputed_score(self, router):
+        s, t = self._od(router, WORCESTER, BOSTON)
+        route = router.route(s, t, 0.7)
+        length = route.edges["length_m"].to_numpy()
+        stored = route.edges["score"].to_numpy()
+        assert route.mean_score == pytest.approx(
+            (stored * length).sum() / length.sum(), rel=1e-9)
+
+
+class TestBeautyWeightsAreWellBehaved:
+    """The tune sliders shape *what kind* of scenery; `pref` sets how much."""
+
+    def _od(self, router, a, b):
+        return router.snap(*a)[0], router.snap(*b)[0]
+
+    @pytest.mark.parametrize("level", [0.5, 1.5, 2.0, 4.0])
+    def test_moving_every_slider_together_means_no_preference(self, router, level):
+        """"More of everything" is not a preference, and must not be treated as
+        one. It used to be: at the app's maximum it pinned 17% of the state's
+        road-km at exactly 10.0, where the router's `1 - score/10` penalty makes
+        every road free and indistinguishable."""
+        uniform = router._edge_scores({t: level for t in ALL_TYPES})
+        assert np.allclose(uniform, router._edge_scores({}), atol=1e-9)
+
+    @pytest.mark.parametrize("weights", [
+        {}, {t: 2.0 for t in ALL_TYPES}, {t: 4.0 for t in ALL_TYPES},
+        {"coast": 4.0}, {"hills": 4.0, "town": 0.0}, {t: 0.0 for t in ALL_TYPES},
+    ])
+    def test_no_setting_flattens_the_scale(self, router, weights):
+        """However the sliders are set, the score has to keep discriminating
+        between roads — a scale pinned at its ceiling is not a scale."""
+        scores = router._edge_scores(weights)
+        km = router.km
+        pinned = km[scores >= 9.99].sum() / km.sum()
+        assert pinned < 0.05, f"{100 * pinned:.0f}% of km pinned at 10"
+        assert scores.min() >= 0.0 and scores.max() <= 10.0
+
+    def test_cranking_everything_is_not_worse_than_neutral(self, router):
+        """It used to be: all sliders at maximum returned a route no more scenic
+        than neutral and 5 km longer."""
+        s, t = self._od(router, WORCESTER, BOSTON)
+        neutral = router.route(s, t, 1.0)
+        cranked = router.route(s, t, 1.0, {t_: 2.0 for t_ in ALL_TYPES})
+        assert cranked.mean_score >= neutral.mean_score - 1e-9
+        assert cranked.km <= neutral.km + 1e-9
+
+    def test_a_single_type_still_leans_the_route(self, router):
+        """Renormalizing must not neuter the sliders — asking for coast and
+        little else still has to find more coast."""
+        s, t = self._od(router, BOSTON, (41.6362, -70.9342))
+        neutral = router.route(s, t, 0.8)
+        coastal = router.route(s, t, 0.8, {"coast": 4.0, "town": 0.0, "farm": 0.0})
+        assert coastal.scenery_km()["coast"] > neutral.scenery_km()["coast"]
+
     def test_pref_curve_shapes_the_scenery_cost(self, router):
         """The scenery term must scale as pref**PREF_CURVE, not linearly — that
         is what keeps the slider's low end fine-grained."""
-        half = router._weights(0.5, {}) - router.d_minutes
-        full = router._weights(1.0, {}) - router.d_minutes
+        neutral = router._edge_scores({})
+        half = router._weights(0.5, neutral) - router.d_minutes
+        full = router._weights(1.0, neutral) - router.d_minutes
         moving = full > 0
         ratio = half[moving].sum() / full[moving].sum()
         assert ratio == pytest.approx(0.5 ** PREF_CURVE, rel=1e-9)

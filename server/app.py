@@ -83,15 +83,18 @@ def api_route():
         return jsonify(error="point is outside the covered road network "
                              "(currently Massachusetts)"), 400
     if s == t:
-        return jsonify(error="start and end snap to the same point"), 400
+        return jsonify(error="those points are too close together — "
+                             "they sit on the same stretch of road"), 400
 
-    # Fastest ignores beauty weights (pref 0 zeroes the scenery term anyway);
-    # the scenic route applies the user's overall strength and per-type weights.
-    # At pref 0 the scenic weights collapse to the fastest ones, so reuse that
+    # Both routes are scored with the user's beauty weights so the two numbers
+    # the app puts side by side ("scenery 4.1 -> 6.3") are on one scale. The
+    # weights do not change the *fastest* route itself: pref 0 zeroes the
+    # scenery term, so its path is time-only either way.
+    # At pref 0 the scenic route collapses to the fastest one, so reuse that
     # result instead of running Dijkstra twice — this halves the latency of
     # mid-drive "switch to fastest" reroutes.
     pref = max(0.0, min(1.0, pref))
-    fastest = ROUTER.route(s, t, 0.0)
+    fastest = ROUTER.route(s, t, 0.0, weights)
     scenic = fastest if pref == 0.0 else ROUTER.route(s, t, pref, weights)
     if fastest is None or scenic is None:
         return jsonify(error="no route found between those points"), 404

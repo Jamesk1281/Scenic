@@ -75,6 +75,45 @@ def test_beauty_weights_are_accepted(client):
     assert r.status_code == 200
 
 
+def test_both_routes_are_scored_on_the_same_scale(client):
+    """The app shows "scenery 4.1 -> 6.3" side by side, so the two numbers have
+    to be measured the same way. Weighting only the scenic one made the
+    comparison meaningless — and the fastest route's own path must not move,
+    since pref 0 zeroes the scenery term whatever the weights say."""
+    plain = client.get(f"/api/route?from={WORCESTER}&to={BOSTON}&pref=0.7").get_json()
+    tuned = client.get(f"/api/route?from={WORCESTER}&to={BOSTON}&pref=0.7"
+                       "&w_coast=4&w_town=0&w_farm=0").get_json()
+
+    # same path for "fastest" either way...
+    assert tuned["fastest"]["geometry"] == plain["fastest"]["geometry"]
+    # ...but rescored, along with the scenic route, on the user's own scale
+    assert tuned["fastest"]["properties"]["mean_score"] != \
+        plain["fastest"]["properties"]["mean_score"]
+
+
+def test_tuning_changes_the_reported_score(client):
+    """A tune slider that moves the route but not its reported score is the
+    defect this guards."""
+    plain = client.get(f"/api/route?from={BOSTON}&to=41.6362,-70.9342"
+                       "&pref=0.8").get_json()["scenic"]["properties"]
+    coastal = client.get(f"/api/route?from={BOSTON}&to=41.6362,-70.9342"
+                         "&pref=0.8&w_coast=4&w_town=0&w_farm=0"
+                         ).get_json()["scenic"]["properties"]
+    assert coastal["mean_score"] != plain["mean_score"]
+    assert coastal["scenery_km"]["coast"] > plain["scenery_km"]["coast"]
+
+
+def test_weights_are_clamped_not_rejected(client):
+    for query in ("w_coast=-3", "w_coast=99", "w_coast=1e999"):
+        r = client.get(f"/api/route?from={WORCESTER}&to={BOSTON}&pref=0.5&{query}")
+        assert r.status_code == 200, query
+
+
+def test_unparseable_weight_is_a_bad_request(client):
+    r = client.get(f"/api/route?from={WORCESTER}&to={BOSTON}&w_coast=abc")
+    assert r.status_code == 400
+
+
 @pytest.mark.parametrize("query", [
     "",                                       # nothing at all
     f"from={WORCESTER}",                      # missing destination

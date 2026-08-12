@@ -17,6 +17,7 @@ import concurrent.futures as cf
 import io
 import math
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -29,7 +30,24 @@ from scipy.ndimage import maximum_filter, minimum_filter
 # MA bounding box (lon/lat) with a small margin
 BBOX = (-73.55, 41.18, -69.85, 42.92)
 TILE_URL = "https://elevation-tiles-prod.s3.amazonaws.com/terrarium/{z}/{x}/{y}.png"
-RELIEF_WINDOW_M = 1000.0  # neighborhood for local relief
+
+# Neighborhood for local relief, in *ground* meters. Web Mercator stretches
+# distance by 1/cos(latitude), so a window sized in raw mercator units is
+# narrower on the ground than it reads — at Massachusetts' latitude, 26%
+# narrower. That went unnoticed because it is self-consistent within one
+# region: score.py's RELIEF_FULL was fitted against whatever window this
+# actually produced. It stops being self-consistent the moment the pipeline is
+# pointed at a second region, where the same constant would silently mean a
+# different distance. 750 m is the window MA has been using all along
+# (13 px either way), now stated in the units it is measured in.
+RELIEF_WINDOW_M = 750.0
+
+# Below this share of the mosaic covered by real data, stop rather than write a
+# raster. Missing tiles are filled as sea level, so a hole does not read as
+# "no data" downstream — it reads as a flat plain ringed by a cliff of maximal
+# relief, which score.py then happily turns into scenery.
+MIN_COVERAGE = 0.98
+
 TILE_PX = 256
 R = 6378137.0  # web mercator radius
 
@@ -51,18 +69,38 @@ def tile_to_mercator(x, y, z):
 
 
 def fetch_tile(z, x, y, cache: Path):
+    """Fetch one terrain tile. Returns (x, y, rgb or None, reason or None).
+
+    A tile that cannot be fetched is not a harmless gap — main() fills it as
+    sea level — so the reason travels back with it and gets reported rather
+    than swallowed. Retries back off, because the failure worth retrying is a
+    rate limit or a blip, and hammering S3 three times in a row rides out
+    neither.
+    """
     p = cache / f"{z}_{x}_{y}.png"
     if p.exists():
-        return x, y, np.asarray(Image.open(p).convert("RGB"))
+        try:
+            return x, y, np.asarray(Image.open(p).convert("RGB")), None
+        except Exception as e:
+            # A truncated write from an interrupted earlier run. Drop it and
+            # re-fetch rather than failing forever on a poisoned cache.
+            p.unlink(missing_ok=True)
+            print(f"  re-fetching corrupt cache entry {p.name}: {e}")
+
+    reason = "no attempt made"
     for attempt in range(3):
         try:
             r = requests.get(TILE_URL.format(z=z, x=x, y=y), timeout=30)
             if r.status_code == 200:
                 p.write_bytes(r.content)
-                return x, y, np.asarray(Image.open(io.BytesIO(r.content)).convert("RGB"))
-        except requests.RequestException:
-            pass
-    return x, y, None  # missing tile -> filled as nodata
+                return x, y, np.asarray(
+                    Image.open(io.BytesIO(r.content)).convert("RGB")), None
+            reason = f"HTTP {r.status_code}"
+        except requests.RequestException as e:
+            reason = type(e).__name__
+        if attempt < 2:
+            time.sleep(0.5 * 2 ** attempt)
+    return x, y, None, reason
 
 
 def decode_terrarium(rgb: np.ndarray) -> np.ndarray:
@@ -88,11 +126,12 @@ def main(out_dir: str, zoom: int = 11):
     elev = np.full((H, W), np.nan, dtype=np.float64)
 
     jobs = [(zoom, x, y) for x in tx for y in ty]
-    done = 0
+    done, missing = 0, []
     with cf.ThreadPoolExecutor(max_workers=24) as ex:
-        for x, y, rgb in ex.map(lambda j: fetch_tile(*j, cache), jobs):
+        for x, y, rgb, reason in ex.map(lambda j: fetch_tile(*j, cache), jobs):
             done += 1
             if rgb is None:
+                missing.append((x, y, reason))
                 continue
             col = (x - x0) * TILE_PX
             row = (y - y0) * TILE_PX
@@ -100,15 +139,36 @@ def main(out_dir: str, zoom: int = 11):
             if done % 100 == 0:
                 print(f"  {done}/{len(jobs)} tiles")
 
+    valid = ~np.isnan(elev)
+    coverage = float(valid.mean())
+    if missing:
+        print(f"WARNING: {len(missing)} of {len(jobs)} tiles could not be fetched; "
+              f"each becomes a ~{TILE_PX * 40:.0f} km^2 patch of fake sea level")
+        for x, y, reason in missing[:10]:
+            print(f"    z{zoom}/{x}/{y}: {reason}")
+        if len(missing) > 10:
+            print(f"    ... and {len(missing) - 10} more")
+    if coverage < MIN_COVERAGE:
+        raise SystemExit(
+            f"only {100 * coverage:.1f}% of the mosaic has real elevation data "
+            f"(need {100 * MIN_COVERAGE:.0f}%). Refusing to write a relief raster "
+            f"whose holes would score as terrain. Re-run to retry the failed "
+            f"tiles — successful ones are cached in {cache}."
+        )
+
     # Mercator bounds + transform for the assembled mosaic
     left, top = tile_to_mercator(x0, y0, zoom)
     right, bottom = tile_to_mercator(x1 + 1, y1 + 1, zoom)
     transform = from_bounds(left, bottom, right, top, W, H)
 
-    # Local relief via a moving window (range = max - min)
-    px_m = (right - left) / W
-    win = max(3, int(round(RELIEF_WINDOW_M / px_m)) | 1)  # odd
-    print(f"pixel ~{px_m:.0f} m; relief window {win}px (~{win * px_m:.0f} m)")
+    # Local relief via a moving window (range = max - min). The window is sized
+    # in ground meters, so the mercator scale factor at this region's latitude
+    # has to come out first — see RELIEF_WINDOW_M.
+    px_m = (right - left) / W                       # mercator meters per pixel
+    px_ground = px_m * math.cos(math.radians((s + n) / 2))
+    win = max(3, int(round(RELIEF_WINDOW_M / px_ground)) | 1)  # odd
+    print(f"pixel ~{px_m:.0f} mercator m (~{px_ground:.0f} m on the ground); "
+          f"relief window {win}px (~{win * px_ground:.0f} m)")
     # Clamp ocean bathymetry (Terrarium encodes sea floor as deep negatives) to
     # sea level so coastal roads don't get spuriously huge land relief.
     land = np.clip(np.where(np.isnan(elev), 0.0, elev), 0.0, None)
@@ -124,9 +184,8 @@ def main(out_dir: str, zoom: int = 11):
     with rasterio.open(out / "elevation.tif", "w", nodata=float("nan"), **prof) as dst:
         dst.write(elev.astype(np.float32), 1)
 
-    valid = ~np.isnan(elev)
     print(f"elevation: {np.nanmin(elev):.0f}..{np.nanmax(elev):.0f} m "
-          f"({100 * valid.mean():.1f}% covered)")
+          f"({100 * coverage:.1f}% covered)")
     print(f"relief: median {np.median(relief[valid]):.0f} m, "
           f"p95 {np.percentile(relief[valid], 95):.0f} m")
     print(f"wrote {out / 'relief.tif'} and {out / 'elevation.tif'}")
