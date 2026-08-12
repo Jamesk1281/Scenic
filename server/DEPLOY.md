@@ -21,6 +21,12 @@ the pipeline scripts:
 Regenerate the graph locally with the pipeline (see the top-level README) when
 the scoring changes, then copy the two parquet files over.
 
+> Deploying the length-weighted edge scoring needs a `graph.py` rerun and a
+> fresh copy of both parquets. The old ones still *load* under the new code —
+> the columns are unchanged — so nothing errors; the server would just keep
+> serving the midpoint-sampled scores, which is the silent-disagreement case
+> the warning below is about.
+
 > **The code and the parquets must come from the same commit.** `router.py`
 > re-blends every edge's score live per request using `WEIGHTS` from `score.py`,
 > so a server running different scoring constants than the ones that built the
