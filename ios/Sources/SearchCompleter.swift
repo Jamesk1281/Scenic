@@ -20,18 +20,23 @@ final class SearchCompleter: NSObject, MKLocalSearchCompleterDelegate {
         super.init()
         completer.delegate = self
         completer.resultTypes = [.address, .pointOfInterest]
-        // Bias results toward Massachusetts so "northea" surfaces Northeastern.
         completer.region = .massachusetts
     }
 
-    /// Refresh suggestions for the current text. Very short fragments are
-    /// ignored so we don't show noise for one or two letters.
-    func update(for fragment: String) {
+    /// Refresh suggestions for the current text, ranked around `region`.
+    ///
+    /// The caller passes the part of the map the user is looking at (or is
+    /// standing in), because the completer ranks by distance from that region's
+    /// center: bias it statewide and a search from Needham surfaces places in
+    /// central Massachusetts first. Very short fragments are ignored so we don't
+    /// show noise for one or two letters.
+    func update(for fragment: String, near region: MKCoordinateRegion) {
         let query = fragment.trimmingCharacters(in: .whitespaces)
         guard query.count >= 2 else {
             suggestions = []
             return
         }
+        completer.region = region
         completer.queryFragment = query
     }
 

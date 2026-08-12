@@ -30,9 +30,9 @@ from router import BEAUTY_TYPES, Router  # noqa: E402
 # keeps one cranked slider from completely swamping the others.
 WEIGHT_MIN, WEIGHT_MAX = 0.0, 4.0
 
-# Reject a request whose endpoint snaps farther than this from any road node —
-# it's outside the covered region (currently Massachusetts), and the "nearest"
-# node would be an arbitrary border town, yielding a nonsense route.
+# Reject a request whose endpoint lies farther than this from any road — it's
+# outside the covered region (currently Massachusetts), and the "nearest" road
+# would be in an arbitrary border town, yielding a nonsense route.
 SNAP_MAX_M = 5000.0
 
 # Where the prebuilt graph lives. An env var (not a CLI arg) so it works

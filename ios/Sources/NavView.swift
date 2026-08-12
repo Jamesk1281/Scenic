@@ -2,9 +2,9 @@ import MapKit
 import SwiftUI
 import UIKit
 
-/// The live navigation screen: a heading-up map that follows the driver, with
-/// the next maneuver up top and controls (bail to the fastest route, end the
-/// drive) at the bottom.
+/// The live navigation screen: a heading-up map that follows the driver, the
+/// next maneuver up top, and a trip bar at the bottom (arrival time, time left,
+/// distance left) with the drive controls either side of it.
 struct NavView: View {
     @Bindable var nav: NavigationModel
     let locationManager: LocationManager
@@ -14,6 +14,9 @@ struct NavView: View {
     /// turn-by-turn map. Falls back to a sensible frame before the first fix.
     @State private var camera: MapCameraPosition =
         .userLocation(followsHeading: true, fallback: .automatic)
+
+    /// Whether the "switch to fastest?" confirmation is up.
+    @State private var confirmingFastest = false
 
     var body: some View {
         Map(position: $camera) {
@@ -45,9 +48,22 @@ struct NavView: View {
         .onChange(of: locationManager.location?.timestamp) {
             if let location = locationManager.location { nav.update(location) }
         }
+        .confirmationDialog("Switch to the fastest route?",
+                            isPresented: $confirmingFastest,
+                            titleVisibility: .visible) {
+            Button("Switch to fastest", role: .destructive) {
+                if let here = locationManager.location?.coordinate {
+                    Task { await nav.switchToFastest(from: here) }
+                }
+            }
+            Button("Keep the scenic route", role: .cancel) {}
+        } message: {
+            Text("This gives up the scenic route for the rest of the drive.")
+        }
     }
 
-    /// The maneuver banner — distance + instruction, or an arrival/reroute note.
+    /// The maneuver banner — distance + instruction, or whatever else the driver
+    /// most needs to know right now.
     @ViewBuilder private var banner: some View {
         Group {
             if nav.arrived {
@@ -63,6 +79,16 @@ struct NavView: View {
             } else if nav.isRerouting {
                 Label("Rerouting…", systemImage: "arrow.triangle.2.circlepath")
                     .font(.headline).frame(maxWidth: .infinity)
+            } else if !nav.hasJoinedRoute {
+                // The trip was planned from somewhere the driver isn't yet. Say
+                // so plainly rather than reading out a first instruction that
+                // belongs to a road miles away.
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("\(distanceText(nav.distanceToRouteStart)) away")
+                        .font(.subheadline).foregroundStyle(.secondary)
+                    Text("Head to the start of your route").font(.title3.bold())
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             } else {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(distanceText(nav.distanceToNext))
@@ -77,32 +103,67 @@ struct NavView: View {
         .padding(.horizontal)
     }
 
-    /// End the drive, and (until you've bailed) a switch-to-fastest button for
-    /// when you realize you're running late.
+    /// Trip stats front and center, with End and the fastest-route escape hatch
+    /// tucked into the corners.
+    ///
+    /// The stats take the middle on purpose. That's where a thumb lands, and the
+    /// numbers aren't tappable — so resting a hand on the phone mid-drive can't
+    /// trigger anything.
     private var controls: some View {
-        HStack {
+        HStack(alignment: .center) {
             Button(role: .destructive) { onEnd() } label: {
-                Label("End", systemImage: "xmark")
+                Label("End", systemImage: "xmark").labelStyle(.iconOnly)
+                    .frame(width: 30, height: 30)
             }
             .buttonStyle(.bordered)
+            .accessibilityLabel("End the drive")
 
-            Spacer()
+            Spacer(minLength: 8)
 
+            if nav.arrived {
+                Text("Arrived").font(.headline)
+            } else {
+                tripStats
+            }
+
+            Spacer(minLength: 8)
+
+            // Hidden once taken: there's no second fastest route to switch to.
             if !nav.followingFastest && !nav.arrived {
-                Button {
-                    if let here = locationManager.location?.coordinate {
-                        Task { await nav.switchToFastest(from: here) }
-                    }
-                } label: {
-                    Label("Fastest route", systemImage: "bolt.fill")
+                Button { confirmingFastest = true } label: {
+                    Label("Fastest", systemImage: "bolt.fill").labelStyle(.iconOnly)
+                        .frame(width: 30, height: 30)
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(.gray)
+                .buttonStyle(.bordered)
+                .tint(.secondary)
+                .accessibilityLabel("Switch to the fastest route")
+            } else {
+                // Keep the stats centered when the button isn't there.
+                Color.clear.frame(width: 30, height: 30)
             }
         }
         .padding(.horizontal)
         .padding(.vertical, 10)
         .background(.ultraThinMaterial)
+    }
+
+    /// Arrival time, time left, distance left — the three numbers a driver
+    /// actually watches.
+    private var tripStats: some View {
+        VStack(spacing: 1) {
+            Text(nav.eta, format: .dateTime.hour().minute())
+                .font(.title3.bold())
+                .monospacedDigit()
+            Text("\(timeText(nav.remainingMinutes)) · \(milesText(nav.remainingMeters))")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            "Arriving at \(nav.eta.formatted(date: .omitted, time: .shortened)), "
+            + "\(timeText(nav.remainingMinutes)) and \(milesText(nav.remainingMeters)) to go"
+        )
     }
 
     /// Distance in friendly US units: feet (rounded to 50) up close, miles after.
@@ -111,6 +172,18 @@ struct NavView: View {
         if feet < 1000 {
             return "\(max(50, Int((feet / 50).rounded()) * 50)) ft"
         }
-        return String(format: "%.1f mi", meters / 1609.34)
+        return milesText(meters)
+    }
+
+    /// "0.4 mi" up close, "23 mi" once the decimal stops meaning anything.
+    private func milesText(_ meters: Double) -> String {
+        let miles = meters / 1609.34
+        return miles < 10 ? String(format: "%.1f mi", miles) : "\(Int(miles.rounded())) mi"
+    }
+
+    /// "8 min", or "1 hr 12 min" once it's worth splitting.
+    private func timeText(_ minutes: Double) -> String {
+        let total = max(0, Int(minutes.rounded()))
+        return total >= 60 ? "\(total / 60) hr \(total % 60) min" : "\(total) min"
     }
 }

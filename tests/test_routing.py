@@ -103,6 +103,42 @@ class TestRoutingOverTheGraph:
         assert near < 500
         assert far > 100_000
 
+    def test_snap_lands_on_the_road_you_are_standing_on(self, router):
+        """The defect this guards: snapping to the nearest *junction* put a
+        mid-block address on a neighbouring street 23% of the time, because the
+        closest junction in a straight line is often on the road behind the
+        house. Drivers reported starting a drive on a road they don't live on.
+        Snapping via the nearest road segment fixes it — both ends of that
+        segment carry the road's own name.
+        """
+        import numpy as np
+        from collections import defaultdict
+
+        edges = router.edges
+        names = edges["name"].fillna("").to_numpy()
+        u, v = edges["u"].to_numpy(), edges["v"].to_numpy()
+        roads_at_node = defaultdict(set)
+        for i in range(len(edges)):
+            roads_at_node[u[i]].add(names[i])
+            roads_at_node[v[i]].add(names[i])
+        node_id = router.nodes["node_id"].to_numpy()
+
+        # Stand in the middle of a sample of named residential blocks — the
+        # stand-in for "outside a house".
+        rng = np.random.default_rng(7)
+        candidates = np.where((edges["highway"].to_numpy() == "residential")
+                              & (edges["length_m"].to_numpy() > 120)
+                              & (names != ""))[0]
+        wrong = 0
+        sample = rng.choice(candidates, size=120, replace=False)
+        for i in sample:
+            midpoint = edges.geometry.values[i].interpolate(0.5, normalized=True)
+            idx, off = router.snap(midpoint.y, midpoint.x)
+            assert off < 1.0, "a point on a road should be ~0 m from the network"
+            if names[i] not in roads_at_node[node_id[idx]]:
+                wrong += 1
+        assert wrong == 0, f"{wrong}/{len(sample)} snapped to a different road"
+
     def test_fastest_is_faster_and_scenic_is_more_scenic(self, router):
         s, t = self._od(router, WORCESTER, BOSTON)
         fast, scenic = router.route(s, t, 0.0), router.route(s, t, 1.0)

@@ -15,12 +15,9 @@ struct ContentView: View {
     /// comes back.
     @State private var camera: MapCameraPosition = .region(.massachusetts)
 
-    /// How tall the sheet is. Compact (just the search controls) until a route
-    /// exists, then it rises to show the comparison.
-    @State private var sheetHeight: PresentationDetent = .height(260)
-
-    /// Owns the user's location; only started once navigation begins.
-    @State private var locationManager = LocationManager()
+    /// How tall the sheet is. Compact until the user engages with it; `RoutePanel`
+    /// raises and lowers it from there.
+    @State private var sheetHeight: PresentationDetent = .planningCompact
 
     var body: some View {
         // A live navigation session takes over the whole screen; otherwise we
@@ -29,7 +26,7 @@ struct ContentView: View {
         // sheet sliding away underneath.
         ZStack {
             if let nav = model.nav {
-                NavView(nav: nav, locationManager: locationManager) { model.endNavigation() }
+                NavView(nav: nav, locationManager: model.locationManager) { model.endNavigation() }
                     .transition(.opacity)
             } else {
                 planningView
@@ -56,17 +53,28 @@ struct ContentView: View {
             if let end = model.end {
                 Marker("End", coordinate: end).tint(.red)
             }
+            UserAnnotation()
         }
+        .mapControls { MapUserLocationButton() }
         .ignoresSafeArea()
+        // Rank search results around whatever the user is looking at. Apple's
+        // search sorts by distance from this region's center, so without it
+        // every search is answered from the middle of the state.
+        .onMapCameraChange(frequency: .onEnd) { context in
+            model.searchRegion = context.region
+        }
         // Refit the camera whenever a new scenic route arrives.
         .onChange(of: model.response?.scenic.coordinates.count) { frameRoute() }
-        // Raise the sheet to show results when a route appears; lower it when cleared.
-        .onChange(of: model.response == nil) { _, noRoute in
-            sheetHeight = noRoute ? .height(260) : .medium
+        // Setting a start with no destination yet (typically "My Location")
+        // shows nothing on screen otherwise — and seeing the pin land on the
+        // right street is how you catch a bad fix before pulling away.
+        .onChange(of: model.start?.latitude) {
+            guard model.response == nil, let start = model.start else { return }
+            withAnimation { camera = .region(.around(start, meters: 1_200)) }
         }
         .sheet(isPresented: .constant(true)) {
-            RoutePanel(model: model)
-                .presentationDetents([.height(260), .medium, .large], selection: $sheetHeight)
+            RoutePanel(model: model, detent: $sheetHeight)
+                .presentationDetents([.planningCompact, .medium, .large], selection: $sheetHeight)
                 .presentationBackgroundInteraction(.enabled(upThrough: .medium))
                 .presentationDragIndicator(.visible)
                 .interactiveDismissDisabled()   // it's the main UI — never dismiss

@@ -22,8 +22,9 @@ travel time for beauty via a single preference knob, and a native iOS app
 - [x] Routable graph (~402k edges) split at intersections, scenic-scored
 - [x] Scenic router: Dijkstra with a time-vs-scenery preference knob
 - [x] Per-beauty-type preferences — weight scenery types live per request
-- [x] iOS app (SwiftUI + MapKit): route planning, tunable scenery, turn-by-turn
-      live navigation with a switch-to-fastest escape hatch
+- [x] iOS app (SwiftUI + MapKit): route planning from an address or your own
+      location, tunable scenery, turn-by-turn live navigation with arrival
+      time / distance remaining and a switch-to-fastest escape hatch
 - [x] Scenic-byway calibration (Mohawk Trail, Jacob's Ladder)
 - [x] Scoring calibrated against the score distribution, with tests that guard
       it (`tests/`) — see [How scoring works](#how-scoring-works)
@@ -33,7 +34,13 @@ travel time for beauty via a single preference knob, and a native iOS app
 - [ ] Land cover (NLCD/ESA WorldCover) feature for better score accuracy
 - [ ] More accurate travel times (currently free-flow: speed limit ÷ distance,
       no stops or traffic — measured 10-25% optimistic against real drive times,
-      and worst on the surface roads scenic routes prefer)
+      and worst on the surface roads scenic routes prefer). The app's "time
+      remaining" inherits this, and scales it by the fraction of route left
+- [ ] Start from the exact point, not the nearest corner. `snap()` finds the
+      road you're on and then routes from that road's *nearer end* — right
+      street, but a median 99 m up it (p90 217 m), because graph nodes are
+      junctions. Splitting the snapped edge into two virtual nodes per request
+      would take that to zero
 - [ ] Drive the routes and judge them. Scoring is calibrated and the nav code is
       written, but none of it has met real GPS yet; route *quality* is the one
       question a laptop cannot answer.

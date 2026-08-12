@@ -2,10 +2,10 @@ import CoreLocation
 import Observation
 
 /// Drives one live navigation session: which route we're following, which step
-/// is current, and how far to the next maneuver. It's fed a stream of locations
-/// from `LocationManager` (via `update`) and reshapes the drive in response —
-/// advancing steps, noticing arrival, re-routing if you stray off the line, and
-/// bailing to the fastest route on request.
+/// is current, how far to the next maneuver, and how much trip is left. It's
+/// fed a stream of locations from `LocationManager` (via `update`) and reshapes
+/// the drive in response — advancing steps, noticing arrival, re-routing if you
+/// stray off the line, and bailing to the fastest route on request.
 @Observable
 @MainActor
 final class NavigationModel {
@@ -25,6 +25,35 @@ final class NavigationModel {
     /// True while a re-route request is in flight (off-route or switch).
     private(set) var isRerouting = false
 
+    /// What's left of the trip, measured along the route rather than as the
+    /// crow flies. Seeded with the whole route so the screen has honest numbers
+    /// before the first GPS fix lands.
+    private(set) var remainingMeters: Double
+    private(set) var remainingMinutes: Double
+
+    /// Clock time we expect to arrive. Read fresh each time, so it slides later
+    /// while the driver sits at a light instead of freezing.
+    var eta: Date { Date().addingTimeInterval(remainingMinutes * 60) }
+
+    /// False until the driver has actually reached the route line.
+    ///
+    /// This gate is why a planned trip survives contact with GPS. Set up
+    /// "Waltham to Boston" while sitting in Needham and the very first fix is
+    /// miles off the line — indistinguishable, to the off-route check, from
+    /// having missed a turn. Rerouting on it silently threw the planned trip
+    /// away and navigated Needham to Boston instead. So off-route recovery
+    /// stays disarmed until we've seen the driver on the route at least once.
+    private(set) var hasJoinedRoute = false
+
+    /// While they're still on their way to it, how far the driver is from the
+    /// start of the planned route.
+    private(set) var distanceToRouteStart: Double = 0
+
+    /// Meters from the line beyond which the driver counts as off route — and,
+    /// until they've joined, within which they count as having arrived on it.
+    /// One threshold rather than two: joining is a latch, so it can't chatter.
+    private static let offRouteMeters: Double = 60
+
     /// The scenic preference we re-route with — preserved on off-route reroutes,
     /// dropped to 0 (fastest) when the user switches.
     private var pref: Double
@@ -42,6 +71,8 @@ final class NavigationModel {
         self.destination = destination
         self.pref = pref
         self.weights = weights
+        self.remainingMeters = route.properties.km * 1000
+        self.remainingMinutes = route.properties.minutes
     }
 
     /// The instruction shown in the banner right now.
@@ -62,7 +93,19 @@ final class NavigationModel {
         let routeEnd = steps[steps.count - 1].coordinate
         if location.distance(to: destination) < 40 || location.distance(to: routeEnd) < 40 {
             arrived = true
+            remainingMeters = 0
+            remainingMinutes = 0
             return
+        }
+
+        let here = progress(of: location.coordinate, along: route.coordinates)
+
+        if !hasJoinedRoute {
+            if here.offRoute <= Self.offRouteMeters {
+                hasJoinedRoute = true
+            } else if let lineStart = route.coordinates.first {
+                distanceToRouteStart = location.distance(to: lineStart)
+            }
         }
 
         // Tick past any maneuvers we've now reached (more than one can fall
@@ -73,14 +116,38 @@ final class NavigationModel {
         }
         distanceToNext = location.distance(to: steps[currentStep].coordinate)
 
+        updateRemaining(here)
+
         // Strayed well off the line — re-route from here, keeping the same
         // scenic intent (or fastest, if that's what we're already following).
         // The cooldown stops a failed attempt from retrying on every GPS tick.
-        if !isRerouting,
+        if hasJoinedRoute,
+           !isRerouting,
            Date().timeIntervalSince(lastRerouteAttempt) > 8,
-           distanceToPolyline(location.coordinate, route.coordinates) > 60 {
+           here.offRoute > Self.offRouteMeters {
             Task { await reroute(from: location.coordinate) }
         }
+    }
+
+    /// Distance and time still to drive.
+    ///
+    /// Before the driver joins the route, their nearest point on the line is
+    /// meaningless — approaching a Waltham-to-Boston route from Needham, it
+    /// lands somewhere in the middle — so we quote the whole trip until they're
+    /// actually on it.
+    ///
+    /// Time is the route's own estimate scaled by the fraction left, which
+    /// assumes the rest of the drive averages the same speed as the whole. The
+    /// backend's minutes are free-flow to begin with (no lights, no traffic, and
+    /// measurably optimistic on the small roads scenic routes favour), so this
+    /// is an estimate on top of an estimate — good enough to plan by, not to
+    /// promise by.
+    private func updateRemaining(_ here: RouteProgress) {
+        let total = route.properties.km * 1000
+        remainingMeters = hasJoinedRoute ? here.remaining : total
+        remainingMinutes = total > 0
+            ? route.properties.minutes * (remainingMeters / total)
+            : 0
     }
 
     // MARK: - Re-routing
@@ -106,5 +173,11 @@ final class NavigationModel {
         route = feature
         steps = feature.properties.steps
         currentStep = 0
+        // The new route starts from where the driver is standing, so they are
+        // on it by construction — arm off-route recovery for the rest of the
+        // drive even if they never reached the originally planned start.
+        hasJoinedRoute = true
+        remainingMeters = feature.properties.km * 1000
+        remainingMinutes = feature.properties.minutes
     }
 }
