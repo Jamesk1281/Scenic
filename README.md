@@ -32,10 +32,16 @@ travel time for beauty via a single preference knob, and a native iOS app
       the app works off-device on a real phone — see
       [`server/DEPLOY.md`](server/DEPLOY.md)
 - [ ] Land cover (NLCD/ESA WorldCover) feature for better score accuracy
+- [x] Drive traces: every drive records itself, so a test drive produces
+      measurements instead of impressions — see
+      [Measuring travel times](#measuring-travel-times)
 - [ ] More accurate travel times (currently free-flow: speed limit ÷ distance,
       no stops or traffic — measured 10-25% optimistic against real drive times,
       and worst on the surface roads scenic routes prefer). The app's "time
-      remaining" inherits this, and scales it by the fraction of route left
+      remaining" inherits this, and scales it by the fraction of route left.
+      The instrument is built; the correction is not applied yet, because
+      `minutes` is the *routing weight* and not just a display field — see
+      [Measuring travel times](#measuring-travel-times)
 - [ ] Start from the exact point, not the nearest corner. `snap()` finds the
       road you're on and then routes from that road's *nearer end* — right
       street, but a median 99 m up it (p90 217 m), because graph nodes are
@@ -131,10 +137,97 @@ at some point:
 - **a compressed scale** — no real road collects every component, so the blend
   needs an explicit stretch or "8/10" is unreachable.
 
+## Measuring travel times
+
+Travel time is `length_m / speed_kmh`, summed over the route's edges
+(`graph.py`). `speed_kmh` is OSM's `maxspeed` tag where there is one and a
+per-class guess where there isn't — which is 77% of the network's kilometres,
+and 89% of residential. Nothing is charged for traffic lights, stop signs, turns
+or traffic, though MA has 11,348 mapped signals and 17,567 stop signs and two
+thirds of the graph's nodes are real intersections. The result is optimistic,
+worst on exactly the surface roads a scenic route prefers.
+
+Guessing a correction would be calibrating against Apple Maps' model — traffic
+included — rather than against the road. So the app measures instead. Every
+drive writes an NDJSON trace to its `Documents/traces` folder
+(`ios/Sources/DriveTrace.swift`): one record per GPS fix, carrying both the raw
+position and the fix's match onto the route line. That match is the measurement
+— `travelled` is metres along a known route, so its slope against the timestamp
+is real speed at a known place on a known road.
+
+Getting a drive worth analysing:
+
+- **Start where the route starts.** Fixes taken before the driver reaches the
+  line are dropped — the match lands wherever the route happens to pass nearest,
+  which is not where they are. Driving two miles to the route start measures
+  nothing.
+- **Watch the indicator.** The nav screen shows whether it is recording, next to
+  the arrival time. If it says otherwise, the drive is not worth taking.
+- **Expect the blue bar.** Background location is on during a drive, so a locked
+  phone or a phone call doesn't end the recording. It stops when the drive does.
+- **Plug in.** A 1 Hz GPS with the screen awake is not gentle on a battery, and a
+  phone that dies at minute 50 takes the last of the drive with it.
+- **Drive the same route twice at different hours** if you want to separate
+  traffic from the road. Nothing else can: one drive cannot tell a busy junction
+  from a slow one.
+
+Then pull the traces off through Files.app (On My iPhone → Scenic) or Finder
+over a cable — do it before deleting the app, since that takes them with it:
+
+```sh
+.venv/bin/python tools/analyze_trace.py data/processed traces/*.ndjson
+```
+
+which reports, per drive and pooled across drives:
+
+- **the headline** — actual vs. predicted minutes for the ground actually
+  covered, priced per snapped edge rather than by scaling the route's total, so
+  a drive that rerouted or was abandoned halfway still counts;
+- **a speed factor per road class** — measured moving speed against the speed the
+  graph assumed. This is what `SPEED_KMH` should be multiplied by. Classes with
+  too little road behind them are marked, not quietly averaged in;
+- **stops, split by what caused them** — at a mapped traffic signal, a stop sign,
+  a turn, or nothing identifiable. This is the split the whole exercise turns on:
+  a signal is on that road *every* time you drive it, so it belongs in `graph.py`
+  and needs no traffic feed, while an unexplained stop is congestion that no
+  static data will ever predict. Summing them would bake one afternoon's traffic
+  into the graph permanently;
+- **speed by grade band** — whether the back roads are slow because of the
+  corners or because of the climb.
+
+Three things worth knowing before reading a report.
+
+*Every exclusion is reported.* The analyzer drops fixes it can't trust, and the
+dangerous failure is the silent one: a phone that stops reporting while the car
+is stationary turns every stop into a gap, the junction cost reads zero, and that
+looks like good news. So wall-clock time is printed next to measured time, and
+unaccounted minutes next to both — with the drive's own `phase` records saying
+which gaps were the app being backgrounded rather than a tunnel.
+
+*The app is set up so a drive can't be half-lost.* `LocationManager` runs with no
+distance filter (a filter can't make fixes arrive faster — GPS is ~1 Hz — it only
+suppresses ones that moved too little, so the 5 m filter this used to carry
+deleted the record of every car sitting still), and with `UIBackgroundModes:
+location`, so a locked phone or an incoming call doesn't silently end the drive.
+The nav screen shows whether it is recording, because a screen that looks normal
+while recording nothing costs a whole drive.
+
+*Grade is measured over a 200 m baseline*, on smoothed altitude, and reported
+only in coarse bands. Rise over a single 20 m step is almost entirely phone-GPS
+noise, and read that way a dead-flat drive splits neatly into confident-looking
+uphill and downhill — the curvature mistake exactly. There is a test for it.
+
+Applying the correction is a separate change, and a bigger one than it looks:
+`minutes` is the Dijkstra weight, not a display field. Making time more expensive
+divides through as a smaller `BETA` — a 1.2x on minutes turns the scenery penalty
+of 7.0 into an effective 5.8 — and *per-class* factors don't rescale at all, they
+re-rank, pushing routes off the small roads onto arterials. So the honest ETA and
+the scenic/fast trade-off have to be retuned together.
+
 ## Tests
 
 ```sh
-.venv/bin/python -m pytest tests/          # backend: 128 tests
+.venv/bin/python -m pytest tests/          # backend: 155 tests
 ```
 
 The geometry and scoring maths run anywhere; the calibration, routing and API
@@ -161,8 +254,14 @@ carries them onto edges, and `router.py` re-blends them live per request. So:
   rebuild. Add it to `BEAUTY_TYPES` in `router.py` only if users should be able
   to tune it (otherwise list it in `BASELINE`).
 - **More realistic travel times** land in `graph.py` (the `minutes` column):
-  free-flow speed is optimistic on local roads; a small per-junction stop
-  penalty is the cheap first fix, real traffic data the expensive one.
+  free-flow speed is optimistic on local roads; a per-class speed factor and a
+  per-junction stop penalty are the cheap first fixes, real traffic data the
+  expensive one. Drive first and fit them to the trace —
+  [Measuring travel times](#measuring-travel-times) — rather than picking
+  numbers. Charge the junction penalty at nodes of degree >= 3 (and more where
+  OSM has a `highway=traffic_signals` or `stop` node) rather than per edge:
+  edges are also split where a way merely ends, so a flat per-edge cost prices
+  OSM's editing history instead of the road, the same trap curvature fell into.
 - **A second region** is the same pipeline run on another Geofabrik extract.
   The MA-specific bits to generalize: the projection in `common.py`, the BBOX
   in `elevation.py`, the byway names in `score.py`, and the

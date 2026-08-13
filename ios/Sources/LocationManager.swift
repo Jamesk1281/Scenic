@@ -17,6 +17,21 @@ import Observation
 final class LocationManager: NSObject, CLLocationManagerDelegate {
     /// The most recent usable fix, or nil until the first one arrives.
     var location: CLLocation?
+
+    /// Called with every usable fix, as it lands. Set for the duration of a
+    /// drive by `RouteModel`, cleared when the drive ends.
+    ///
+    /// This exists because `location` alone is not enough. Reading it from a
+    /// SwiftUI `onChange` works only while the app is on screen: backgrounded,
+    /// the scene stops rendering, body evaluation is suspended, and observed
+    /// changes coalesce — so a locked phone delivers *one* callback carrying the
+    /// latest fix when it wakes, and every fix in between is gone. Steps would
+    /// stop advancing, arrival would never fire, and the drive trace would hold
+    /// a hole exactly the length of the drive that wasn't watched.
+    ///
+    /// A closure called straight from the delegate has no view in the path, so
+    /// the drive runs whether or not anything is drawing it.
+    var onFix: (@MainActor (CLLocation) -> Void)?
     /// Current permission state, so the UI can prompt or explain if denied.
     var authorization: CLAuthorizationStatus
 
@@ -60,7 +75,18 @@ final class LocationManager: NSObject, CLLocationManagerDelegate {
         super.init()
         manager.delegate = self
         manager.desiredAccuracy = kCLLocationAccuracyBestForNavigation
-        manager.distanceFilter = 5   // meters between updates
+        // No distance filter, deliberately. A filter cannot make fixes arrive
+        // faster — GPS produces them at about 1 Hz and the filter only
+        // *suppresses* the ones that moved too little. So at driving speed a 5 m
+        // filter changed nothing (1 Hz is already ~29 m apart at 65 mph, which is
+        // what `advanceSteps` is written around), while a stopped car moved less
+        // than 5 m per second and its updates were dropped almost entirely.
+        //
+        // That silence is invisible to navigation and fatal to `DriveTrace`:
+        // time spent stopped at lights and stop signs is exactly the cost the
+        // router charges nothing for, and with the filter on, a 40-second red
+        // light left no evidence it had happened.
+        manager.distanceFilter = kCLDistanceFilterNone
         // Tell CoreLocation this is a car, so it filters the fix stream for
         // road travel instead of walking.
         manager.activityType = .automotiveNavigation
@@ -80,15 +106,28 @@ final class LocationManager: NSObject, CLLocationManagerDelegate {
     // MARK: - Live navigation
 
     /// Ask permission (if needed) and start receiving location updates.
+    ///
+    /// Background updates are switched on here rather than in `init` because
+    /// they are only legal while the app is actually navigating, and iOS raises
+    /// if the capability isn't declared — so the setting stays paired with the
+    /// `UIBackgroundModes` entry in `project.yml` and with the drive it's for.
+    /// `showsBackgroundLocationIndicator` puts the blue bar up: this app follows
+    /// you from your pocket only while a drive is running, and says so.
     func start() {
         navigating = true
         manager.requestWhenInUseAuthorization()
+        manager.allowsBackgroundLocationUpdates = true
+        manager.showsBackgroundLocationIndicator = true
         manager.startUpdatingLocation()
     }
 
     /// Stop updates when leaving navigation, to save battery.
     func stop() {
         navigating = false
+        // Surrendered as soon as the drive is over. Left on, a one-shot "My
+        // Location" from the planning screen would quietly hold a background
+        // location grant the user only ever agreed to for a drive.
+        manager.allowsBackgroundLocationUpdates = false
         guard pendingFix == nil else { return }   // a one-shot still needs them
         manager.stopUpdatingLocation()
     }
@@ -174,6 +213,11 @@ final class LocationManager: NSObject, CLLocationManagerDelegate {
 
         guard Self.isUsable(newest) else { return }
         location = newest
+        // Delivered here rather than observed from a view — see `onFix`. Core
+        // Location calls its delegate on the run loop the manager was created
+        // on, which for this app is main, so the isolation is real rather than
+        // assumed away.
+        MainActor.assumeIsolated { onFix?(newest) }
     }
 
     func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {

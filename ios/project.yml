@@ -19,6 +19,23 @@ targets:
           UIApplicationSupportsMultipleScenes: false
         # Shown when navigation asks for location to follow the route.
         NSLocationWhenInUseUsageDescription: "Scenic uses your location to follow your route, turn by turn, while you drive."
+        # Keep receiving location while backgrounded. With when-in-use
+        # authorization this is allowed for navigation as long as the blue
+        # status bar indicator is showing, which LocationManager opts into.
+        #
+        # Without it, a locked phone or an incoming call silently ends the drive:
+        # steps stop advancing, arrival never fires, and — since the recorder
+        # runs on the same fix stream — half the drive trace goes missing. That
+        # is the difference between one test drive and two.
+        UIBackgroundModes:
+          - location
+        # Expose Documents/ (where DriveTrace writes each drive) to Files.app and
+        # to Finder over a cable. That is the whole export story for drive
+        # traces: copy them off, delete the ones you don't want, no in-app UI
+        # and no upload. They're a record of where you drove, so they stay on
+        # the phone until you move them yourself.
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
         # Allow http to the local Flask dev server (simulator -> host). The
         # deployed backend is https, so it needs no exception of its own.
         NSAppTransportSecurity:

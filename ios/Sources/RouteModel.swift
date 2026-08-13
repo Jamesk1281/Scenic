@@ -195,13 +195,30 @@ final class RouteModel {
     /// Begin live navigation along one of the computed routes (the scenic one by
     /// default). Carries the current preference + weights so any mid-trip
     /// re-route still reflects what the user wanted.
+    /// Every drive is recorded to `Documents/traces` — see `DriveTrace`. Free-flow
+    /// travel times are the biggest known inaccuracy in the app, and a drive is
+    /// the only place the real numbers exist; recording by default is what makes
+    /// each one count instead of being a drive you have to take again.
     func startNavigation(_ feature: RouteFeature) {
         guard let end else { return }
-        nav = NavigationModel(route: feature, destination: end, pref: pref, weights: weights)
+        let trace = DriveTrace(origin: start, destination: end,
+                               pref: pref, weights: weights)
+        let session = NavigationModel(route: feature, destination: end,
+                                      pref: pref, weights: weights, trace: trace)
+        // Fixes go straight from CoreLocation into the drive, with no view in
+        // between. A SwiftUI `onChange` would stop delivering the moment the
+        // phone locked — see `LocationManager.onFix` — and a drive that only
+        // runs while someone is looking at it is not a drive we can measure.
+        locationManager.onFix = { [weak session] location in session?.update(location) }
+        nav = session
     }
 
     /// Leave navigation and return to route planning.
     func endNavigation() {
+        // Flush the trace before dropping the session. Nothing else here needs
+        // the notice, but the last unwritten fixes are only in memory.
+        locationManager.onFix = nil
+        nav?.finish()
         nav = nil
     }
 

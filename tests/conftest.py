@@ -1,4 +1,4 @@
-"""Shared test setup: put pipeline/ on the path and locate the built data.
+"""Shared test setup: put pipeline/ and tools/ on the path, locate the built data.
 
 The pure-function tests run anywhere. The calibration and routing tests need a
 built graph, which is large and gitignored, so they skip cleanly when it's
@@ -13,6 +13,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "pipeline"))
+sys.path.insert(0, str(ROOT / "tools"))
 
 DATA = Path(os.environ.get("SCENIC_DATA", ROOT / "data" / "processed"))
 

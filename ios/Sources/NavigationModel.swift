@@ -110,8 +110,15 @@ final class NavigationModel {
     /// recovery for a third, and letting whichever landed last win.
     private var rerouteGeneration = 0
 
+    /// Records the drive for later calibration, or nil to record nothing.
+    ///
+    /// Injected rather than created here, and nil by default, so constructing a
+    /// `NavigationModel` never touches the filesystem. The tests build hundreds
+    /// of them; only `RouteModel.startNavigation` — a real drive — passes one in.
+    private let trace: DriveTrace?
+
     init(route: RouteFeature, destination: CLLocationCoordinate2D,
-         pref: Double, weights: [String: Double]) {
+         pref: Double, weights: [String: Double], trace: DriveTrace? = nil) {
         self.route = route
         self.steps = route.properties.steps
         self.coordinates = route.coordinates
@@ -120,7 +127,33 @@ final class NavigationModel {
         self.weights = weights
         self.remainingMeters = route.properties.km * 1000
         self.remainingMinutes = route.properties.minutes
+        self.trace = trace
+        // Last, and after every stored property: it reads `steps` and
+        // `coordinates` back off `self`.
         self.stepRemaining = Self.remainingAtEachStep(of: steps, along: coordinates)
+        trace?.route(route, reason: "start")
+    }
+
+    /// Close out the drive — called when the user leaves navigation, however it
+    /// ended. Only the trace cares; everything else is thrown away with `self`.
+    func finish(reason: String = "ended") {
+        trace?.end(reason: reason)
+    }
+
+    /// Note the app going to the background or coming back, and flush.
+    func recordPhase(_ name: String) {
+        trace?.phase(name)
+    }
+
+    /// Why this drive isn't being recorded, or nil if it is.
+    ///
+    /// Surfaced on the nav screen. A test drive is expensive and unrepeatable —
+    /// the light was that colour, the traffic was that thick, once — so the one
+    /// thing the screen must never do is look normal while recording nothing.
+    var recordingProblem: String? {
+        guard let trace else { return "Not recording — couldn't open a trace file." }
+        guard let failure = trace.failure else { return nil }
+        return "Recording stopped — \(failure)"
     }
 
     /// The instruction shown in the banner right now.
@@ -181,11 +214,16 @@ final class NavigationModel {
             arrived = true
             remainingMeters = 0
             remainingMinutes = 0
+            trace?.fix(location, progress: here, joined: hasJoinedRoute, step: currentStep)
+            trace?.end(reason: "arrived")
             return
         }
 
         advanceSteps(here, from: location)
         updateRemaining(here)
+        // Recorded after the step and distance work so the fix carries the state
+        // it produced, not the previous fix's.
+        trace?.fix(location, progress: here, joined: hasJoinedRoute, step: currentStep)
 
         // Strayed well off the line — re-route from here, keeping the same
         // scenic intent (or fastest, if that's what we're already following).
@@ -252,10 +290,11 @@ final class NavigationModel {
     func switchToFastest(from location: CLLocationCoordinate2D) async {
         followingFastest = true
         pref = 0
-        await reroute(from: location)
+        await reroute(from: location, reason: "fastest")
     }
 
-    private func reroute(from origin: CLLocationCoordinate2D) async {
+    private func reroute(from origin: CLLocationCoordinate2D,
+                         reason: String = "offroute") async {
         rerouteGeneration += 1
         let generation = rerouteGeneration
         let wantFastest = pref == 0
@@ -269,7 +308,7 @@ final class NavigationModel {
               generation == rerouteGeneration
         else { return }
 
-        adopt(wantFastest ? response.fastest : response.scenic)
+        adopt(wantFastest ? response.fastest : response.scenic, reason: reason)
         // The new route starts from where the driver is standing, so they are
         // on it by construction — arm off-route recovery for the rest of the
         // drive even if they never reached the originally planned start.
@@ -277,7 +316,11 @@ final class NavigationModel {
     }
 
     /// Follow a different route from here on.
-    private func adopt(_ feature: RouteFeature) {
+    private func adopt(_ feature: RouteFeature, reason: String) {
+        // Recorded before the state changes under it. `travelled` restarts at
+        // zero on the new line, so a trace that didn't know the line had been
+        // replaced would read the reset as the car teleporting backwards.
+        trace?.route(feature, reason: reason)
         route = feature
         steps = feature.properties.steps
         coordinates = feature.coordinates

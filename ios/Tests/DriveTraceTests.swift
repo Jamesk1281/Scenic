@@ -1,0 +1,390 @@
+import CoreLocation
+import XCTest
+@testable import Scenic
+
+/// The recorder that turns a test drive into data. Worth testing precisely
+/// because its failures are silent and expensive: you find out the file was
+/// truncated, or the reroute went unrecorded, after the drive — and the only way
+/// to get the measurement back is to drive it again.
+@MainActor
+final class DriveTraceTests: XCTestCase {
+
+    private var folder: URL!
+
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("trace-tests-\(UUID().uuidString)")
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: folder)
+        try super.tearDownWithError()
+    }
+
+    private func trace(pref: Double = 0.7) -> DriveTrace {
+        let trace = DriveTrace(origin: Fixture.origin, destination: Fixture.north(5000), pref: pref,
+                               weights: ["water": 1.5], directory: folder)
+        return XCTUnwrap(trace, "the trace should open in a writable directory")
+    }
+
+    /// `XCTUnwrap` is throwing; these helpers are called from non-throwing
+    /// contexts, so fail loudly instead.
+    private func XCTUnwrap<T>(_ value: T?, _ message: String) -> T {
+        guard let value else {
+            XCTFail(message)
+            fatalError(message)
+        }
+        return value
+    }
+
+    /// Every record written, in order, decoded from the file.
+    private func records(of trace: DriveTrace) -> [[String: Any]] {
+        guard let text = try? String(contentsOf: trace.url, encoding: .utf8) else {
+            XCTFail("no trace file at \(trace.url.path)")
+            return []
+        }
+        return text.split(separator: "\n").compactMap { line in
+            try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+        }
+    }
+
+    private func kinds(of trace: DriveTrace) -> [String] {
+        records(of: trace).map { $0["t"] as? String ?? "?" }
+    }
+
+    private func progress(travelled: Double, remaining: Double = 0,
+                          offRoute: Double = 3) -> RouteProgress {
+        RouteProgress(offRoute: offRoute, remaining: remaining, travelled: travelled)
+    }
+
+    // MARK: - The file
+
+    func test_a_drive_writes_a_header_then_its_route_then_fixes_then_an_end() {
+        let trace = self.trace()
+        trace.route(Fixture.straightRoute(), reason: "start")
+        trace.fix(Fixture.fixAt(100), progress: progress(travelled: 100), joined: true, step: 0)
+        trace.end(reason: "arrived")
+
+        XCTAssertEqual(kinds(of: trace), ["drive", "route", "fix", "end"])
+
+        let header = records(of: trace)[0]
+        XCTAssertEqual(header["pref"] as? Double, 0.7)
+        XCTAssertEqual((header["weights"] as? [String: Double])?["water"], 1.5)
+        // The destination is what makes a trace identifiable months later.
+        XCTAssertEqual((header["dest"] as? [Double])?.first, Fixture.north(5000).latitude)
+        XCTAssertNotNil(header["started"] as? String)
+    }
+
+    func test_the_route_line_is_written_in_full() {
+        // Without the geometry, `travelled` is a distance along nothing: there
+        // is no way to recover which road any fix was on, and the trace is
+        // unreadable no matter how many fixes it holds.
+        let trace = self.trace()
+        let route = Fixture.straightRoute()
+        trace.route(route, reason: "start")
+        trace.end(reason: "ended")
+
+        let written = records(of: trace)[1]
+        XCTAssertEqual((written["coords"] as? [[Double]])?.count,
+                       route.geometry.coordinates.count)
+        XCTAssertEqual(written["km"] as? Double, route.properties.km)
+        XCTAssertEqual(written["minutes"] as? Double, route.properties.minutes)
+        XCTAssertEqual((written["steps"] as? [[String: Any]])?.count,
+                       route.properties.steps.count)
+    }
+
+    func test_a_fix_carries_both_the_raw_position_and_its_match_on_the_route() {
+        let trace = self.trace()
+        trace.route(Fixture.straightRoute(), reason: "start")
+        trace.fix(Fixture.fixAt(1234), progress: progress(travelled: 1234, remaining: 3766),
+                  joined: true, step: 2)
+        trace.end(reason: "ended")
+
+        let fix = records(of: trace)[2]
+        XCTAssertEqual(fix["lat"] as? Double, Fixture.north(1234).latitude)
+        XCTAssertEqual(fix["travelled"] as? Double, 1234)
+        XCTAssertEqual(fix["remaining"] as? Double, 3766)
+        XCTAssertEqual(fix["step"] as? Int, 2)
+        XCTAssertEqual(fix["joined"] as? Bool, true)
+        // The timestamp is the fix's own, not the moment it was written — the
+        // whole measurement is a slope against this number.
+        XCTAssertNotNil(fix["ts"] as? Double)
+    }
+
+    func test_the_recorded_fields_are_the_ones_the_analysis_reads() {
+        // Keep in step with REQUIRED_FIELDS in tools/analyze_trace.py, which
+        // asserts the same names from its own side. A trace is written on a
+        // phone and read on a laptop, days apart, so a field renamed on one end
+        // would otherwise surface as a drive that reads as empty — after the
+        // driving is done and with no way to get it back.
+        let required = [
+            "drive": ["t", "ts", "pref"],
+            "route": ["t", "ts", "seq", "reason", "km", "minutes", "coords", "steps"],
+            "fix": ["t", "ts", "lat", "lon", "acc", "alt", "off", "travelled",
+                    "joined", "route"],
+            "phase": ["t", "ts", "phase"],
+            "end": ["t", "ts", "reason"],
+        ]
+
+        let trace = self.trace()
+        trace.route(Fixture.straightRoute(), reason: "start")
+        trace.fix(Fixture.fixAt(10), progress: progress(travelled: 10), joined: true, step: 0)
+        trace.phase("background")
+        trace.end(reason: "arrived")
+
+        let written = records(of: trace)
+        XCTAssertEqual(Set(written.compactMap { $0["t"] as? String }),
+                       Set(required.keys), "every record type should appear")
+        for record in written {
+            let kind = record["t"] as? String ?? "?"
+            for field in required[kind] ?? [] {
+                XCTAssertNotNil(record[field],
+                                "a \(kind) record must carry '\(field)' — "
+                                + "tools/analyze_trace.py reads it")
+            }
+        }
+    }
+
+    func test_the_header_carries_both_ends_so_the_route_can_be_replayed() {
+        // Origin, destination, preference and weights together are the exact
+        // request that produced this drive. With them, a trace can be re-asked
+        // of a rebuilt graph months later; without the origin it can only ever
+        // be read the way it was first thought to be read.
+        let trace = self.trace()
+        trace.end(reason: "ended")
+
+        let header = records(of: trace)[0]
+        XCTAssertEqual((header["from"] as? [Double])?.first, Fixture.origin.latitude)
+        XCTAssertEqual((header["dest"] as? [Double])?.first, Fixture.north(5000).latitude)
+    }
+
+    func test_a_fix_carries_altitude_and_how_much_to_trust_it() {
+        // Grade is a real reason a car is slower than the limit and it is
+        // concentrated on the hilly roads scenic routes pick. Nothing recovers
+        // it later, so the drive that could measure it must not be the one that
+        // forgot to.
+        let trace = self.trace()
+        let location = CLLocation(
+            coordinate: Fixture.north(100), altitude: 231.5,
+            horizontalAccuracy: 5, verticalAccuracy: 8,
+            course: 0, speed: 17, timestamp: Date())
+        trace.fix(location, progress: progress(travelled: 100), joined: true, step: 0)
+        trace.end(reason: "ended")
+
+        let fix = records(of: trace)[1]
+        XCTAssertEqual(fix["alt"] as? Double, 231.5)
+        XCTAssertEqual(fix["valt"] as? Double, 8)
+        XCTAssertEqual(fix["spd"] as? Double, 17)
+    }
+
+    // MARK: - Knowing whether it worked
+
+    func test_the_app_leaving_and_returning_is_recorded() {
+        // A hole in the fixes is a tunnel, a suspended app, or a bug, and the
+        // three want completely different responses. Only the app can say which.
+        let trace = self.trace()
+        trace.phase("background")
+        trace.phase("active")
+        trace.end(reason: "ended")
+
+        let phases = records(of: trace)
+            .filter { $0["t"] as? String == "phase" }
+            .compactMap { $0["phase"] as? String }
+        XCTAssertEqual(phases, ["background", "active"])
+    }
+
+    func test_a_drive_says_so_when_it_is_not_being_recorded() {
+        // The screen must never look normal while recording nothing: the drive
+        // is the expensive part, and you only find out at home.
+        let recording = NavigationModel(route: Fixture.straightRoute(),
+                                        destination: Fixture.north(5000),
+                                        pref: 0.8, weights: [:], trace: trace())
+        XCTAssertNil(recording.recordingProblem)
+
+        let silent = NavigationModel(route: Fixture.straightRoute(),
+                                     destination: Fixture.north(5000),
+                                     pref: 0.8, weights: [:], trace: nil)
+        XCTAssertNotNil(silent.recordingProblem)
+    }
+
+    // MARK: - Not losing anything
+
+    func test_buffered_fixes_are_all_on_disk_once_the_drive_ends() {
+        // Fixes are buffered, so the tail of every drive exists only in memory
+        // until something flushes it. That tail contains the arrival.
+        let trace = self.trace()
+        trace.route(Fixture.straightRoute(), reason: "start")
+        for metres in stride(from: 0.0, to: 250.0, by: 5) {
+            trace.fix(Fixture.fixAt(metres), progress: progress(travelled: metres),
+                      joined: true, step: 0)
+        }
+        trace.end(reason: "arrived")
+
+        XCTAssertEqual(kinds(of: trace).filter { $0 == "fix" }.count, 50)
+        XCTAssertEqual(kinds(of: trace).last, "end")
+    }
+
+    func test_records_land_in_the_order_they_happened() {
+        // A `fix` only means something against the `route` record before it, so
+        // the file format depends on order — and the writes happen off the main
+        // actor, on a queue that has to be serial for that to hold.
+        let trace = self.trace()
+        for i in 0..<60 {
+            trace.fix(Fixture.fixAt(Double(i) * 10),
+                      progress: progress(travelled: Double(i) * 10), joined: true, step: 0)
+        }
+        trace.end(reason: "ended")
+
+        let travelled = records(of: trace)
+            .filter { $0["t"] as? String == "fix" }
+            .compactMap { $0["travelled"] as? Double }
+        XCTAssertEqual(travelled, (0..<60).map { Double($0) * 10 })
+    }
+
+    func test_ending_twice_writes_one_ending() {
+        // Arrival ends the trace, and so does leaving the nav screen — which a
+        // driver does *after* arriving, every time.
+        let trace = self.trace()
+        trace.end(reason: "arrived")
+        trace.end(reason: "ended")
+
+        let endings = records(of: trace).filter { $0["t"] as? String == "end" }
+        XCTAssertEqual(endings.count, 1)
+        XCTAssertEqual(endings.first?["reason"] as? String, "arrived")
+    }
+
+    func test_two_drives_in_the_same_second_do_not_share_a_file() {
+        // The filename is second-resolution and the writer appends, so a
+        // collision would interleave two drives into one impossible one.
+        let clock = Date().timeIntervalSince1970
+        let first = DriveTrace(origin: nil, destination: Fixture.north(1), pref: 0, weights: [:],
+                               directory: folder, clock: clock)
+        let second = DriveTrace(origin: nil, destination: Fixture.north(1), pref: 0, weights: [:],
+                                directory: folder, clock: clock)
+        first?.end(reason: "ended")
+        second?.end(reason: "ended")
+
+        XCTAssertNotEqual(first?.url, second?.url)
+        XCTAssertEqual(records(of: XCTUnwrap(first, "first trace")).count, 2)
+        XCTAssertEqual(records(of: XCTUnwrap(second, "second trace")).count, 2)
+    }
+
+    // MARK: - Failing quietly
+
+    func test_a_trace_that_cannot_be_opened_refuses_to_start() {
+        // Nowhere to write is the one failure worth refusing on: every later
+        // call would be a no-op pretending to record, and the drive would be
+        // spent before anyone noticed.
+        let blocked = folder.appendingPathComponent("not-a-directory")
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: blocked.path, contents: Data("x".utf8))
+
+        let trace = DriveTrace(origin: nil, destination: Fixture.north(1), pref: 0, weights: [:],
+                               directory: blocked.appendingPathComponent("traces"))
+        XCTAssertNil(trace)
+    }
+
+    func test_a_drive_with_no_recorder_runs_exactly_as_before() {
+        // Recording is injected and optional, so nothing about it is on the path
+        // a drive takes. This is the guard on that.
+        let model = NavigationModel(route: Fixture.straightRoute(),
+                                    destination: Fixture.north(5000),
+                                    pref: 0.8, weights: [:], trace: nil)
+        model.update(Fixture.fixAt(1500))
+        XCTAssertTrue(model.hasJoinedRoute)
+        XCTAssertEqual(model.currentInstruction, "Turn left onto Oak Street")
+    }
+
+    // MARK: - Driven by the navigation model
+
+    func test_navigating_records_the_route_the_fixes_and_the_arrival() {
+        let trace = self.trace()
+        let model = NavigationModel(route: Fixture.straightRoute(),
+                                    destination: Fixture.north(5000),
+                                    pref: 0.8, weights: [:], trace: trace)
+        for metres in stride(from: 0.0, through: 5000.0, by: 500) {
+            model.update(Fixture.fixAt(metres))
+        }
+        XCTAssertTrue(model.arrived)
+        model.finish()   // as leaving the nav screen would
+
+        let written = records(of: trace)
+        XCTAssertEqual(written.first?["t"] as? String, "drive")
+        XCTAssertEqual(written[1]["t"] as? String, "route")
+        XCTAssertEqual(written[1]["reason"] as? String, "start")
+
+        // Distance along the route climbs with the drive, which is the entire
+        // measurement — its slope is the real speed.
+        let travelled = written
+            .filter { $0["t"] as? String == "fix" }
+            .compactMap { $0["travelled"] as? Double }
+        XCTAssertEqual(travelled.count, 11)
+        XCTAssertEqual(travelled, travelled.sorted())
+        XCTAssertEqual(travelled.last ?? 0, 5000, accuracy: 5)
+
+        // Arrival closes the trace, and leaving the screen afterwards doesn't
+        // reopen or double it.
+        XCTAssertEqual(written.last?["t"] as? String, "end")
+        XCTAssertEqual(written.last?["reason"] as? String, "arrived")
+        XCTAssertEqual(written.filter { $0["t"] as? String == "end" }.count, 1)
+    }
+
+    func test_a_reroute_is_recorded_so_travelled_can_be_read_against_the_right_line() async {
+        // `travelled` restarts at zero on a new line. A trace that didn't know
+        // the line had been replaced would read that reset as the car
+        // teleporting 3 km backwards — and would price the whole drive wrong.
+        let trace = self.trace()
+        let replacement = Fixture.straightRoute(
+            steps: [(0, "Head north on Detour Road"), (5000, "Arrive at your destination")])
+        let model = NavigationModel(route: Fixture.straightRoute(),
+                                    destination: Fixture.north(5000),
+                                    pref: 0.8, weights: [:], trace: trace)
+        model.fetchRoute = { _, _, _, _ in
+            Fixture.response(fastest: replacement, scenic: replacement)
+        }
+
+        model.update(Fixture.fixAt(500))                       // on the line
+        model.update(Fixture.fix(CLLocationCoordinate2D(       // 300 m east of it
+            latitude: Fixture.north(800).latitude, longitude: -71.0 + 300 / 82_600)))
+
+        let deadline = Date().addingTimeInterval(2)
+        while model.isRerouting || Date() < deadline {
+            if !model.isRerouting, records(of: trace).count > 3 { break }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        model.update(Fixture.fixAt(100))
+        model.finish()
+
+        let routes = records(of: trace).filter { $0["t"] as? String == "route" }
+        XCTAssertEqual(routes.count, 2, "the replacement line should be recorded")
+        XCTAssertEqual(routes.last?["reason"] as? String, "offroute")
+
+        // Fixes name the line they were matched against, so the analysis can
+        // split the drive at the seam instead of reading one line across both.
+        let sequences = records(of: trace)
+            .filter { $0["t"] as? String == "fix" }
+            .compactMap { $0["route"] as? Int }
+        XCTAssertEqual(sequences.first, 0)
+        XCTAssertEqual(sequences.last, 1)
+    }
+
+    func test_switching_to_fastest_is_recorded_as_its_own_reason() async {
+        // Half the drive priced as scenic and half as fastest is two different
+        // measurements; the trace has to say where the switch happened.
+        let trace = self.trace()
+        let model = NavigationModel(route: Fixture.straightRoute(),
+                                    destination: Fixture.north(5000),
+                                    pref: 0.8, weights: [:], trace: trace)
+        model.fetchRoute = { _, _, _, _ in
+            let feature = Fixture.straightRoute()
+            return Fixture.response(fastest: feature, scenic: feature)
+        }
+        model.update(Fixture.fixAt(500))
+        await model.switchToFastest(from: Fixture.north(500))
+        model.finish()
+
+        let routes = records(of: trace).filter { $0["t"] as? String == "route" }
+        XCTAssertEqual(routes.map { $0["reason"] as? String }, ["start", "fastest"])
+    }
+}

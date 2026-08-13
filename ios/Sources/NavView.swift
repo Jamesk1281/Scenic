@@ -22,6 +22,11 @@ struct NavView: View {
     /// fits when the driver runs a larger system text size.
     @ScaledMetric(relativeTo: .body) private var controlSize: CGFloat = 30
 
+    /// Watched so the drive trace can mark where the app went away and came
+    /// back, and flush on the way out — a hole in the fixes otherwise looks the
+    /// same as a tunnel.
+    @Environment(\.scenePhase) private var scenePhase
+
     var body: some View {
         Map(position: $camera) {
             MapPolyline(coordinates: nav.coordinates)
@@ -47,10 +52,21 @@ struct NavView: View {
             locationManager.stop()
             UIApplication.shared.isIdleTimerDisabled = false
         }
-        // CLLocation isn't Equatable, so we watch the fix's timestamp and read
-        // the location itself when it changes.
-        .onChange(of: locationManager.location?.timestamp) {
-            if let location = locationManager.location { nav.update(location) }
+        // No `onChange` feeding `nav.update` here on purpose. The drive is wired
+        // straight to CoreLocation in `RouteModel.startNavigation`, because a
+        // view modifier stops firing the moment the phone locks — see
+        // `LocationManager.onFix`. This view only draws what the drive decides.
+        //
+        // `scenePhase` is different, and is the right tool for exactly this: the
+        // transition *into* the background is delivered, which is what the trace
+        // needs to distinguish a suspended app from a tunnel.
+        .onChange(of: scenePhase) { _, phase in
+            switch phase {
+            case .background: nav.recordPhase("background")
+            case .inactive:   nav.recordPhase("inactive")
+            case .active:     nav.recordPhase("active")
+            @unknown default: break
+            }
         }
         .confirmationDialog("Switch to the fastest route?",
                             isPresented: $confirmingFastest,
@@ -114,6 +130,24 @@ struct NavView: View {
     /// numbers aren't tappable — so resting a hand on the phone mid-drive can't
     /// trigger anything.
     private var controls: some View {
+        VStack(spacing: 6) {
+            controlRow
+            // Under the controls, not in the banner: the banner is where the
+            // next maneuver goes, and no diagnostic outranks the turn you are
+            // about to miss. Unmissable, but never in the way.
+            if let problem = nav.recordingProblem {
+                Label(problem, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 10)
+        .background(.ultraThinMaterial)
+    }
+
+    private var controlRow: some View {
         HStack(alignment: .center) {
             Button(role: .destructive) { onEnd() } label: {
                 Label("End", systemImage: "xmark").labelStyle(.iconOnly)
@@ -146,18 +180,26 @@ struct NavView: View {
                 Color.clear.frame(width: controlSize, height: controlSize)
             }
         }
-        .padding(.horizontal)
-        .padding(.vertical, 10)
-        .background(.ultraThinMaterial)
     }
 
     /// Arrival time, time left, distance left — the three numbers a driver
     /// actually watches.
     private var tripStats: some View {
         VStack(spacing: 1) {
-            Text(nav.eta, format: .dateTime.hour().minute())
-                .font(.title3.bold())
-                .monospacedDigit()
+            HStack(spacing: 5) {
+                // A drive is unrepeatable — that light was that colour, that
+                // traffic was that thick, once — so whether it is being recorded
+                // has to be answerable at a glance, before pulling away rather
+                // than after getting home. Silence would look identical to
+                // working.
+                Image(systemName: nav.recordingProblem == nil
+                      ? "record.circle" : "exclamationmark.triangle.fill")
+                    .font(.caption2)
+                    .foregroundStyle(nav.recordingProblem == nil ? .red : .orange)
+                Text(nav.eta, format: .dateTime.hour().minute())
+                    .font(.title3.bold())
+                    .monospacedDigit()
+            }
             Text("\(timeText(nav.remainingMinutes)) · \(milesText(nav.remainingMeters))")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -166,7 +208,8 @@ struct NavView: View {
         .accessibilityElement(children: .combine)
         .accessibilityLabel(
             "Arriving at \(nav.eta.formatted(date: .omitted, time: .shortened)), "
-            + "\(timeText(nav.remainingMinutes)) and \(milesText(nav.remainingMeters)) to go"
+            + "\(timeText(nav.remainingMinutes)) and \(milesText(nav.remainingMeters)) to go. "
+            + (nav.recordingProblem ?? "Recording this drive.")
         )
     }
 

@@ -1,6 +1,12 @@
 data/
 out/
 .venv/
+
+# Drive traces copied off a phone (see tools/analyze_trace.py). These are a
+# record of where someone actually drove, timestamped to the second — never
+# commit them, whatever the analysis turns up.
+traces/
+*.ndjson
 __pycache__/
 *.pyc
 .DS_Store
