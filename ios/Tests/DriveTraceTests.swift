@@ -340,7 +340,7 @@ final class DriveTraceTests: XCTestCase {
         let model = NavigationModel(route: Fixture.straightRoute(),
                                     destination: Fixture.north(5000),
                                     pref: 0.8, weights: [:], trace: trace)
-        model.fetchRoute = { _, _, _, _ in
+        model.fetchRoute = { _, _, _, _, _ in
             Fixture.response(fastest: replacement, scenic: replacement)
         }
 
@@ -376,12 +376,12 @@ final class DriveTraceTests: XCTestCase {
         let model = NavigationModel(route: Fixture.straightRoute(),
                                     destination: Fixture.north(5000),
                                     pref: 0.8, weights: [:], trace: trace)
-        model.fetchRoute = { _, _, _, _ in
+        model.fetchRoute = { _, _, _, _, _ in
             let feature = Fixture.straightRoute()
             return Fixture.response(fastest: feature, scenic: feature)
         }
         model.update(Fixture.fixAt(500))
-        await model.switchToFastest(from: Fixture.north(500))
+        await model.switchToFastest(from: Fixture.fixAt(500))
         model.finish()
 
         let routes = records(of: trace).filter { $0["t"] as? String == "route" }

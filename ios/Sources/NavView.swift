@@ -34,6 +34,15 @@ struct NavView: View {
             Marker("Destination", coordinate: nav.destination).tint(.red)
             UserAnnotation()
         }
+        // North stops being obvious the moment the map turns with the car, and
+        // on a scenic drive "which way am I actually pointing" is a question
+        // worth answering without leaving the app. MapKit's own compass hides
+        // itself at north-up and appears as soon as the map rotates, which in
+        // a heading-up drive means it is simply always there.
+        //
+        // Placed by `.mapControls`, so it sits inside the map's safe area —
+        // which the insets below have already pushed clear of the banner.
+        .mapControls { MapCompass() }
         .ignoresSafeArea()
         .safeAreaInset(edge: .top) { banner }
         .safeAreaInset(edge: .bottom) { controls }
@@ -84,7 +93,7 @@ struct NavView: View {
                             isPresented: $confirmingFastest,
                             titleVisibility: .visible) {
             Button("Switch to fastest", role: .destructive) {
-                if let here = locationManager.location?.coordinate {
+                if let here = locationManager.location {
                     Task { await nav.switchToFastest(from: here) }
                 }
             }
@@ -142,21 +151,61 @@ struct NavView: View {
     /// numbers aren't tappable — so resting a hand on the phone mid-drive can't
     /// trigger anything.
     private var controls: some View {
-        VStack(spacing: 6) {
-            controlRow
-            // Under the controls, not in the banner: the banner is where the
-            // next maneuver goes, and no diagnostic outranks the turn you are
-            // about to miss. Unmissable, but never in the way.
-            if let problem = nav.recordingProblem {
-                Label(problem, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+        VStack(spacing: 8) {
+            // Above the bar and outside its material, so it reads as a map
+            // control rather than a trip control — and only while the map is
+            // somewhere the driver put it, which is the only time it does
+            // anything.
+            if camera.positionedByUser {
+                HStack {
+                    Spacer()
+                    recenterButton
+                }
+                .padding(.horizontal)
             }
+
+            VStack(spacing: 6) {
+                controlRow
+                // Under the controls, not in the banner: the banner is where
+                // the next maneuver goes, and no diagnostic outranks the turn
+                // you are about to miss. Unmissable, but never in the way.
+                if let problem = nav.recordingProblem {
+                    Label(problem, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            .padding(.horizontal)
+            .padding(.vertical, 10)
+            .background(.ultraThinMaterial)
         }
-        .padding(.horizontal)
-        .padding(.vertical, 10)
-        .background(.ultraThinMaterial)
+    }
+
+    /// Puts the camera back on the driver, heading-up.
+    ///
+    /// Without it, panning the map is a one-way door: `MapCameraPosition` stops
+    /// following the moment the user drags it, and nothing here ever set it
+    /// back — so a driver who nudged the map to see what was coming spent the
+    /// rest of the drive with a map that no longer tracked them, and no way
+    /// short of ending the drive to get it back.
+    ///
+    /// It restores `followsHeading` rather than merely centring, because
+    /// heading-up is what the drive started in; recentring to a north-up map
+    /// mid-drive would be its own surprise.
+    private var recenterButton: some View {
+        Button {
+            withAnimation {
+                camera = .userLocation(followsHeading: true, fallback: .automatic)
+            }
+        } label: {
+            Label("Recenter", systemImage: "location.fill")
+                .labelStyle(.iconOnly)
+                .frame(width: controlSize, height: controlSize)
+        }
+        .buttonStyle(.borderedProminent)
+        .clipShape(Circle())
+        .accessibilityLabel("Recenter the map on your location")
     }
 
     private var controlRow: some View {

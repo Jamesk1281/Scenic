@@ -71,11 +71,17 @@ enum RouteService {
     ///   - weights: per-beauty-type weights keyed by `BeautyType.apiName`
     ///     (1.0 = neutral). Sent as `w_<type>` params; omitted types default to
     ///     neutral on the server, so an empty dictionary is the plain behavior.
+    ///   - heading: the driver's course over ground, for a reroute taken while
+    ///     moving. It decides which end of the current road the route starts
+    ///     from, so a replacement doesn't open by turning the car around. Leave
+    ///     it nil when planning from a standstill — the server then falls back
+    ///     to the nearer end, which is the right answer for a parked car.
     static func route(
         from start: CLLocationCoordinate2D,
         to end: CLLocationCoordinate2D,
         pref: Double,
-        weights: [String: Double] = [:]
+        weights: [String: Double] = [:],
+        heading: CLLocationDirection? = nil
     ) async throws -> RouteResponse {
         // Build the URL: /api/route?from=lat,lon&to=lat,lon&pref=0.50&w_coast=...
         var components = URLComponents(string: "\(baseURL)/api/route")!
@@ -85,7 +91,9 @@ enum RouteService {
             URLQueryItem(name: "pref", value: String(format: "%.2f", pref)),
         ] + weights.map { type, weight in
             URLQueryItem(name: "w_\(type)", value: String(format: "%.2f", weight))
-        }
+        } + (heading.map {
+            [URLQueryItem(name: "heading", value: String(format: "%.1f", $0))]
+        } ?? [])
 
         let (data, response) = try await session.data(from: components.url!)
 

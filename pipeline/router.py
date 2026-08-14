@@ -238,19 +238,35 @@ class Router:
         strength = max(0.0, min(1.0, pref)) ** PREF_CURVE
         return self.d_minutes + strength * BETA * penalty[self.eidx]
 
-    def snap(self, lat: float, lon: float) -> tuple[int, float]:
+    def snap(self, lat: float, lon: float,
+             heading: float | None = None) -> tuple[int, float]:
         """Routable node for a lat/lon: (node index, meters to the road).
 
-        Finds the nearest road *segment* first, then takes that segment's nearer
-        end — rather than going straight to the nearest junction. The difference
-        is not cosmetic. Graph nodes are junctions, and a house mid-block is
-        routinely closer, in a straight line, to a junction on the street behind
-        it than to either end of its own street. Snapping to the nearest
-        junction outright therefore started 23% of sampled residential addresses
-        on a road the driver was not on (measured over 400 blocks; the drivers'
-        complaint was "it starts me on a different road than I live on"). Going
-        via the segment makes that 0%: both ends of the nearest segment are, by
-        construction, on the road you are standing on.
+        Finds the nearest road *segment* first, then takes one of that segment's
+        two ends — rather than going straight to the nearest junction. The
+        difference is not cosmetic. Graph nodes are junctions, and a house
+        mid-block is routinely closer, in a straight line, to a junction on the
+        street behind it than to either end of its own street. Snapping to the
+        nearest junction outright therefore started 23% of sampled residential
+        addresses on a road the driver was not on (measured over 400 blocks; the
+        drivers' complaint was "it starts me on a different road than I live
+        on"). Going via the segment makes that 0%: both ends of the nearest
+        segment are, by construction, on the road you are standing on.
+
+        Which end depends on whether the caller knows where the driver is
+        pointing. Planning a trip from a parked car, there is no travel
+        direction and the *nearer* end is right. Mid-drive there is, and the
+        nearer end is as often as not the junction just passed — so a reroute
+        computed from it can legitimately open by sending the driver back the
+        way they came, which the first test drive did in fact do. Given
+        `heading` (course over ground in degrees, 0=N, clockwise) the end that
+        lies more nearly *ahead* is chosen instead.
+
+        Pass `heading` only while actually moving. CoreLocation reports a course
+        of -1 when it has no opinion and its course is noise at walking pace; a
+        confidently wrong heading is worse here than none, because it points the
+        route at the wrong end of the road with no distance check to catch it.
+        Out-of-range values are therefore ignored rather than trusted.
 
         The distance returned is to the road itself, so callers can reject
         points that aren't on the network at all — e.g. a request from outside
@@ -261,9 +277,40 @@ class Router:
         point = shapely.Point(x, y)
         e = int(self._edge_tree.nearest(point))
         u, v = int(self.edge_u_idx[e]), int(self.edge_v_idx[e])
-        du = (self._nx[u] - x) ** 2 + (self._ny[u] - y) ** 2
-        dv = (self._nx[v] - x) ** 2 + (self._ny[v] - y) ** 2
-        return (u if du <= dv else v), float(self._edge_geom_m[e].distance(point))
+        if heading is None or not 0.0 <= heading < 360.0:
+            du = (self._nx[u] - x) ** 2 + (self._ny[u] - y) ** 2
+            dv = (self._nx[v] - x) ** 2 + (self._ny[v] - y) ** 2
+            node = u if du <= dv else v
+        else:
+            node = self._forward_end(x, y, u, v, heading)
+        return node, float(self._edge_geom_m[e].distance(point))
+
+    def _forward_end(self, x: float, y: float, u: int, v: int,
+                     heading: float) -> int:
+        """Whichever of a segment's two ends lies more nearly ahead of a driver
+        at (x, y) travelling on `heading`.
+
+        Bearings are taken in projected metres rather than on the sphere.
+        `CRS_METERS` is a conformal conic, so a grid bearing differs from a true
+        one by the convergence angle — under 1.5 degrees anywhere in
+        Massachusetts, against a decision that is almost always ~180 degrees
+        apart. The approximation is nowhere near the margin.
+        """
+        best, best_delta = None, None
+        for node in (u, v):
+            dx, dy = self._nx[node] - x, self._ny[node] - y
+            # The driver standing exactly on a junction gives no direction to
+            # it; the other end still does.
+            if dx == 0.0 and dy == 0.0:
+                continue
+            # Easting/northing, so a compass bearing is atan2(east, north).
+            bearing = math.degrees(math.atan2(dx, dy)) % 360.0
+            delta = abs((bearing - heading + 180.0) % 360.0 - 180.0)
+            if best_delta is None or delta < best_delta:
+                best, best_delta = node, delta
+        # Both ends degenerate to the driver's own position: nothing to choose
+        # between, and returning a valid node matters more than which.
+        return u if best is None else best
 
     def route(self, src_idx: int, dst_idx: int, pref: float, weights: dict = None):
         # Scored once, then used for both jobs: choosing the route and reporting

@@ -1,7 +1,7 @@
 """Scenic routing API (backend for the iOS app).
 
 Loads the routing graph once at startup and serves:
-  GET  /api/route?from=LAT,LON&to=LAT,LON&pref=0.5[&w_<type>=...]
+  GET  /api/route?from=LAT,LON&to=LAT,LON&pref=0.5[&heading=DEG][&w_<type>=...]
                               -> {"fastest": <GeoJSON Feature>,
                                   "scenic":  <GeoJSON Feature>}
   GET  /api/health
@@ -10,6 +10,12 @@ Loads the routing graph once at startup and serves:
 weighted with w_<type> (e.g. w_coast=2&w_town=3&w_farm=0); each defaults to 1.0
 (neutral) and is clamped to a sane range. The tunable types are listed by
 BEAUTY_TYPES in router.py.
+
+`heading` (0..360, 0=N, clockwise) is the driver's course over ground, and
+applies to `from` only — a destination has no travel direction. With it, the
+start snaps to the end of its road that lies ahead rather than the nearer one,
+so a mid-drive reroute doesn't open by turning the driver around. Send it only
+while moving; omit it when planning from a parked car.
 
 Run:  python server/app.py [processed_dir]   (default: data/processed)
 """
@@ -57,6 +63,28 @@ def _parse_ll(s: str):
     return lat, lon
 
 
+def _parse_heading(args):
+    """Read the driver's course over ground, or None if they didn't send a
+    usable one.
+
+    Anything outside 0..360 is dropped rather than rejected. CoreLocation
+    reports -1 for "no opinion", and a client that forwards it verbatim is
+    asking for the default behaviour, not making a bad request — failing the
+    whole route over it would turn a missing heading into a failed reroute.
+
+    Dropped, specifically, and never wrapped: `-1 % 360` is 359, so normalising
+    the range would turn "I don't know which way I'm facing" into a confident
+    due-north, and point the reroute at the wrong end of the road.
+    """
+    raw = args.get("heading")
+    if raw is None or raw == "":
+        return None
+    value = float(raw)          # a non-numeric heading is a real bad request
+    # The same 0..360 window `Router.snap` accepts, so both layers agree on
+    # what "usable" means rather than each having its own idea.
+    return value if 0.0 <= value < 360.0 else None
+
+
 def _parse_weights(args):
     """Read the per-beauty-type weights (w_<type>) from the query string. Each
     defaults to 1.0 (neutral) and is clamped to [WEIGHT_MIN, WEIGHT_MAX]."""
@@ -73,11 +101,15 @@ def api_route():
         a = _parse_ll(request.args["from"])
         b = _parse_ll(request.args["to"])
         pref = float(request.args.get("pref", 0.5))
+        heading = _parse_heading(request.args)
         weights = _parse_weights(request.args)
     except (KeyError, ValueError):
-        return jsonify(error="need from=lat,lon&to=lat,lon[&pref=0..1][&w_<type>=...]"), 400
+        return jsonify(error="need from=lat,lon&to=lat,lon[&pref=0..1]"
+                             "[&heading=0..360][&w_<type>=...]"), 400
 
-    s, s_off = ROUTER.snap(*a)
+    # Heading applies to the start only: it says which way the driver is
+    # travelling, and a destination isn't travelling anywhere.
+    s, s_off = ROUTER.snap(*a, heading=heading)
     t, t_off = ROUTER.snap(*b)
     if max(s_off, t_off) > SNAP_MAX_M:
         return jsonify(error="point is outside the covered road network "

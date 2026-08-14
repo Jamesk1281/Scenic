@@ -113,4 +113,18 @@ enum Fixture {
 
     /// A fix `meters` along the straight fixture route.
     static func fixAt(_ meters: Double) -> CLLocation { fix(north(meters)) }
+
+    /// A fix that carries a course and a speed.
+    ///
+    /// `fix` leaves both at CoreLocation's -1 "no opinion", which is what a
+    /// stationary phone reports and what most of these tests want. A reroute
+    /// only forwards a heading when the car is actually moving, so testing
+    /// that needs a fix that says so.
+    static func movingFix(_ coordinate: CLLocationCoordinate2D,
+                          course: CLLocationDirection,
+                          speed: CLLocationSpeed) -> CLLocation {
+        CLLocation(coordinate: coordinate, altitude: 0,
+                   horizontalAccuracy: 5, verticalAccuracy: 5,
+                   course: course, speed: speed, timestamp: Date())
+    }
 }

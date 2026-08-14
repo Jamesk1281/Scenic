@@ -71,7 +71,7 @@ final class LiveDriveTests: XCTestCase {
                                     pref: 0.8, weights: [:])
         // No backend during the drive: a reroute here would mean the logic
         // decided the driver had left a route they are being walked along.
-        model.fetchRoute = { _, _, _, _ in throw URLError(.notConnectedToInternet) }
+        model.fetchRoute = { _, _, _, _, _ in throw URLError(.notConnectedToInternet) }
 
         var lastStep = 0
         var lastRemaining = Double.greatestFiniteMagnitude

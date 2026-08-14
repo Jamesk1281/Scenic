@@ -13,17 +13,22 @@ final class RerouteTests: XCTestCase {
     @MainActor
     final class Backend {
         private(set) var prefsRequested: [Double] = []
+        private(set) var headingsRequested: [CLLocationDirection?] = []
         private var pending: [CheckedContinuation<RouteResponse, Error>] = []
 
         var fetch: RouteFetcher {
-            { [self] _, _, pref, _ in
+            { [self] _, _, pref, _, heading in
                 prefsRequested.append(pref)
+                headingsRequested.append(heading)
                 return try await withCheckedThrowingContinuation { continuation in
                     pending.append(continuation)
                 }
             }
         }
 
+        /// Requests made, answered or not: `reply` resumes a continuation but
+        /// leaves it in place, so this only ever grows. That is what makes it
+        /// usable as "has it asked again?" as well as "is one outstanding?".
         var inFlight: Int { pending.count }
 
         func reply(_ index: Int, with response: RouteResponse) {
@@ -82,10 +87,116 @@ final class RerouteTests: XCTestCase {
         XCTAssertEqual(model.currentInstruction, "Continue on New Road")
     }
 
+    // MARK: - The reroute loop the first test drive ran into
+
+    /// A model that has just adopted a replacement route, with the clock under
+    /// the test's control. Returns the model and a way to move time forward.
+    private func afterAReroute(_ backend: Backend) async -> (NavigationModel, (TimeInterval) -> Void) {
+        let model = joined(backend)
+        var clock = Date()
+        model.now = { clock }
+        model.update(offRoute(800))
+        await waitFor { backend.inFlight == 1 }
+        backend.reply(0, with: namedRoute("Continue on New Road"))
+        await waitFor { !model.isRerouting }
+        return (model, { clock = clock.addingTimeInterval($0) })
+    }
+
+    func test_a_reroute_that_lands_off_the_new_line_does_not_immediately_reroute_again() async {
+        // The defect this guards, measured on the first test drive: a
+        // replacement route starts at the graph junction `snap` picked — a
+        // median 99 m from the driver, p90 217 m — while the off-route
+        // threshold is 60 m. So the first fix after a reroute was frequently
+        // already off the new line and asked for another. 4 of 12 reroutes did
+        // this, and the loop ran 7 times in 61 seconds, resetting the banner to
+        // the first instruction each time, until the driver gave up and took
+        // the fastest-route escape hatch.
+        //
+        // Neither existing guard could catch it. The cooldown bounds *failed*
+        // attempts; this one succeeded. The movement guard bounds a *parked*
+        // car; at 12 m/s this one cleared 50 m between every attempt. Both are
+        // stepped past below, deliberately, so only the new guard is under test.
+        let backend = Backend()
+        let (model, advance) = await afterAReroute(backend)
+
+        advance(20)                                  // well past the 8 s cooldown
+        model.update(offRoute(1200))                 // and 400 m further on
+        try? await Task.sleep(for: .milliseconds(50))
+
+        XCTAssertEqual(backend.inFlight, 1,
+                       "asked for another route before reaching the one it just gave")
+    }
+
+    func test_reaching_the_new_route_re_arms_off_route_recovery() async {
+        // The guard above must not become a latch: once the driver is actually
+        // on the replacement line, a genuine wrong turn has to reroute again.
+        let backend = Backend()
+        let (model, advance) = await afterAReroute(backend)
+
+        model.update(Fixture.fixAt(1000))            // joins the new line
+        advance(20)
+        model.update(offRoute(1400))                 // then strays off it
+
+        await waitFor { backend.inFlight == 2 }
+    }
+
+    func test_a_driver_who_never_reaches_the_new_route_still_re_arms() async {
+        // The other way it could latch: turn off before ever touching the
+        // replacement line and off-route recovery would never come back, so the
+        // rest of the drive would be navigated against a route already
+        // abandoned. The grace period bounds the wait.
+        let backend = Backend()
+        let (model, advance) = await afterAReroute(backend)
+
+        advance(60)                                  // past joinGraceSeconds (45)
+        model.update(offRoute(1200))
+
+        await waitFor { backend.inFlight == 2 }
+    }
+
+    // MARK: - Which way the driver is pointing
+
+    func test_a_reroute_while_moving_sends_the_heading() async {
+        // Without it the server snaps to the *nearer* end of the road, which
+        // mid-drive is as often as not the junction just passed — so the
+        // replacement route opens by turning the car around. The first test
+        // drive was rerouted backwards down a road it was already committed to.
+        let backend = Backend()
+        let model = joined(backend)
+        model.update(Fixture.movingFix(offRoute(800).coordinate,
+                                       course: 90, speed: 20))
+        await waitFor { backend.inFlight == 1 }
+        XCTAssertEqual(backend.headingsRequested, [90])
+    }
+
+    func test_a_reroute_at_a_crawl_sends_no_heading() async {
+        // CoreLocation derives course from successive positions, so a car
+        // inching forward produces a heading that swings through the compass.
+        // A confidently wrong one is worse than none: it points the route at
+        // the wrong end of the road with no distance check to catch it.
+        let backend = Backend()
+        let model = joined(backend)
+        model.update(Fixture.movingFix(offRoute(800).coordinate,
+                                       course: 90, speed: 0.4))
+        await waitFor { backend.inFlight == 1 }
+        XCTAssertEqual(backend.headingsRequested, [nil])
+    }
+
+    func test_a_reroute_with_no_course_sends_no_heading() async {
+        // -1 is CoreLocation for "no opinion", and it must not reach the wire:
+        // the server drops it, but only because it checks — forwarding it as a
+        // number is how it would become a confident due north.
+        let backend = Backend()
+        let model = joined(backend)
+        model.update(offRoute(800))                  // plain fix: course -1
+        await waitFor { backend.inFlight == 1 }
+        XCTAssertEqual(backend.headingsRequested, [nil])
+    }
+
     func test_switching_to_fastest_asks_for_pref_zero() async {
         let backend = Backend()
         let model = joined(backend)
-        Task { await model.switchToFastest(from: Fixture.north(600)) }
+        Task { await model.switchToFastest(from: Fixture.fixAt(600)) }
         await waitFor { backend.inFlight == 1 }
         XCTAssertEqual(backend.prefsRequested, [0.0])
         XCTAssertTrue(model.followingFastest)
@@ -103,7 +214,7 @@ final class RerouteTests: XCTestCase {
 
         model.update(offRoute(800))                       // request 0: scenic
         await waitFor { backend.inFlight == 1 }
-        Task { await model.switchToFastest(from: Fixture.north(800)) }
+        Task { await model.switchToFastest(from: Fixture.fixAt(800)) }
         await waitFor { backend.inFlight == 2 }           // request 1: fastest
         XCTAssertEqual(backend.prefsRequested, [0.8, 0.0])
 
@@ -127,7 +238,7 @@ final class RerouteTests: XCTestCase {
 
         model.update(offRoute(800))
         await waitFor { backend.inFlight == 1 }
-        Task { await model.switchToFastest(from: Fixture.north(800)) }
+        Task { await model.switchToFastest(from: Fixture.fixAt(800)) }
         await waitFor { backend.inFlight == 2 }
 
         backend.fail(0)                                   // the older one gives up

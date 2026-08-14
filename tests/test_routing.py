@@ -158,6 +158,64 @@ class TestRoutingOverTheGraph:
                 wrong += 1
         assert wrong == 0, f"{wrong}/{len(sample)} snapped to a different road"
 
+    def test_snap_with_a_heading_takes_the_end_you_are_driving_toward(self, router):
+        """The defect this guards: mid-drive, the *nearer* end of the road you
+        are on is as often as not the junction you have just passed, so a
+        reroute computed from it can legitimately open by sending you back the
+        way you came. The first test drive did exactly that. With a heading,
+        snap should take the end ahead of the driver instead — and the two
+        opposite headings on one road must give the two different ends.
+        """
+        import math
+
+        import numpy as np
+
+        node_id = router.nodes["node_id"].to_numpy()
+        lat = router.nodes["lat"].to_numpy()
+        lon = router.nodes["lon"].to_numpy()
+        row_of = {int(nid): k for k, nid in enumerate(node_id)}
+        edges = router.edges
+        u, v = edges["u"].to_numpy(), edges["v"].to_numpy()
+
+        def bearing(from_lat, from_lon, to_lat, to_lon):
+            p1, p2 = math.radians(from_lat), math.radians(to_lat)
+            dl = math.radians(to_lon - from_lon)
+            y = math.sin(dl) * math.cos(p2)
+            x = (math.cos(p1) * math.sin(p2)
+                 - math.sin(p1) * math.cos(p2) * math.cos(dl))
+            return (math.degrees(math.atan2(y, x)) + 360) % 360
+
+        rng = np.random.default_rng(11)
+        # Long edges, so the two ends are unambiguously in different directions
+        # and the midpoint is far from both.
+        candidates = np.where(edges["length_m"].to_numpy() > 200)[0]
+        checked = wrong = 0
+        for i in rng.choice(candidates, size=150, replace=False):
+            mid = edges.geometry.values[i].interpolate(0.5, normalized=True)
+            a, b = int(u[i]), int(v[i])
+            # Only meaningful where the nearest road really is this one; a
+            # parallel service road would otherwise put us on a different edge
+            # and compare against the wrong pair of ends.
+            if node_id[router.snap(mid.y, mid.x)[0]] not in (a, b):
+                continue
+            checked += 1
+            toward_a = bearing(mid.y, mid.x, lat[row_of[a]], lon[row_of[a]])
+            toward_b = bearing(mid.y, mid.x, lat[row_of[b]], lon[row_of[b]])
+            got_a = node_id[router.snap(mid.y, mid.x, heading=toward_a)[0]]
+            got_b = node_id[router.snap(mid.y, mid.x, heading=toward_b)[0]]
+            if got_a != a or got_b != b:
+                wrong += 1
+        assert checked > 100, "too few usable samples to conclude anything"
+        assert wrong == 0, f"{wrong}/{checked} snapped to the end behind the driver"
+
+    def test_an_unusable_heading_falls_back_to_the_nearer_end(self, router):
+        """CoreLocation reports -1 when it has no opinion, and its course is
+        noise at a crawl. A heading that cannot be trusted has to behave as
+        though none was given, not as though the driver faced north."""
+        plain = router.snap(*BOSTON)[0]
+        for heading in (-1.0, 360.0, 999.0, -0.0001):
+            assert router.snap(*BOSTON, heading=heading)[0] == plain, heading
+
     def test_fastest_is_faster_and_scenic_is_more_scenic(self, router):
         s, t = self._od(router, WORCESTER, BOSTON)
         fast, scenic = router.route(s, t, 0.0), router.route(s, t, 1.0)

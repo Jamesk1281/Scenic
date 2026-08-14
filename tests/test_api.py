@@ -142,3 +142,32 @@ def test_preference_is_clamped_not_rejected(client):
         assert client.get(
             f"/api/route?from={WORCESTER}&to={BOSTON}&pref={pref}"
         ).status_code == 200
+
+
+def test_a_heading_is_accepted(client):
+    r = client.get(f"/api/route?from={WORCESTER}&to={BOSTON}&pref=0.5&heading=90")
+    assert r.status_code == 200
+    assert r.get_json()["scenic"]["properties"]["km"] > 0
+
+
+@pytest.mark.parametrize("heading", ["-1", "400", "-720", ""])
+def test_an_unusable_heading_is_ignored_not_wrapped(client, heading):
+    """The dangerous one is -1: CoreLocation reports it for "no opinion", and
+    normalising the range would turn that into a confident due north, because
+    `-1 % 360` is 359. That points the start at the wrong end of the road with
+    nothing to catch it — a silently worse route, not an error. So an unusable
+    heading has to behave exactly as if none had been sent.
+    """
+    plain = client.get(
+        f"/api/route?from={WORCESTER}&to={BOSTON}&pref=0.5").get_json()
+    given = client.get(
+        f"/api/route?from={WORCESTER}&to={BOSTON}&pref=0.5&heading={heading}"
+    ).get_json()
+    assert given["scenic"]["geometry"] == plain["scenic"]["geometry"]
+
+
+def test_an_unparseable_heading_is_a_bad_request(client):
+    """Out of range is a client with no fix; non-numeric is a client with a
+    bug, and those should be loud."""
+    r = client.get(f"/api/route?from={WORCESTER}&to={BOSTON}&heading=abc")
+    assert r.status_code == 400

@@ -3,8 +3,13 @@ import Observation
 
 /// How a replacement route is fetched. A seam so the navigation logic can be
 /// driven in tests without a backend; production leaves it at the real service.
+///
+/// The trailing heading is the driver's course over ground, or nil when they
+/// aren't moving fast enough for it to mean anything — see
+/// `NavigationModel.usableHeading`.
 typealias RouteFetcher = (CLLocationCoordinate2D, CLLocationCoordinate2D,
-                          Double, [String: Double]) async throws -> RouteResponse
+                          Double, [String: Double],
+                          CLLocationDirection?) async throws -> RouteResponse
 
 /// Drives one live navigation session: which route we're following, which step
 /// is current, how far to the next maneuver, and how much trip is left. It's
@@ -92,9 +97,19 @@ final class NavigationModel {
     private var pref: Double
     private let weights: [String: Double]
 
+    /// The clock the re-routing guards read.
+    ///
+    /// A seam for the same reason `fetchRoute` is one: every guard below is a
+    /// duration, and the runaway they exist to stop took 61 seconds of real
+    /// driving to appear. Tests that had to sleep through an 8-second cooldown
+    /// and a 45-second grace period would not be written, and this bug reached
+    /// a car precisely because nothing exercised the timings.
+    var now: () -> Date = Date.init
+
     /// How replacement routes are fetched. Tests substitute a stub.
-    var fetchRoute: RouteFetcher = { from, to, pref, weights in
-        try await RouteService.route(from: from, to: to, pref: pref, weights: weights)
+    var fetchRoute: RouteFetcher = { from, to, pref, weights, heading in
+        try await RouteService.route(from: from, to: to, pref: pref,
+                                     weights: weights, heading: heading)
     }
 
     /// When the last reroute was attempted. Off-route checks run on every GPS
@@ -123,6 +138,64 @@ final class NavigationModel {
     private func hasMovedSinceLastReroute(_ location: CLLocation) -> Bool {
         guard let origin = lastRerouteOrigin else { return true }
         return location.distance(to: origin) >= Self.rerouteMinMovementMeters
+    }
+
+    /// Set when a replacement route is adopted, and cleared once the driver
+    /// actually reaches it. Off-route recovery stays disarmed in between.
+    ///
+    /// A replacement route does *not* start where the driver is standing. It
+    /// starts at the graph node `snap` chose, which is a junction — a median
+    /// 99 m away, p90 217 m — while `offRouteMeters` is 60. So the fix that
+    /// lands immediately after a reroute is frequently already off the new
+    /// line, and re-triggers the very reroute that just answered. Measured on
+    /// the first test drive: 4 of 12 reroutes placed the driver over the
+    /// threshold on their first fix, and the loop ran 7 times in 61 seconds
+    /// with the banner resetting to the first instruction each time, until the
+    /// driver gave up and took the fastest-route escape hatch.
+    ///
+    /// The cooldown and the movement guard could not catch this. Both were
+    /// written for a *failed* or a *stationary* reroute; this one succeeds, and
+    /// at 12 m/s the car clears the 50 m movement bar between every attempt.
+    private var awaitingJoin = false
+    private var awaitingJoinSince: Date?
+
+    /// How long to let the driver reach a freshly adopted route before arming
+    /// off-route recovery regardless.
+    ///
+    /// Without a bound this would be a one-way latch: a driver who turns off
+    /// before ever touching the new line would never re-arm rerouting and would
+    /// navigate the rest of the trip against a route they had abandoned. Long
+    /// enough to cover the p90 snap offset at town speed, short enough that a
+    /// genuinely wrong route is not followed far.
+    private static let joinGraceSeconds: TimeInterval = 45
+
+    /// True once the driver has reached a newly adopted route, or waited long
+    /// enough that they clearly aren't going to.
+    private func settleAwaitingJoin(_ here: RouteProgress) {
+        guard awaitingJoin else { return }
+        let expired = now().timeIntervalSince(awaitingJoinSince ?? .distantPast)
+            > Self.joinGraceSeconds
+        if here.offRoute <= Self.offRouteMeters || expired {
+            awaitingJoin = false
+            awaitingJoinSince = nil
+        }
+    }
+
+    /// The driver's course, or nil when reporting one would be a guess.
+    ///
+    /// CoreLocation reports -1 when it has no opinion, and its course is
+    /// derived from successive positions — so a car inching forward at a light
+    /// produces a heading that swings through the compass. Sending one of those
+    /// is worse than sending nothing: the server would trust it and start the
+    /// replacement route at the wrong end of the road, which is exactly the
+    /// failure the heading was added to prevent.
+    private static let minSpeedForHeading: CLLocationSpeed = 2.0   // m/s, ~4.5 mph
+
+    static func usableHeading(_ location: CLLocation) -> CLLocationDirection? {
+        guard location.course >= 0, location.speed >= minSpeedForHeading else {
+            return nil
+        }
+        return location.course
     }
 
     /// Ticks up on every reroute, so a slow reply that lands after a newer
@@ -292,16 +365,25 @@ final class NavigationModel {
         // it produced, not the previous fix's.
         trace?.fix(location, progress: here, joined: hasJoinedRoute, step: currentStep)
 
+        // A route adopted a moment ago starts at a junction the driver has yet
+        // to reach, so they are legitimately off it until they get there.
+        settleAwaitingJoin(here)
+
         // Strayed well off the line — re-route from here, keeping the same
         // scenic intent (or fastest, if that's what we're already following).
-        // The cooldown stops a failed attempt from retrying on every GPS tick,
-        // and `hasMoved` stops a *successful* one from retrying forever.
+        // Four separate things have to be true, because each guards a different
+        // way this loop has actually run away: the cooldown stops a *failed*
+        // attempt retrying on every GPS tick, `hasMoved` stops a *successful*
+        // one retrying forever from a parked car, and `awaitingJoin` stops a
+        // successful one retrying while the driver is still on their way to the
+        // line it put them on.
         if hasJoinedRoute,
            !isRerouting,
-           Date().timeIntervalSince(lastRerouteAttempt) > 8,
+           !awaitingJoin,
+           now().timeIntervalSince(lastRerouteAttempt) > 8,
            hasMovedSinceLastReroute(location),
            here.offRoute > Self.offRouteMeters {
-            Task { await reroute(from: location.coordinate) }
+            Task { await reroute(from: location, reason: "offroute") }
         }
     }
 
@@ -356,7 +438,7 @@ final class NavigationModel {
     // MARK: - Re-routing
 
     /// Abandon the scenic route and head straight there the quick way.
-    func switchToFastest(from location: CLLocationCoordinate2D) async {
+    func switchToFastest(from location: CLLocation) async {
         let previousPref = pref
         followingFastest = true
         pref = 0
@@ -379,26 +461,36 @@ final class NavigationModel {
     }
 
     @discardableResult
-    private func reroute(from origin: CLLocationCoordinate2D,
+    private func reroute(from origin: CLLocation,
                          reason: String = "offroute") async -> RerouteOutcome {
         rerouteGeneration += 1
         let generation = rerouteGeneration
         let wantFastest = pref == 0
         isRerouting = true
-        lastRerouteAttempt = Date()
-        lastRerouteOrigin = origin
+        lastRerouteAttempt = now()
+        lastRerouteOrigin = origin.coordinate
         // Only the newest attempt may clear the flag; an older one finishing
         // must not advertise the newer one as done.
         defer { if generation == rerouteGeneration { isRerouting = false } }
 
-        guard let response = try? await fetchRoute(origin, destination, pref, weights)
+        // The heading goes with it so the server can snap to the end of this
+        // road that lies *ahead*. Without it the nearest graph node is as often
+        // as not the junction just passed, and the replacement route opens by
+        // turning the driver around — which the first test drive did.
+        guard let response = try? await fetchRoute(origin.coordinate, destination,
+                                                   pref, weights,
+                                                   Self.usableHeading(origin))
         else { return generation == rerouteGeneration ? .failed : .superseded }
         guard generation == rerouteGeneration else { return .superseded }
 
         adopt(wantFastest ? response.fastest : response.scenic, reason: reason)
-        // The new route starts from where the driver is standing, so they are
-        // on it by construction — arm off-route recovery for the rest of the
-        // drive even if they never reached the originally planned start.
+        // Count the driver as on the route even though they are not on it yet:
+        // the new line starts at a junction up ahead, not under the car. This
+        // is what keeps the banner showing instructions rather than "head to
+        // the start of your route" for a driver who is mid-trip and doing
+        // nothing wrong. `awaitingJoin` is the other half — it holds off
+        // *rerouting* over the same gap, which is what stopped this from
+        // becoming an 8-second loop.
         hasJoinedRoute = true
         return .adopted
     }
@@ -417,5 +509,10 @@ final class NavigationModel {
         travelled = 0
         remainingMeters = feature.properties.km * 1000
         remainingMinutes = feature.properties.minutes
+        // The driver has not reached this line yet — it begins at a junction
+        // ahead of them. Hold off-route recovery until they do, or this route
+        // triggers its own replacement on the very next fix.
+        awaitingJoin = true
+        awaitingJoinSince = now()
     }
 }
