@@ -2,8 +2,9 @@
 
 Splits drivable ways at shared intersection nodes into directed edges, computes
 per-edge travel time, and tags each edge with the scenic score (and component
-vector) of the nearest scored chunk from score.py. Keeps the largest connected
-component so every node is mutually reachable.
+vector) of the nearest scored chunk from score.py. Keeps the largest *strongly*
+connected component — oneway-aware, so every node is mutually reachable by car
+rather than merely joined to the network by some road running the wrong way.
 
 Outputs:
   data/processed/graph_nodes.parquet  node_id, lon, lat
@@ -26,7 +27,7 @@ import shapely
 from pyproj import Transformer
 from shapely.strtree import STRtree
 
-from common import CRS_METERS, DRIVABLE, PRIVATE_ACCESS
+from common import CRS_METERS, DRIVABLE, ONEWAY_FWD, ONEWAY_REV, PRIVATE_ACCESS
 from score import blend, components, composite
 
 # Assumed driving speed (km/h) per road class, used to turn edge length into
@@ -235,6 +236,20 @@ def attach_scores(edges: gpd.GeoDataFrame, chunks: gpd.GeoDataFrame,
 
 
 def largest_component(edges: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Keep the edges whose endpoints are mutually reachable *by car*.
+
+    Strongly connected on the directed graph, not weakly connected on an
+    undirected one. The router traverses oneway-aware, so an undirected check
+    answers a question nobody asks: measured on the MA graph it kept 645 nodes
+    (199 km of road) that Dijkstra can never route out of, 167 of them with no
+    outgoing edge at all. Those nodes sit within SNAP_MAX_M of a real address,
+    so server/app.py accepted the request as in-region and then answered 404
+    "no route found" for two perfectly ordinary Massachusetts points.
+
+    The directed graph is built with the same oneway rules as router.py's
+    `_build_directed` (shared via common.py), so the component kept here is
+    exactly the one the router can traverse.
+    """
     from scipy.sparse import csr_matrix
     from scipy.sparse.csgraph import connected_components
 
@@ -243,8 +258,13 @@ def largest_component(edges: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     ui = edges["u"].map(idx).to_numpy()
     vi = edges["v"].map(idx).to_numpy()
     n = len(node_ids)
-    g = csr_matrix((np.ones(len(ui)), (ui, vi)), shape=(n, n))
-    ncomp, labels = connected_components(g, directed=False)
+    ow = edges["oneway"].astype(str).str.lower()
+    fwd_ok = ~ow.isin(ONEWAY_REV).to_numpy()
+    rev_ok = ~ow.isin(ONEWAY_FWD).to_numpy()
+    tails = np.concatenate([ui[fwd_ok], vi[rev_ok]])
+    heads = np.concatenate([vi[fwd_ok], ui[rev_ok]])
+    g = csr_matrix((np.ones(len(tails)), (tails, heads)), shape=(n, n))
+    ncomp, labels = connected_components(g, directed=True, connection="strong")
     if ncomp == 1:
         return edges.reset_index(drop=True)
     biggest = np.bincount(labels).argmax()

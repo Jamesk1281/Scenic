@@ -92,16 +92,65 @@ MAX_ACCURACY_M = 25.0
 # an average over unknown conditions.
 MAX_GAP_S = 20.0
 
-# Below this, the car is stopped rather than moving (m/s). ~1.1 mph: slower than
-# a crawl in traffic, faster than GPS drift at a red light.
-STOPPED_MS = 0.5
+# Below this, the car is stopped rather than moving (m/s). 1.0 m/s is 2.2 mph.
+#
+# It was 0.5, on the reasoning that this is "faster than GPS drift at a red
+# light". That premise is wrong: `travelled` is a per-fix map-matched position,
+# and its along-track jitter at a standstill is metres, so a parked car produces
+# apparent per-step speeds of several m/s. Measured against the smoothing window
+# below, 0.5 recovered a 45 s stop as 3 runs totalling 24 s; 1.0 recovers it as
+# 1 run of 40 s, while a genuine 3 m/s crawl still reads as moving throughout.
+STOPPED_MS = 1.0
 
 # A stop has to last this long to be one, in seconds. Shorter is a rolling stop
 # or two jittery fixes, and counting those would inflate the junction cost.
 MIN_STOP_S = 3.0
 
+# How many consecutive steps the stopped/moving decision is made over.
+#
+# Not per-step, because at a standstill the per-step delta IS the along-track
+# noise: with 2 m of it, half the steps of a parked car read as moving and the
+# run shatters into fragments that MIN_STOP_S then discards. Measured on a 45 s
+# stop, the per-step test found 3 fragments totalling 10 s; over this window it
+# is one stop of 40 s. The window measures net displacement over its own span,
+# which is unbiased on a moving car (exact on a constant ramp) and averages the
+# jitter down by the span at a standstill.
+#
+# 5 and not wider: the window cannot resolve a stop shorter than itself, and
+# stop-and-go traffic is exactly the congestion signal this tool needs to see.
+# At 9, the five 10-second stops of a queue smeared into a single 6-second one;
+# at 5 all five are found. Grid-searched over four synthetic drives — one long
+# stop, stop-and-go, free-flowing, and a 3 m/s crawl — 5 paired with
+# STOPPED_MS = 1.0 is the only setting that gets the stop *count* right in both
+# stop cases while inventing none in either moving case.
+#
+# Only the *classification* is smoothed. `dist_m` and `dt_s` stay raw, so
+# distance and time totals are untouched — median-smoothing `travelled` itself
+# was tried first and cost 8% of the drive's distance, clipping the ramp at
+# every stop-start.
+#
+# The residual is a known under-count: the window straddles each stop's edges,
+# so a stop reads roughly STOP_SMOOTH/2 seconds shorter than it was. Stop
+# durations are therefore a floor. That is the right direction to be wrong in
+# for a junction penalty, and far better than the 4 s the old clamped distance
+# reported for the same 45 s light.
+STOP_SMOOTH = 5
+
 # How far a fix may be from a road before we refuse to say which road it was on.
 MAX_SNAP_M = 30.0
+
+# How far a fix may sit from the route line before its match is not to be
+# trusted for distance. `progress()` in ios/Sources/Geo.swift bounds the match
+# backwards (via notBefore) but not forwards, so on a route that runs parallel
+# to itself — or shares a corridor with a highway — one fix can match far ahead
+# of the driver. The recorded `off` says so plainly, in metres, and used to be
+# printed and then ignored; the forward jump entered `dist_m` as genuine
+# distance covered in one second, inflating that step's speed, its class's
+# measured_kmh, and the factor prescribed for SPEED_KMH. Because such a step is
+# *fast* rather than stopped, no stop-detection guard saw it either. 60 m
+# mirrors NavigationModel.offRouteMeters: past that the app itself calls the
+# driver off route and reroutes.
+MAX_OFF_ROUTE_M = 60.0
 
 # How close a stop has to be to a mapped signal or stop sign to be blamed on it.
 # Generous, because the car stops at the back of a queue, not at the stop line.
@@ -110,6 +159,15 @@ CONTROL_NEAR_M = 45.0
 # ...and to a maneuver, to be blamed on the turn instead. Tighter: a maneuver
 # point is where the route changes road, which is the junction itself.
 MANEUVER_NEAR_M = 35.0
+
+# Which of router.py's steps are actually turns. It also emits "Head <compass>
+# on X" at the trip start, "Continue on X" where a leg seam is under 20 degrees
+# (the road merely changes name), and "Arrive at your destination" at the end —
+# none of which is a junction a car stops at. Counting them blamed idling at the
+# start point, whose coordinate *is* step 0, on "a turn", and _stop_report then
+# folded that into the structural share it describes as predictable from OSM —
+# corrupting the signals-vs-congestion split the exercise turns on.
+TURN_PREFIXES = ("Turn", "Slight", "Sharp")
 
 # Altitude noise on a phone is metres, and one step covers ~15 m of road. Rise
 # over run with a run that short is almost entirely noise: ±1.5 m of residual
@@ -129,7 +187,7 @@ GRADE_BAND = 0.02
 # Every column `steps` produces. Named once so the empty case can carry the same
 # shape as the full one — see the early return in `steps`.
 STEP_COLUMNS = ["ts", "dt_s", "dist_m", "grade", "lat", "lon", "acc", "off_m",
-                "speed_ms"]
+                "speed_ms", "stopped"]
 
 
 # --- reading -----------------------------------------------------------------
@@ -197,10 +255,19 @@ def steps(fixes):
     out = pd.DataFrame({
         "ts": f["ts"].to_numpy()[:-1],
         "dt_s": np.diff(f["ts"].to_numpy()),
-        # The recorded match is per-fix, so GPS jitter can nudge it backwards a
-        # metre or two. Clamped rather than dropped: a car at a light produces a
-        # long run of these, and dropping them would delete the stop.
-        "dist_m": np.maximum(np.diff(f["travelled"].to_numpy()), 0.0),
+        # Signed, and deliberately NOT clamped at zero. The recorded match is
+        # per-fix, so GPS jitter nudges it backwards a metre or two at a
+        # standstill — and clamping that at zero *rectifies* zero-mean noise
+        # into a positive drift: every backwards wobble becomes 0 while every
+        # forwards one is kept as real distance, so a parked car accumulates
+        # metres. Measured on a 45 s stop with 2.5 m of along-track noise, the
+        # clamped form reported 4 s of stopped time instead of 45 and inflated
+        # distance by 4.7% — with no gap, no inaccurate fix and no unaccounted
+        # wall clock, so every guard in this file still called it a clean drive.
+        # Left signed the wobbles cancel: a stop sums to ~0 m, its `speed_ms`
+        # goes slightly negative (still below STOPPED_MS, so still "stopped"),
+        # and the distance total stays honest.
+        "dist_m": np.diff(f["travelled"].to_numpy()),
         "grade": grade_per_fix[:-1],
         "lat": f["lat"].to_numpy()[:-1],
         "lon": f["lon"].to_numpy()[:-1],
@@ -213,15 +280,34 @@ def steps(fixes):
     # zero, and nothing in the output says so. Carried out as attributes so
     # `report` can put the discarded time on screen next to the answer.
     gaps = out[out.dt_s > MAX_GAP_S]
-    kept = out[(out.dt_s > 0) & (out.dt_s <= MAX_GAP_S) & (out.acc <= MAX_ACCURACY_M)]
+    kept = out[(out.dt_s > 0) & (out.dt_s <= MAX_GAP_S) & (out.acc <= MAX_ACCURACY_M)
+               & (out.off_m <= MAX_OFF_ROUTE_M)]
     kept = kept.reset_index(drop=True)
-    kept["speed_ms"] = kept.dist_m / kept.dt_s
+    # Net displacement over a centred window, divided by that window's own
+    # elapsed time — see STOP_SMOOTH. This is the column every stopped/moving
+    # test reads (`stops`, `by_road_class`, `by_grade`), so they all agree; the
+    # raw dist_m/dt_s beside it stay untouched and carry the totals.
+    window = dict(window=STOP_SMOOTH, center=True, min_periods=1)
+    kept["speed_ms"] = (kept.dist_m.rolling(**window).sum()
+                        / kept.dt_s.rolling(**window).sum())
+    # ...then widened by the window's own half-width, because that is exactly
+    # how far the blur reaches. A step at the edge of a stop sees motion inside
+    # its window and reads as moving, which both shortened the stop and let its
+    # stationary seconds leak into the speed factor — measured, one 60 s stop
+    # dragged a road's factor from 1.00 to 0.94, i.e. the junction cost bleeding
+    # into the per-km number the split exists to keep it out of. Every consumer
+    # reads this one column, so `stops`, `by_road_class` and `by_grade` cannot
+    # disagree about what counted as stopped.
+    edge = STOP_SMOOTH // 2
+    kept["stopped"] = (kept.speed_ms < STOPPED_MS).rolling(
+        window=2 * edge + 1, center=True, min_periods=1).max().astype(bool)
     kept = kept[STEP_COLUMNS]
     kept.attrs["gap_count"] = len(gaps)
     kept.attrs["gap_seconds"] = float(gaps.dt_s.sum())
     kept.attrs["gap_spans"] = list(zip(gaps.ts.to_numpy(),
                                        (gaps.ts + gaps.dt_s).to_numpy()))
     kept.attrs["dropped_accuracy"] = int((out.acc > MAX_ACCURACY_M).sum())
+    kept.attrs["dropped_offroute"] = int((out.off_m > MAX_OFF_ROUTE_M).sum())
     # Wall clock from the first usable fix to the last, so `report` can say how
     # much of the drive the measured time actually accounts for. Without it a
     # drive with ten minutes of dropouts reports a shorter, tidier drive than
@@ -385,12 +471,28 @@ def stops(steps_df):
     if steps_df.empty:
         return pd.DataFrame(columns=["start_ts", "seconds", "lat", "lon"])
 
-    stopped = (steps_df.speed_ms < STOPPED_MS).to_numpy()
+    stopped = steps_df.stopped.to_numpy()
+    # Adjacent *rows* are not adjacent *time*. `steps` has already deleted every
+    # row over MAX_GAP_S or MAX_ACCURACY_M and `report` concatenates the route
+    # segments, so two rows can be minutes apart — and a run scanned over rows
+    # alone then merged a stop before a dropout with the stop after it into one
+    # long stop, at the first one's coordinates. That halves the junction count,
+    # which is the denominator of the per-junction penalty this whole tool
+    # exists to produce, and hands the second stop to classify_stops at the
+    # wrong junction. A row continues the previous one only if no time is
+    # missing between them.
+    ts = steps_df.ts.to_numpy()
+    dt = steps_df.dt_s.to_numpy()
+    continues = np.r_[False, np.isclose(ts[1:], ts[:-1] + dt[:-1], atol=0.5)]
     runs, start = [], None
     for i, is_stopped in enumerate(stopped):
-        if is_stopped and start is None:
-            start = i
-        elif not is_stopped and start is not None:
+        if is_stopped:
+            if start is not None and not continues[i]:
+                runs.append((start, i))       # a gap split one stop into two
+                start = i
+            elif start is None:
+                start = i
+        elif start is not None:
             runs.append((start, i)); start = None
     if start is not None:
         runs.append((start, len(stopped)))
@@ -411,7 +513,8 @@ def by_road_class(steps_df):
     leaving it in here would smear one defect across both numbers and let a fix
     for either look like it worked.
     """
-    moving = steps_df[(steps_df.speed_ms >= STOPPED_MS) & steps_df.highway.notna()]
+    moving = steps_df[~steps_df.stopped & steps_df.highway.notna()
+                      & (steps_df.assumed_ms > 0)]
     if moving.empty:
         return pd.DataFrame()
 
@@ -422,7 +525,14 @@ def by_road_class(steps_df):
         # crawling fixes and one fast one are a hundred metres and a kilometre,
         # and averaging the speeds would weight them equally.
         "measured_kmh": d.dist_m.sum() / d.dt_s.sum() * 3.6,
-        "assumed_kmh": (d.assumed_ms * d.dist_m).sum() / d.dist_m.sum() * 3.6,
+        # Total distance over total *assumed* time — the same harmonic form as
+        # measured_kmh above. A distance-weighted arithmetic mean of speed is
+        # not the speed that produces the assumed time, and arithmetic >=
+        # harmonic always, so it biased assumed_kmh high and `factor` low:
+        # measured 5.4% low on a single class carrying a mix of tagged and
+        # default speeds, which pipeline/graph.py guarantees. `factor` is
+        # prescribed for SPEED_KMH, so that bias landed in the routing weights.
+        "assumed_kmh": d.dist_m.sum() / (d.dist_m / d.assumed_ms).sum() * 3.6,
     }), include_groups=False)
     grouped["factor"] = grouped.measured_kmh / grouped.assumed_kmh
     return grouped.sort_values("km", ascending=False)
@@ -437,8 +547,8 @@ def by_grade(steps_df):
     anything finer, and a precise-looking grade number here would be the
     curvature mistake a second time.
     """
-    moving = steps_df[(steps_df.speed_ms >= STOPPED_MS) & steps_df.grade.notna()
-                      & steps_df.highway.notna()]
+    moving = steps_df[~steps_df.stopped & steps_df.grade.notna()
+                      & steps_df.highway.notna() & (steps_df.assumed_ms > 0)]
     if moving.empty:
         return pd.DataFrame()
 
@@ -447,7 +557,14 @@ def by_grade(steps_df):
     grouped = moving.groupby(band, observed=True).apply(lambda d: pd.Series({
         "km": d.dist_m.sum() / 1000.0,
         "measured_kmh": d.dist_m.sum() / d.dt_s.sum() * 3.6,
-        "assumed_kmh": (d.assumed_ms * d.dist_m).sum() / d.dist_m.sum() * 3.6,
+        # Total distance over total *assumed* time — the same harmonic form as
+        # measured_kmh above. A distance-weighted arithmetic mean of speed is
+        # not the speed that produces the assumed time, and arithmetic >=
+        # harmonic always, so it biased assumed_kmh high and `factor` low:
+        # measured 5.4% low on a single class carrying a mix of tagged and
+        # default speeds, which pipeline/graph.py guarantees. `factor` is
+        # prescribed for SPEED_KMH, so that bias landed in the routing weights.
+        "assumed_kmh": d.dist_m.sum() / (d.dist_m / d.assumed_ms).sum() * 3.6,
     }), include_groups=False)
     grouped["factor"] = grouped.measured_kmh / grouped.assumed_kmh
     return grouped
@@ -464,6 +581,15 @@ def headline(steps_df):
     return {
         "km": steps_df.dist_m.sum() / 1000.0,
         "actual_min": steps_df.dt_s.sum() / 60.0,
+        # The clock over *matched* ground only, and the one to compare
+        # `predicted_min` against. A prediction can only be made for steps that
+        # snapped to a road, so dividing it into the whole drive's clock charges
+        # every unmatched metre to the router as pure optimism — and unmatched
+        # ground is routine, since DRIVABLE in pipeline/common.py excludes
+        # `service`, so the parking aisle at each end of a trip never snaps.
+        # Measured: with 20% of steps unmatched, a drive whose true optimism was
+        # 0% reported +25%, the error tracking the unmatched fraction exactly.
+        "matched_min": known.dt_s.sum() / 60.0,
         "predicted_min": (known.dist_m / known.assumed_ms).sum() / 60.0,
         "matched_km": known.dist_m.sum() / 1000.0,
     }
@@ -504,6 +630,7 @@ def report(paths, edges, control=None):
         gap_minutes = sum(r.attrs.get("gap_seconds", 0.0) for r in rows) / 60.0
         gap_spans = [s for r in rows for s in r.attrs.get("gap_spans", [])]
         thrown_out = sum(r.attrs.get("dropped_accuracy", 0) for r in rows)
+        mismatched = sum(r.attrs.get("dropped_offroute", 0) for r in rows)
         elapsed_min = sum(r.attrs.get("elapsed_s", 0.0) for r in rows) / 60.0
         # Empty segments are dropped before the concat, not after: pandas warns
         # that it will stop inferring dtypes past all-NA frames, and a route
@@ -523,12 +650,15 @@ def report(paths, edges, control=None):
         print(f"  planned  {planned['minutes']:5.1f} min for {planned['km']:.1f} km")
         print(f"  drove    {h['actual_min']:5.1f} min for {h['km']:.1f} km"
               f"   (wall clock {elapsed_min:.1f} min)")
-        if h["matched_km"] > 0:
-            print(f"  predicted{h['predicted_min']:5.1f} min for the same ground"
-                  f"  →  {h['actual_min'] / h['predicted_min'] - 1:+.0%}")
+        if h["matched_km"] > 0 and h["predicted_min"] > 0:
+            print(f"  predicted{h['predicted_min']:5.1f} min for the "
+                  f"{h['matched_km']:.1f} km that snapped to a road"
+                  f"  (drove {h['matched_min']:.1f} min of it)"
+                  f"  →  {h['matched_min'] / h['predicted_min'] - 1:+.0%}")
 
         drive_stops = stops(drive_steps)
-        maneuvers = [s for route, _ in parts for s in route.get("steps", [])]
+        maneuvers = [s for route, _ in parts for s in route.get("steps", [])
+                     if str(s.get("instruction", "")).startswith(TURN_PREFIXES)]
         drive_stops = classify_stops(drive_stops, control, maneuvers)
         stopped_min = drive_stops.seconds.sum() / 60.0
         print(f"  stopped  {stopped_min:5.1f} min over {len(drive_stops)} stops"
@@ -542,11 +672,12 @@ def report(paths, edges, control=None):
         # than on its own, because "12 minutes missing" means something quite
         # different on a 20-minute drive than on a three-hour one.
         unaccounted = elapsed_min - h["actual_min"]
-        if gap_count or thrown_out or unaccounted > 0.5:
+        if gap_count or thrown_out or mismatched or unaccounted > 0.5:
             asleep = backgrounded(records, gap_spans)
             print(f"  ! {unaccounted:.1f} of {elapsed_min:.1f} wall-clock min are "
                   f"unmeasured: {gap_count} gaps over {MAX_GAP_S:.0f}s "
-                  f"({asleep} while backgrounded), {thrown_out} inaccurate fixes.")
+                  f"({asleep} while backgrounded), {thrown_out} inaccurate fixes, "
+                  f"{mismatched} over {MAX_OFF_ROUTE_M:.0f} m off the route line.")
             if gap_minutes > stopped_min:
                 print("    More time is missing than was measured stopped — the "
                       "stop numbers above are a floor, not a measurement.")
@@ -562,10 +693,13 @@ def report(paths, edges, control=None):
 
     print("=" * 72)
     total = headline(combined)
-    if total["matched_km"] > 0:
-        print(f"ALL DRIVES  {total['km']:.1f} km, {total['actual_min']:.1f} min actual "
-              f"vs {total['predicted_min']:.1f} min predicted "
-              f"→ the router is {1 - total['predicted_min'] / total['actual_min']:.0%} optimistic")
+    if total["matched_km"] > 0 and total["matched_min"] > 0:
+        # Like for like: matched ground on both sides of the ratio. See headline().
+        print(f"ALL DRIVES  {total['km']:.1f} km driven, of which {total['matched_km']:.1f} km "
+              f"snapped to a road")
+        print(f"            {total['matched_min']:.1f} min actual vs "
+              f"{total['predicted_min']:.1f} min predicted for that ground "
+              f"→ the router is {1 - total['predicted_min'] / total['matched_min']:.0%} optimistic")
     print()
 
     _stop_report(pooled_stops, total)
@@ -582,9 +716,19 @@ def report(paths, edges, control=None):
         flag = "" if row.km >= 5 else "   (thin)"
         print(f"  {name:<16}{row.km:>7.1f}{row.assumed_kmh:>9.0f}"
               f"{row.measured_kmh:>10.0f}{row.factor:>8.2f}{flag}")
-    print("\n  factor is what SPEED_KMH in pipeline/graph.py should be multiplied")
-    print("  by for that class. Rows marked (thin) have too little road behind")
-    print("  them to be a measurement — drive more of that class or ignore them.")
+    print("\n  factor is measured speed over the speed the graph assumed. Rows")
+    print("  marked (thin) have too little road behind them to be a measurement.")
+    print("\n  Careful applying it: `assumed` comes from each edge's stored minutes,")
+    print("  which graph.py takes from the OSM maxspeed tag wherever there is one")
+    print("  and from SPEED_KMH only where there isn't. On the built MA graph the")
+    print("  tagged share of km is 97% of motorway, 82% of trunk, 56% of primary,")
+    print("  40% of secondary, 25% of tertiary, 11% of residential — 23% overall.")
+    print("  So multiplying SPEED_KMH by a class's factor moves only its UNTAGGED")
+    print("  remainder: on motorway that is 3% of the km, and the correction")
+    print("  silently under-delivers by its own coverage ratio on exactly the")
+    print("  classes whose factor looks most confident. To move tagged road you")
+    print("  have to scale `minutes` in graph.py after the maxspeed lookup, not")
+    print("  the fallback table.")
 
     grades = by_grade(combined)
     if not grades.empty and len(grades) > 1:

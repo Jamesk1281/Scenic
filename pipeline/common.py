@@ -19,6 +19,14 @@ DRIVABLE = {
 # skipped unless it also carries motor_vehicle=yes (a common override).
 PRIVATE_ACCESS = {"private", "no"}
 
+# oneway= values, and which direction they permit. Shared because graph.py and
+# router.py have to agree exactly: graph.py decides which nodes are mutually
+# reachable and router.py decides which edges may be traversed, so a road that
+# one treats as two-way and the other as one-way produces a node the API accepts
+# and then cannot route out of.
+ONEWAY_FWD = {"yes", "true", "1"}      # forward only
+ONEWAY_REV = {"-1", "reverse"}         # reverse only
+
 # The projected coordinate system we do all metric work in: NAD83 / Massachusetts
 # Mainland, whose units are meters. Lengths, buffers and nearest-feature
 # distances are only meaningful in a projected CRS like this — raw lon/lat

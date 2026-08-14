@@ -228,7 +228,12 @@ final class DriveTrace {
     /// app, or a bug — and the three want completely different responses. It
     /// also flushes, so backgrounding costs no buffered fixes if iOS decides not
     /// to wake us again.
+    /// Ignored once the drive has ended. `end` is the file's terminator, and
+    /// NavView stays on screen after arrival — so pocketing the phone there
+    /// fired a scene-phase change that appended *past* the ending, leaving a
+    /// trace with no terminator and an away-marker `analyze_trace.py` counts.
     func phase(_ name: String) {
+        guard !finished else { return }
         append(["t": "phase", "ts": Self.now(), "phase": name], flush: true)
     }
 
@@ -281,6 +286,11 @@ private final class LineWriter: @unchecked Sendable {
     private let url: URL
     private var handle: FileHandle?
     private var broken = false
+    /// Set by `close()`. Without it, `append`'s nil-handle branch reads a
+    /// deliberately closed writer as "not opened yet" and transparently
+    /// reopens the file — so anything recorded after the ending both wrote
+    /// past it and leaked the descriptor, since `close()` never runs twice.
+    private var closed = false
 
     init(url: URL) {
         self.url = url
@@ -289,7 +299,7 @@ private final class LineWriter: @unchecked Sendable {
     /// Write these lines, reporting the first failure and then going quiet.
     func append(_ lines: [String], onFailure: @escaping @Sendable (String) -> Void) {
         queue.async {
-            guard !self.broken else { return }
+            guard !self.broken, !self.closed else { return }
             do {
                 if self.handle == nil {
                     // `FileHandle(forWritingTo:)` needs the file to exist first.
@@ -323,6 +333,7 @@ private final class LineWriter: @unchecked Sendable {
     /// never waits on the caller (failures are reported with an async hop).
     func close() {
         queue.sync {
+            self.closed = true
             try? self.handle?.close()
             self.handle = nil
         }

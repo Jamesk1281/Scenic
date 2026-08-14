@@ -36,7 +36,7 @@ from scipy.sparse.csgraph import dijkstra
 from shapely.strtree import STRtree
 from pyproj import Transformer
 
-from common import CRS_METERS
+from common import CRS_METERS, ONEWAY_FWD, ONEWAY_REV
 from score import WEIGHTS, composite
 
 BETA = 7.0  # minutes-equivalent penalty per km of fully-unscenic road at pref=1
@@ -49,9 +49,6 @@ BETA = 7.0  # minutes-equivalent penalty per km of fully-unscenic road at pref=1
 # exponent evens out what remains. Measured over four routes, exponents above
 # ~1.5 overcorrect, trading the dead top for a dead bottom.
 PREF_CURVE = 1.3
-
-ONEWAY_FWD = {"yes", "true", "1"}
-ONEWAY_REV = {"-1", "reverse"}
 
 # --- Beauty types -----------------------------------------------------------
 # The six *tunable* beauty types — the kinds of scenery a driver would actually

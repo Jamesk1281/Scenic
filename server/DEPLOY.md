@@ -27,6 +27,14 @@ the scoring changes, then copy the two parquet files over.
 > serving the midpoint-sampled scores, which is the silent-disagreement case
 > the warning below is about.
 
+> The same applies to the strongly-connected component fix in `graph.py`.
+> A graph built before it contains 645 nodes (199 km of road) that the router
+> can never route out of, 167 of them with no outgoing edge at all — the API
+> accepts a request snapping to one and then answers 404. The fix is in the
+> *build*, so it takes a `graph.py` rerun and a fresh copy of both parquets;
+> nothing about the serving code notices. Rebuilt, the graph is one strongly
+> connected component and drops 712 edges (0.2%).
+
 > **The code and the parquets must come from the same commit.** `router.py`
 > re-blends every edge's score live per request using `WEIGHTS` from `score.py`,
 > so a server running different scoring constants than the ones that built the
@@ -157,9 +165,11 @@ byte-order mark that the YAML parser rejects).
 
 ### 6. Rate limit
 
-The API has no auth and permissive CORS, and each request is ~190 ms of CPU
-against 4 threads — a ceiling near 20 req/s, so one loop in a script is a denial
-of service. At `dash.cloudflare.com` → your domain → **Security → WAF → Rate
+The API has no auth and permissive CORS, and each request is ~190 ms of CPU that
+the 4 threads do **not** parallelize (see Notes) — a ceiling nearer **5 req/s**
+than the 20 this file used to claim, so one loop in a script is a denial of
+service, and comfortably sooner than assumed. At
+`dash.cloudflare.com` → your domain → **Security → WAF → Rate
 limiting rules** (main dashboard, no Zero Trust needed), match
 `http.host eq "api.example.com"`, count by IP, and cap at **60 requests/minute**.
 
@@ -223,9 +233,14 @@ exception at roughly €4).
 
 ## Notes
 
-- **One process, a few threads.** waitress loads the graph once and serves with
-  4 threads; scipy releases the GIL during routing, so requests overlap without a
-  second copy of the graph. Measured **~0.8 GB physical footprint**; plan for
+- **One process, a few threads — but routing does not run in parallel.** waitress
+  loads the graph once and serves with 4 threads, which keeps the server
+  responsive while a route computes. It does not multiply throughput: measured on
+  the real graph, 4 concurrent routes take 0.482 s versus 0.519 s serial, a
+  **1.08x** speedup. (This file used to say scipy releases the GIL during
+  routing. It does not, for `scipy.sparse.csgraph.dijkstra`.) More throughput
+  means more processes, at another ~1 GB of graph each.
+  Measured **~0.8 GB physical footprint**; plan for
   2 GB free, so a 4 GB machine is fine and 8 GB comfortable. Note that plain RSS
   understates this badly on macOS, which compresses much of it out.
   (It was ~1.0 GB until the router's node-pair lookup stopped being a dict of
@@ -234,7 +249,8 @@ exception at roughly €4).
   and ~500 ms through the tunnel. Nearly all of that is the Dijkstra itself,
   which solves to every node in the state; point-to-point search
   (A*/bidirectional), or scipy's `limit=` argument, is where a further speedup
-  would come from if it is ever needed.
+  would come from if it is ever needed — and since the threads don't overlap
+  routing, that is also the cheapest way to raise the concurrent ceiling.
 - **Responses are gzipped** (`flask-compress`), ~3–4× smaller. Route GeoJSON is
   large and repetitive, and on a home connection your *upload* bandwidth is the
   real ceiling — compression multiplies how many routes the laptop can serve.

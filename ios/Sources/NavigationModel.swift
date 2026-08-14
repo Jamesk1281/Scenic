@@ -98,9 +98,32 @@ final class NavigationModel {
     }
 
     /// When the last reroute was attempted. Off-route checks run on every GPS
-    /// tick (~every 5 m), so without a cooldown a failed reroute — server briefly
-    /// unreachable, say — would retry several times a second.
+    /// tick — about 1 Hz, moving or not, since `LocationManager` carries no
+    /// distance filter — so without a cooldown a failed reroute (server briefly
+    /// unreachable, say) would retry several times a second.
     private var lastRerouteAttempt: Date = .distantPast
+
+    /// Where the driver was when the last reroute fired, and how far they must
+    /// travel before another may.
+    ///
+    /// The cooldown alone bounds *attempts*, not successes. A replacement route
+    /// begins at the nearest road node, so a car parked more than
+    /// `offRouteMeters` from any mapped road is still off-route the moment the
+    /// new route arrives — and it re-routes again 8 s later, forever. That used
+    /// to be starved by the 5 m distance filter, which produced almost no fixes
+    /// from a stationary car; with the filter gone it runs at 1 Hz in a pocket,
+    /// on background location: roughly 450 reroutes an hour, 900 statewide
+    /// Dijkstras against the server, ~49 MB of route geometry appended to the
+    /// trace, and a banner resetting to step 0 every 8 seconds. Requiring real
+    /// movement in between is what breaks the loop; a user-initiated
+    /// `switchToFastest` bypasses this deliberately.
+    private var lastRerouteOrigin: CLLocationCoordinate2D?
+    private static let rerouteMinMovementMeters: Double = 50
+
+    private func hasMovedSinceLastReroute(_ location: CLLocation) -> Bool {
+        guard let origin = lastRerouteOrigin else { return true }
+        return location.distance(to: origin) >= Self.rerouteMinMovementMeters
+    }
 
     /// Ticks up on every reroute, so a slow reply that lands after a newer
     /// request has started can be recognised as stale and dropped. Two can
@@ -132,11 +155,14 @@ final class NavigationModel {
         // `coordinates` back off `self`.
         self.stepRemaining = Self.remainingAtEachStep(of: steps, along: coordinates)
         trace?.route(route, reason: "start")
+        if trace != nil { startWatchdog() }
     }
 
     /// Close out the drive — called when the user leaves navigation, however it
     /// ended. Only the trace cares; everything else is thrown away with `self`.
     func finish(reason: String = "ended") {
+        watchdog?.cancel()
+        watchdog = nil
         trace?.end(reason: reason)
     }
 
@@ -145,15 +171,52 @@ final class NavigationModel {
         trace?.phase(name)
     }
 
+    /// When this session began, and when the last fix arrived. A recorder with
+    /// nothing to record is the failure the indicator exists to catch, and
+    /// `DriveTrace.failure` cannot see it: the writer is perfectly healthy, the
+    /// fixes just stopped coming (authorization revoked mid-drive, a deep urban
+    /// canyon, updates never restarted after a resume).
+    private let startedAt = Date()
+    private(set) var lastFixAt: Date?
+
+    /// Ticked every couple of seconds purely so SwiftUI re-evaluates the banner.
+    /// "No fixes are arriving" is the one condition that cannot trigger its own
+    /// redraw — every other change to this model is driven *by* a fix — so
+    /// without something observable moving, the screen would keep showing the
+    /// state it had when the stream died.
+    private var watchdogTick = 0
+    private var watchdog: Task<Void, Never>?
+
+    /// How long without a fix counts as not recording. CoreLocation delivers
+    /// about 1 Hz during a drive, so ten seconds of silence is not cadence
+    /// wobble — it is the stream having stopped.
+    private static let fixSilenceSeconds: TimeInterval = 10
+
+    private func startWatchdog() {
+        watchdog = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(2))
+                guard let self else { return }
+                self.watchdogTick &+= 1
+            }
+        }
+    }
+
     /// Why this drive isn't being recorded, or nil if it is.
     ///
     /// Surfaced on the nav screen. A test drive is expensive and unrepeatable —
     /// the light was that colour, the traffic was that thick, once — so the one
     /// thing the screen must never do is look normal while recording nothing.
     var recordingProblem: String? {
+        _ = watchdogTick        // observed, so silence still redraws the banner
         guard let trace else { return "Not recording — couldn't open a trace file." }
-        guard let failure = trace.failure else { return nil }
-        return "Recording stopped — \(failure)"
+        if let failure = trace.failure { return "Recording stopped — \(failure)" }
+        guard !arrived else { return nil }
+        let silence = Date().timeIntervalSince(lastFixAt ?? startedAt)
+        guard silence > Self.fixSilenceSeconds else { return nil }
+        return lastFixAt == nil
+            ? "No GPS fixes yet — nothing is being recorded."
+            : "No GPS fixes for \(Int(silence)) s — nothing is being recorded."
     }
 
     /// The instruction shown in the banner right now.
@@ -180,6 +243,10 @@ final class NavigationModel {
     // MARK: - Driven by each location update
 
     func update(_ location: CLLocation) {
+        // Before the guards: this records that a fix *arrived*, which is what
+        // `recordingProblem` watches. An early return here is still evidence
+        // the stream is alive.
+        lastFixAt = Date()
         guard !steps.isEmpty, !arrived, coordinates.count >= 2 else { return }
 
         // Match forwards from where the driver already is, with a little slack
@@ -227,10 +294,12 @@ final class NavigationModel {
 
         // Strayed well off the line — re-route from here, keeping the same
         // scenic intent (or fastest, if that's what we're already following).
-        // The cooldown stops a failed attempt from retrying on every GPS tick.
+        // The cooldown stops a failed attempt from retrying on every GPS tick,
+        // and `hasMoved` stops a *successful* one from retrying forever.
         if hasJoinedRoute,
            !isRerouting,
            Date().timeIntervalSince(lastRerouteAttempt) > 8,
+           hasMovedSinceLastReroute(location),
            here.offRoute > Self.offRouteMeters {
             Task { await reroute(from: location.coordinate) }
         }
@@ -288,31 +357,50 @@ final class NavigationModel {
 
     /// Abandon the scenic route and head straight there the quick way.
     func switchToFastest(from location: CLLocationCoordinate2D) async {
+        let previousPref = pref
         followingFastest = true
         pref = 0
-        await reroute(from: location, reason: "fastest")
+        // Both are restored if the request never lands. Left set, the screen
+        // would draw the gray "fastest" line and hide the button — with no
+        // fastest route ever adopted, so no way to retry — while every later
+        // off-route reroute silently asked for pref 0, discarding the scenic
+        // intent on the strength of a request that failed. A *superseded*
+        // attempt is left alone: a newer request owns the state by then.
+        if await reroute(from: location, reason: "fastest") == .failed {
+            followingFastest = false
+            pref = previousPref
+        }
     }
 
+    /// What became of one reroute attempt. `failed` and `superseded` are worth
+    /// telling apart: only the first means nothing else is coming.
+    private enum RerouteOutcome {
+        case adopted, failed, superseded
+    }
+
+    @discardableResult
     private func reroute(from origin: CLLocationCoordinate2D,
-                         reason: String = "offroute") async {
+                         reason: String = "offroute") async -> RerouteOutcome {
         rerouteGeneration += 1
         let generation = rerouteGeneration
         let wantFastest = pref == 0
         isRerouting = true
         lastRerouteAttempt = Date()
+        lastRerouteOrigin = origin
         // Only the newest attempt may clear the flag; an older one finishing
         // must not advertise the newer one as done.
         defer { if generation == rerouteGeneration { isRerouting = false } }
 
-        guard let response = try? await fetchRoute(origin, destination, pref, weights),
-              generation == rerouteGeneration
-        else { return }
+        guard let response = try? await fetchRoute(origin, destination, pref, weights)
+        else { return generation == rerouteGeneration ? .failed : .superseded }
+        guard generation == rerouteGeneration else { return .superseded }
 
         adopt(wantFastest ? response.fastest : response.scenic, reason: reason)
         // The new route starts from where the driver is standing, so they are
         // on it by construction — arm off-route recovery for the rest of the
         // drive even if they never reached the originally planned start.
         hasJoinedRoute = true
+        return .adopted
     }
 
     /// Follow a different route from here on.

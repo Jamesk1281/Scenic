@@ -44,6 +44,23 @@ final class LocationManager: NSObject, CLLocationManagerDelegate {
 
     private let manager = CLLocationManager()
 
+    /// Whether this *build* declares the background location mode.
+    ///
+    /// `allowsBackgroundLocationUpdates = true` raises `NSInvalidArgumentException`
+    /// when the bundle lacks `UIBackgroundModes: location` — an Objective-C
+    /// exception, so no Swift `catch` can reach it and the app simply dies. That
+    /// is not a hypothetical: `ios/Generated/Info.plist` is a *gitignored build
+    /// output* of `project.yml`, regenerated only by `xcodegen generate`, so a
+    /// checkout whose plist predates the entry crashes the instant the driver
+    /// taps Start — with a clean `git status` and nothing to suggest why.
+    /// Reading the bundle turns that into a degraded drive (foreground-only
+    /// updates) instead of a crash, and `recordingProblem` will notice if fixes
+    /// then stop while backgrounded.
+    private static let backgroundLocationDeclared: Bool = {
+        let modes = Bundle.main.object(forInfoDictionaryKey: "UIBackgroundModes") as? [String]
+        return modes?.contains("location") ?? false
+    }()
+
     /// True between `start()` and `stop()`, so a one-shot request knows whether
     /// it may switch the GPS back off when it's done.
     private var navigating = false
@@ -116,8 +133,13 @@ final class LocationManager: NSObject, CLLocationManagerDelegate {
     func start() {
         navigating = true
         manager.requestWhenInUseAuthorization()
-        manager.allowsBackgroundLocationUpdates = true
-        manager.showsBackgroundLocationIndicator = true
+        // Only if this build actually declares the capability — see
+        // `backgroundLocationDeclared`. Setting it without the entry raises an
+        // Objective-C exception that no Swift `catch` can reach.
+        if Self.backgroundLocationDeclared {
+            manager.allowsBackgroundLocationUpdates = true
+            manager.showsBackgroundLocationIndicator = true
+        }
         manager.startUpdatingLocation()
     }
 
@@ -126,7 +148,8 @@ final class LocationManager: NSObject, CLLocationManagerDelegate {
         navigating = false
         // Surrendered as soon as the drive is over. Left on, a one-shot "My
         // Location" from the planning screen would quietly hold a background
-        // location grant the user only ever agreed to for a drive.
+        // location grant the user only ever agreed to for a drive. (Clearing it
+        // is always safe; only setting it true needs the capability.)
         manager.allowsBackgroundLocationUpdates = false
         guard pendingFix == nil else { return }   // a one-shot still needs them
         manager.stopUpdatingLocation()

@@ -2,8 +2,17 @@
 
 Uses waitress — a production WSGI server that runs the same on Windows, macOS,
 Linux, and in Docker (unlike gunicorn, which is Unix-only). One worker process
-with a few threads: the ~1 GB graph is loaded once, and threads let requests
-overlap (scipy releases the GIL during the heavy routing).
+with a few threads: the ~1 GB graph is loaded once, and the threads keep the
+server responsive (accepting connections, serving /api/health) while a route is
+being computed.
+
+They do NOT make routing parallel. This used to claim scipy releases the GIL
+during the Dijkstra, so requests overlapped; measured on the real graph, four
+concurrent routes take 0.482 s against 0.519 s for four serial ones — a 1.08x
+speedup, i.e. essentially serialized. Real throughput is therefore about one
+route per ~95 ms of CPU (~5 req/s for the two-Dijkstra endpoint), not 4x that.
+Going faster means more *processes*, and each one is another ~1 GB copy of the
+graph — the trade to make deliberately, not to assume away.
 
     python server/serve.py                          # 0.0.0.0:5057
     PORT=8080 python server/serve.py                # custom port

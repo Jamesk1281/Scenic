@@ -39,16 +39,28 @@ struct NavView: View {
         .safeAreaInset(edge: .bottom) { controls }
         .onAppear {
             locationManager.start()
-            // Keep the screen awake for the whole drive. iOS otherwise dims and
-            // locks the display after a minute or two without a touch — and
-            // since we hold only when-in-use authorization and declare no
-            // background location mode, locking silently stops the location
-            // updates that `nav.update` runs on. Steps would stop advancing,
-            // off-route detection would stop, and arrival would never fire:
-            // the app appears to hang a couple of minutes into every drive.
+            // Keep the screen awake for the whole drive, so the map stays
+            // visible without the driver reaching for the phone. (Location
+            // itself no longer depends on this: the app now declares
+            // `UIBackgroundModes: location` and `LocationManager` opts into
+            // background updates, so a locked phone keeps delivering fixes.
+            // Before that, locking stopped the stream and the app appeared to
+            // hang a couple of minutes into every drive.)
             UIApplication.shared.isIdleTimerDisabled = true
         }
         .onDisappear {
+            locationManager.stop()
+            UIApplication.shared.isIdleTimerDisabled = false
+        }
+        // Arrival ends the drive, so release the hardware then rather than
+        // waiting for a tap on End. `nav.update` early-returns once `arrived`
+        // latches, so nothing is being recorded or displayed — but the session
+        // would otherwise keep running at 1 Hz, in the background, with the
+        // screen held awake, until the driver happened to come back to the
+        // phone. Locking it used to be the implicit backstop; declaring the
+        // background mode is exactly what removed that.
+        .onChange(of: nav.arrived) { _, arrived in
+            guard arrived else { return }
             locationManager.stop()
             UIApplication.shared.isIdleTimerDisabled = false
         }
