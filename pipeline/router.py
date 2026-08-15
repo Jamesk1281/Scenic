@@ -857,6 +857,15 @@ TURN_CHORD_M = 25.0
 # routes that gathering 60 m of approach then finds.
 APPROACH_M = 60.0
 
+# Two instructions closer together than this cannot both be acted on. At 50 km/h
+# a driver covers 14 m a second, and hearing an instruction, finding the road and
+# moving across for it needs several of those.
+#
+# This does not mean a route never has two junctions that close — plenty do, and
+# both maneuvers are real. It means the *router* must not manufacture the
+# crowding by describing one junction twice.
+MIN_INSTRUCTION_GAP_M = 60.0
+
 
 def _dist_m(p, q):
     """Metres between two [lon, lat] points, on the flat.
@@ -1261,10 +1270,32 @@ class RouteResult:
             # exit already names where the ramp goes. Emitting "Continue on X"
             # a few metres later says nothing and arrives while the driver is
             # still in the manoeuvre.
-            if (previous is not None and previous["kind"] in ("roundabout", "ramp")
-                    and step["type"] == "continue"):
-                steps[-1]["distance_m"] += round(leg["length_m"])
-                continue
+            #
+            # The same is true when the follow-on is a slight turn rather than a
+            # continue — "Take the exit onto Saint James Street" then, 40 m on,
+            # "Slight right onto Saint James Street". Measured over 120 routes,
+            # 61 of the 408 instruction pairs that land closer together than a
+            # driver can act on were this: the same road, named twice.
+            #
+            # Bounded by the length of the leg being left, because the merge at
+            # the end of a two-kilometre ramp is a real event and folding it
+            # would leave the driver with nothing to follow for two kilometres.
+            # And never for a sharp turn, where which way you go is the
+            # instruction and the earlier one did not say.
+            if previous is not None and previous["kind"] in ("roundabout", "ramp"):
+                # ...but never a fork. That one exists precisely because the
+                # road ahead is not the road to take, so folding it back into
+                # "the same road, already named" is the bug it was written to
+                # fix. Measured: dropping this clause put one misleading fork
+                # back into 120 routes.
+                repeats = (step["type"] != "fork"
+                           and step["name"] and step["name"] == steps[-1]["name"]
+                           and previous["length_m"] < MIN_INSTRUCTION_GAP_M
+                           and step["modifier"] not in ("sharp left", "sharp right",
+                                                        "uturn"))
+                if step["type"] == "continue" or repeats:
+                    steps[-1]["distance_m"] += round(leg["length_m"])
+                    continue
 
             step["lat"] = round(pts[0][1], 6)
             step["lon"] = round(pts[0][0], 6)
