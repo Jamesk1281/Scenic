@@ -111,4 +111,60 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual((range.lowerBound + range.upperBound) / 2,
                        BeautyType.neutralWeight, accuracy: 1e-9)
     }
+
+    // MARK: - Maneuvers
+
+    func test_a_structured_maneuver_decodes() {
+        let json = """
+        {"instruction":"Take exit 26 toward I 93 North: Boston","lat":42.1,
+         "lon":-71.2,"distance_m":320,"type":"exit","modifier":"slight right",
+         "exit_ref":"26","destination":"I 93 North: Boston","roundabout_exit":0}
+        """.data(using: .utf8)!
+        let step = try! JSONDecoder().decode(RouteStep.self, from: json)
+        XCTAssertEqual(step.maneuver, .exit)
+        XCTAssertEqual(step.exit_ref, "26")
+        XCTAssertEqual(step.destination, "I 93 North: Boston")
+    }
+
+    func test_a_maneuver_type_the_app_does_not_know_still_decodes() {
+        // The backend may learn a maneuver before this app is updated. An
+        // unrecognised type must degrade to `unknown`, not fail the decode:
+        // the whole route would be lost mid-drive over a word, and the
+        // `instruction` is perfectly readable either way.
+        let json = """
+        {"instruction":"Board the ferry","lat":42.1,"lon":-71.2,
+         "distance_m":10,"type":"ferry","modifier":"straight",
+         "exit_ref":"","destination":"","roundabout_exit":0}
+        """.data(using: .utf8)!
+        let step = try! JSONDecoder().decode(RouteStep.self, from: json)
+        XCTAssertEqual(step.maneuver, .unknown)
+        XCTAssertEqual(step.instruction, "Board the ferry")
+    }
+
+    func test_a_step_from_before_the_maneuver_rework_still_decodes() {
+        // Old cached responses and older fixtures carry only the four original
+        // fields; they must not become undecodable.
+        let json = """
+        {"instruction":"Turn left onto Elm Street","lat":42.1,"lon":-71.2,
+         "distance_m":120}
+        """.data(using: .utf8)!
+        let step = try! JSONDecoder().decode(RouteStep.self, from: json)
+        XCTAssertEqual(step.maneuver, .unknown)
+        XCTAssertNil(step.exit_ref)
+    }
+
+    func test_left_and_right_turns_do_not_share_an_icon() {
+        // The glyph is what a driver reads at a glance; both are type `turn`,
+        // so the modifier is what has to distinguish them.
+        let decode = { (modifier: String) -> RouteStep in
+            let json = """
+            {"instruction":"x","lat":0,"lon":0,"distance_m":1,"type":"turn",
+             "modifier":"\(modifier)","exit_ref":"","destination":"",
+             "roundabout_exit":0}
+            """.data(using: .utf8)!
+            return try! JSONDecoder().decode(RouteStep.self, from: json)
+        }
+        XCTAssertNotEqual(decode("left").symbol, decode("right").symbol)
+        XCTAssertNotEqual(decode("left").symbol, decode("slight left").symbol)
+    }
 }

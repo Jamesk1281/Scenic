@@ -131,10 +131,19 @@ struct NavView: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             } else {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(distanceText(nav.distanceToNext))
-                        .font(.subheadline).foregroundStyle(.secondary)
-                    Text(nav.currentInstruction).font(.title3.bold())
+                HStack(spacing: 12) {
+                    // The maneuver glyph, ahead of the words. A driver reads
+                    // the arrow long before the sentence, and an exit should
+                    // not look like a left turn.
+                    Image(systemName: nav.currentSymbol)
+                        .font(.title2.bold())
+                        .foregroundStyle(Color.scenic)
+                        .accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(distanceText(nav.distanceToNext))
+                            .font(.subheadline).foregroundStyle(.secondary)
+                        Text(nav.currentInstruction).font(.title3.bold())
+                    }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }

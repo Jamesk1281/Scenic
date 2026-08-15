@@ -7,10 +7,11 @@ connected component — oneway-aware, so every node is mutually reachable by car
 rather than merely joined to the network by some road running the wrong way.
 
 Outputs:
-  data/processed/graph_nodes.parquet  node_id, lon, lat
+  data/processed/graph_nodes.parquet  node_id, lon, lat, exit_ref
   data/processed/graph_edges.parquet  u, v, length_m, minutes, score,
                                        c_water/c_coast/c_green/c_relief/...,
-                                       name, ref, highway, geometry (WGS84)
+                                       name, ref, highway, junction,
+                                       dest_ref, dest_name, geometry (WGS84)
 
 Usage: python graph.py <input.osm.pbf> <processed_dir>
 """
@@ -59,7 +60,24 @@ class GraphHandler(osmium.SimpleHandler):
         super().__init__()
         self.ways = []           # (tags-dict, [node_ids], [(lon,lat)])
         self.node_count = {}     # node_id -> times referenced (for junctions)
+        self.exit_refs = {}      # node_id -> exit number ("26", "13A")
         self.errors = 0
+
+    def node(self, n):
+        """Pick up exit numbers.
+
+        They live on the *mainline* node where the ramp diverges — an OSM
+        `highway=motorway_junction` carrying `ref=26` — and not on the ramp
+        itself. That distinction is the whole reason this handler exists: 74%
+        of Massachusetts' 1,363 junction nodes carry an exit number, while only
+        4% of ramp ways carry any `ref` at all, and the ones that do hold the
+        road number they lead to ("MA 3") rather than the exit. Reading the
+        ramp would produce "Take exit MA 3".
+        """
+        if n.tags.get("highway") == "motorway_junction":
+            ref = n.tags.get("ref", "")
+            if ref:
+                self.exit_refs[n.id] = ref
 
     def way(self, w):
         hw = w.tags.get("highway")
@@ -92,6 +110,21 @@ class GraphHandler(osmium.SimpleHandler):
             "highway": hw,
             "name": w.tags.get("name", ""),
             "ref": w.tags.get("ref", ""),
+            # Kept rather than merely consulted. `junction` was already read
+            # just above to infer oneway and then discarded, which is why a
+            # rotary arrived at the driver as a run of unexplained slight
+            # rights instead of "take the 2nd exit". MA has 1,234 of them, 693
+            # named.
+            "junction": w.tags.get("junction", ""),
+            # Where a ramp leads, as it appears on the sign. `destination:ref`
+            # is the road ("I 93 North"), `destination` the places it serves
+            # ("Cambridgeport;Brookline"), semicolon-separated in OSM and left
+            # that way here — splitting them is a rendering decision, and the
+            # wording lives in router.py with the rest of the labels. 46% of MA
+            # ramps carry one or the other.
+            "dest_ref": w.tags.get("destination:ref", ""),
+            "dest_name": (w.tags.get("destination", "")
+                          or w.tags.get("destination:street", "")),
             "oneway": oneway,
             "speed": parse_maxspeed(w.tags.get("maxspeed", "")) or SPEED_KMH[hw],
         }
@@ -125,6 +158,8 @@ def build_edges(ways, node_count, to_m):
                 "minutes": length / 1000.0 / meta["speed"] * 60.0,
                 "oneway": meta["oneway"],
                 "name": meta["name"], "ref": meta["ref"], "highway": meta["highway"],
+                "junction": meta["junction"],
+                "dest_ref": meta["dest_ref"], "dest_name": meta["dest_name"],
                 "geometry": shapely.LineString(seg),
             })
     return rows
@@ -156,8 +191,9 @@ def main(pbf_path: str, processed_dir: str):
     print(f"largest component: {len(edges):,} edges, "
           f"{len(set(edges['u']) | set(edges['v'])):,} nodes")
 
-    # node table (coords from edge endpoints)
-    nodes = node_table(edges)
+    # node table (coords from edge endpoints, plus any exit number)
+    nodes = node_table(edges, h.exit_refs)
+    print(f"{(nodes['exit_ref'] != '').sum():,} nodes carry an exit number")
 
     edges.to_parquet(d / "graph_edges.parquet")
     nodes.to_parquet(d / "graph_nodes.parquet")
@@ -273,7 +309,7 @@ def largest_component(edges: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     return edges[mask].reset_index(drop=True)
 
 
-def node_table(edges: gpd.GeoDataFrame) -> pd.DataFrame:
+def node_table(edges: gpd.GeoDataFrame, exit_refs: dict | None = None) -> pd.DataFrame:
     coords = shapely.get_coordinates(edges.geometry.values)
     counts = shapely.get_num_coordinates(edges.geometry.values)
     starts = np.r_[0, np.cumsum(counts)[:-1]]
@@ -283,11 +319,17 @@ def node_table(edges: gpd.GeoDataFrame) -> pd.DataFrame:
     nid = np.r_[edges["u"].to_numpy(), edges["v"].to_numpy()]
     xy = np.vstack([u_xy, v_xy])
     _, first = np.unique(nid, return_index=True)
-    return pd.DataFrame({
+    table = pd.DataFrame({
         "node_id": nid[first],
         "lon": xy[first, 0],
         "lat": xy[first, 1],
     })
+    # Empty for all but a handful of nodes — MA has ~1,000 numbered exits
+    # against 310,000 nodes — but it has to ride on the node rather than the
+    # edge, because an exit number describes the *point* where the ramp leaves
+    # the mainline. That is exactly the seam the maneuver generator looks at.
+    table["exit_ref"] = table["node_id"].map(exit_refs or {}).fillna("")
+    return table
 
 
 if __name__ == "__main__":

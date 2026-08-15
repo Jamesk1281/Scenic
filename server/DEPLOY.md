@@ -35,6 +35,20 @@ the scoring changes, then copy the two parquet files over.
 > nothing about the serving code notices. Rebuilt, the graph is one strongly
 > connected component and drops 712 edges (0.2%).
 
+> **Turn-by-turn maneuvers need a rebuilt graph, and this one will not start
+> without it.** The instructions carry exit numbers, ramp destinations and
+> rotary exit counts, which come from OSM tags `graph.py` used to discard —
+> `junction`, `destination`, `destination:ref` on edges, and the `ref` on
+> `highway=motorway_junction` nodes. So `graph_edges.parquet` gains `junction`,
+> `dest_ref` and `dest_name`, and `graph_nodes.parquet` gains `exit_ref`.
+>
+> Unlike every warning below this one, it is not a silent disagreement:
+> `Router` checks for those columns at load and raises, because a graph that
+> merely *routes* correctly while answering every rotary with a slight right
+> and every exit with nothing is exactly the failure this file keeps warning
+> about. Rerun `graph.py` and copy **both** parquets. Note the rebuild is now
+> ~135 s rather than ~30 s: reading node tags means a Python callback per node.
+
 > **The code and the parquets must come from the same commit.** `router.py`
 > re-blends every edge's score live per request using `WEIGHTS` from `score.py`,
 > so a server running different scoring constants than the ones that built the

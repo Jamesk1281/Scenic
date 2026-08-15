@@ -168,9 +168,15 @@ final class DriveTrace {
             "minutes": feature.properties.minutes,
             "mean_score": feature.properties.mean_score,
             "coords": feature.geometry.coordinates,
+            // The maneuver type rides along with the words: when a drive goes
+            // wrong at a junction, "which kind of maneuver was it" is the first
+            // question, and recovering that from the prose afterwards means
+            // parsing English out of a trace.
             "steps": feature.properties.steps.map {
                 ["instruction": $0.instruction, "lat": $0.lat, "lon": $0.lon,
-                 "distance_m": $0.distance_m] as [String: Any]
+                 "distance_m": $0.distance_m,
+                 "type": $0.maneuver.rawValue,
+                 "modifier": $0.modifier ?? ""] as [String: Any]
             },
         ], flush: true)
     }

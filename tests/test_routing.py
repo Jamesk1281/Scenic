@@ -10,8 +10,9 @@ import numpy as np
 import pytest
 import shapely
 
-from router import (BEAUTY_TYPES, BREAKDOWN_MIN, PREF_CURVE, RouteResult,
-                    _bearing, _compass, _turn_delta, _turn_phrase, stitch)
+from router import (BEAUTY_TYPES, BREAKDOWN_MIN, PREF_CURVE, ManeuverContext,
+                    RouteResult, Router, _bearing, _compass, _turn_delta,
+                    _turn_modifier, stitch)
 
 ALL_TYPES = [name for name, *_ in BEAUTY_TYPES]
 
@@ -56,13 +57,16 @@ class TestBearings:
         assert abs(_turn_delta(0, 180)) == pytest.approx(180)
 
     @pytest.mark.parametrize("delta,expected", [
-        (0, "Continue"), (10, "Continue"),
-        (30, "Slight right"), (-30, "Slight left"),
-        (90, "Turn right"), (-90, "Turn left"),
-        (150, "Sharp right"), (-150, "Sharp left"),
+        (0, "straight"), (10, "straight"),
+        (30, "slight right"), (-30, "slight left"),
+        (90, "right"), (-90, "left"),
+        (150, "sharp right"), (-150, "sharp left"),
+        (180, "uturn"),
     ])
-    def test_turn_phrases(self, delta, expected):
-        assert _turn_phrase(0, delta % 360) == expected
+    def test_turn_modifiers(self, delta, expected):
+        """The vocabulary is OSRM's and Valhalla's, so the wire format survives
+        a change of routing engine."""
+        assert _turn_modifier(0, delta % 360) == expected
 
 
 class TestStitch:
@@ -110,6 +114,198 @@ class TestSteps:
         r = self._result([[(0, 0), (0, 0.01)], [(0, 0.01), (0.01, 0.01)]],
                          ["Main Street", "Main Street"])
         assert any("stay on Main Street" in s["instruction"] for s in r.steps())
+
+
+# Degrees per metre at the equator, where the fixtures live — near enough for
+# geometry whose only job is to have the right angles in it.
+_DEG_LAT = 1.0 / 110540.0
+_DEG_LON = 1.0 / 111320.0
+
+
+def _point(east_m, north_m):
+    return (east_m * _DEG_LON, north_m * _DEG_LAT)
+
+
+def _along(bearing_deg, metres):
+    rad = np.radians(bearing_deg)
+    return np.sin(rad) * metres, np.cos(rad) * metres
+
+
+class TestManeuverGeneration:
+    """The four things the first test drive got wrong."""
+
+    def _result(self, legs, nodes=None, context=None):
+        """`legs` is a list of (coords, name, highway, junction, dest_ref,
+        dest_name)."""
+        import geopandas as gpd
+        rows = gpd.GeoDataFrame(
+            {"name": [x[1] for x in legs],
+             "ref": [""] * len(legs),
+             "highway": [x[2] for x in legs],
+             "junction": [x[3] for x in legs],
+             "dest_ref": [x[4] for x in legs],
+             "dest_name": [x[5] for x in legs],
+             "length_m": [100.0] * len(legs),
+             "geometry": [shapely.LineString(x[0]) for x in legs]},
+            crs=4326,
+        )
+        coords = [np.array(x[0]) for x in legs]
+        return RouteResult(rows, stitch(coords), coords,
+                           nodes=nodes, context=context)
+
+    def test_a_turn_is_not_reported_as_continue_when_the_corner_is_rounded(self):
+        """The defect this guards, and the reason it was user-visible.
+
+        `_turn_phrase` used to take its bearings from the two vertices either
+        side of the junction. OSM packs vertices tightly through a corner to
+        shape it — 29% of edge ends in the MA graph have their last two under
+        10 m apart — so that baseline is mostly digitizing noise. And the noise
+        is *biased*: the approach already curves into the turn, so the measured
+        change comes out too small and a real turn was announced as "Continue".
+        A driver on the first test drive was told to continue straight where
+        the map plainly showed a turn.
+
+        Here the approach runs due north for 80 m and then rounds 3 m into the
+        corner at 30 degrees. Measured across the rounding alone the turn looks
+        like 30 degrees (a slight right); measured over a chord that clears it,
+        it is the 60 degrees it really is.
+        """
+        rounding = _along(30, 3)
+        approach = [_point(0, 0), _point(0, 40), _point(0, 80),
+                    _point(rounding[0], 80 + rounding[1])]
+        onward_end = _along(60, 120)
+        onward = [approach[-1],
+                  _point(rounding[0] + onward_end[0], 80 + rounding[1] + onward_end[1])]
+
+        steps = self._result([
+            (approach, "Old Road", "residential", "", "", ""),
+            (onward, "New Road", "residential", "", "", ""),
+        ]).steps()
+
+        turn = steps[1]
+        assert turn["modifier"] == "right", (
+            f"a 60-degree turn came out as {turn['modifier']!r} — the bearing "
+            "is being measured across the corner rounding again")
+        assert turn["instruction"] == "Turn right onto New Road"
+
+    def test_a_rotary_is_counted_not_described_as_slight_rights(self):
+        """A rotary used to merge into one unremarkable leg and emit nothing,
+        or break into a run of slight rights. It is a distinct maneuver with an
+        exit number, and the count comes from the graph rather than any tag."""
+        leg = lambda a, b: [a, b]
+        legs = [
+            (leg(_point(0, 0), _point(0, 100)), "Approach Road", "primary", "", "", ""),
+            (leg(_point(0, 100), _point(10, 110)), "Reid Rotary", "primary", "roundabout", "", ""),
+            (leg(_point(10, 110), _point(20, 100)), "Reid Rotary", "primary", "roundabout", "", ""),
+            (leg(_point(20, 100), _point(30, 90)), "Reid Rotary", "primary", "roundabout", "", ""),
+            (leg(_point(30, 90), _point(120, 0)), "Elm Street", "primary", "", "", ""),
+        ]
+        # Node indices in travel order, one longer than the edge list.
+        nodes = [0, 1, 2, 3, 4, 5]
+        # Two of the nodes we pass round the circle have a road leaving them:
+        # node 3 (one we go by) and node 4 (the one we leave on).
+        exits = np.zeros(6, dtype=int)
+        exits[3] = 1
+        exits[4] = 1
+        context = ManeuverContext({}, exits)
+
+        steps = self._result(legs, nodes=nodes, context=context).steps()
+        rotary = [s for s in steps if s["type"] == "roundabout"]
+        assert len(rotary) == 1, [s["instruction"] for s in steps]
+        assert rotary[0]["roundabout_exit"] == 2
+        assert rotary[0]["instruction"] == "Take the 2nd exit at Reid Rotary onto Elm Street"
+
+    def test_the_entry_road_is_not_counted_as_a_rotary_exit(self):
+        """Counting the node you arrive at would put every rotary instruction
+        one exit late."""
+        legs = [
+            ([_point(0, 0), _point(0, 100)], "Approach Road", "primary", "", "", ""),
+            ([_point(0, 100), _point(10, 110)], "Reid Rotary", "primary", "roundabout", "", ""),
+            ([_point(10, 110), _point(20, 100)], "Reid Rotary", "primary", "roundabout", "", ""),
+            ([_point(20, 100), _point(110, 10)], "Elm Street", "primary", "", "", ""),
+        ]
+        exits = np.zeros(5, dtype=int)
+        exits[1] = 1        # the entry node: the road we arrived on leaves it too
+        exits[3] = 1        # the exit we actually take
+        steps = self._result(legs, nodes=[0, 1, 2, 3, 4],
+                             context=ManeuverContext({}, exits)).steps()
+        rotary = [s for s in steps if s["type"] == "roundabout"][0]
+        assert rotary["roundabout_exit"] == 1, "the entry road was counted as an exit"
+
+    def test_a_motorway_exit_is_named_not_called_a_slight_right(self):
+        """96% of ramps carry no name, so the label fell through and every exit
+        in the state was announced as a bare "Slight right"."""
+        legs = [
+            ([_point(0, 0), _point(0, 200)], "", "motorway", "", "", ""),
+            ([_point(0, 200), _point(*_along(30, 150))],
+             "", "motorway_link", "", "I 93 North", "Boston;Quincy"),
+            ([_point(*_along(30, 150)), _point(200, 400)], "I 93", "motorway", "", "", ""),
+        ]
+        context = ManeuverContext({1: "26"}, np.zeros(4, dtype=int))
+        steps = self._result(legs, nodes=[0, 1, 2, 3], context=context).steps()
+        exit_step = [s for s in steps if s["type"] == "exit"][0]
+        assert exit_step["exit_ref"] == "26"
+        assert exit_step["instruction"] == "Take exit 26 toward I 93 North: Boston"
+        assert any(s["type"] == "merge" for s in steps), "joining a motorway is a merge"
+
+    def test_an_unsigned_ramp_falls_back_to_the_road_it_joins(self):
+        """The fallback order never invents anything: exit number, then where
+        the ramp says it goes, then the road it actually joins."""
+        legs = [
+            ([_point(0, 0), _point(0, 200)], "", "primary", "", "", ""),
+            ([_point(0, 200), _point(*_along(30, 150))], "", "primary_link", "", "", ""),
+            ([_point(*_along(30, 150)), _point(200, 400)], "Chestnut Street", "primary", "", "", ""),
+        ]
+        steps = self._result(legs, nodes=[0, 1, 2, 3],
+                             context=ManeuverContext({}, np.zeros(4, dtype=int))).steps()
+        exit_step = [s for s in steps if s["type"] == "exit"][0]
+        assert exit_step["instruction"] == "Take the exit onto Chestnut Street"
+
+    def test_a_long_interchange_destination_is_truncated(self):
+        """"I 93: South Station / Concord New Hampshire / Quincy" is a gantry
+        you read at 60 mph, not a sentence anyone can follow spoken aloud."""
+        legs = [
+            ([_point(0, 0), _point(0, 200)], "", "motorway", "", "", ""),
+            ([_point(0, 200), _point(*_along(30, 150))], "", "motorway_link", "",
+             "I 93;I 95;US 1", "South Station;Concord New Hampshire;Quincy"),
+            ([_point(*_along(30, 150)), _point(200, 400)], "I 93", "motorway", "", "", ""),
+        ]
+        steps = self._result(legs, nodes=[0, 1, 2, 3],
+                             context=ManeuverContext({}, np.zeros(4, dtype=int))).steps()
+        exit_step = [s for s in steps if s["type"] == "exit"][0]
+        assert exit_step["destination"] == "I 93 / I 95: South Station"
+
+    def test_every_step_carries_a_type_and_a_modifier(self):
+        """The wire format is a structured maneuver, not a sentence: the app
+        styles on the type, voice guidance needs the parts separately, and the
+        vocabulary is OSRM's so a change of routing engine would not move the
+        client."""
+        legs = [
+            ([_point(0, 0), _point(0, 100)], "Main Street", "residential", "", "", ""),
+            ([_point(0, 100), _point(100, 100)], "Elm Street", "residential", "", "", ""),
+        ]
+        steps = self._result(legs).steps()
+        assert [s["type"] for s in steps] == ["depart", "turn", "arrive"]
+        for step in steps:
+            assert set(step) >= {"instruction", "type", "modifier", "name",
+                                 "exit_ref", "destination", "roundabout_exit",
+                                 "lat", "lon", "distance_m"}
+
+
+class TestStaleGraphIsRefused:
+    def test_a_graph_without_the_maneuver_tags_is_refused_loudly(self):
+        """A graph built before this rework still loads and still routes — it
+        would just answer every rotary with a slight right and every exit with
+        nothing. That is the silent-disagreement case DEPLOY.md exists to warn
+        about, so it has to be a failure to start, not a quieter route.
+        """
+        import pandas as pd
+
+        router = Router.__new__(Router)
+        router.edges = pd.DataFrame({"u": [1], "v": [2], "name": [""]})
+        router.nodes = pd.DataFrame({"node_id": [1], "lon": [0.0], "lat": [0.0]})
+        with pytest.raises(RuntimeError, match="junction"):
+            router._require_columns()
 
 
 class TestRoutingOverTheGraph:

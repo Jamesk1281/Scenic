@@ -31,13 +31,77 @@ struct Geometry: Decodable {
     let coordinates: [[Double]]
 }
 
+/// What kind of maneuver a step is.
+///
+/// The vocabulary is the backend's, which is in turn OSRM's and Valhalla's —
+/// so if the routing engine is ever swapped this type does not move. Decoded
+/// from a string with an `unknown` fallback rather than as a bare enum,
+/// because a backend that learns a new maneuver must not make the whole route
+/// undecodable on a phone that hasn't been updated: an unrecognised type still
+/// has a perfectly good `instruction` to show.
+enum ManeuverType: String, Decodable {
+    case depart, turn, `continue`, roundabout, exit, merge, arrive, unknown
+
+    init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = ManeuverType(rawValue: raw) ?? .unknown
+    }
+
+    /// The SF Symbol for this maneuver, before the modifier refines it.
+    var symbol: String {
+        switch self {
+        case .depart:     return "location.fill"
+        case .roundabout: return "arrow.triangle.turn.up.right.circle"
+        case .exit:       return "arrow.turn.up.right"
+        case .merge:      return "arrow.merge"
+        case .arrive:     return "flag.checkered"
+        case .turn, .continue, .unknown: return "arrow.up"
+        }
+    }
+}
+
 /// One turn-by-turn maneuver: what to do and where it happens.
+///
+/// Everything past `distance_m` is optional so an older cached response, or a
+/// fixture written before the maneuver rework, still decodes.
 struct RouteStep: Decodable, Identifiable {
     let instruction: String
     let lat: Double
     let lon: Double
     /// How far this instruction carries you (the length of its road leg).
     let distance_m: Double
+
+    /// The structured maneuver behind `instruction`. Present so the app can
+    /// style a motorway exit differently from a left turn, and so voice
+    /// guidance can assemble its own phrasing from the parts rather than
+    /// reading a sentence built for the screen.
+    let type: ManeuverType?
+    let modifier: String?
+    /// The signed exit number, when the junction carries one.
+    let exit_ref: String?
+    /// Where a ramp says it goes, as it reads on the sign.
+    let destination: String?
+    /// Which exit to take at a rotary, 1-based; 0 when it can't be counted.
+    let roundabout_exit: Int?
+
+    var maneuver: ManeuverType { type ?? .unknown }
+
+    /// The icon for this step, refined by the turn direction where there is
+    /// one — a left turn and a right turn are the same `type`, and the arrow
+    /// is the part a driver reads at a glance.
+    var symbol: String {
+        guard maneuver == .turn, let modifier else { return maneuver.symbol }
+        switch modifier {
+        case "left":         return "arrow.turn.up.left"
+        case "right":        return "arrow.turn.up.right"
+        case "slight left":  return "arrow.up.left"
+        case "slight right": return "arrow.up.right"
+        case "sharp left":   return "arrow.uturn.left"
+        case "sharp right":  return "arrow.uturn.right"
+        case "uturn":        return "arrow.uturn.down"
+        default:             return "arrow.up"
+        }
+    }
 
     var id: String { "\(lat),\(lon),\(instruction)" }
     var coordinate: CLLocationCoordinate2D {

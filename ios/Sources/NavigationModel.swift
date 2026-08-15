@@ -297,6 +297,12 @@ final class NavigationModel {
         currentStep < steps.count ? steps[currentStep].instruction : ""
     }
 
+    /// The icon for that instruction. A maneuver is read at a glance long
+    /// before the words are, and an exit and a left turn should not look alike.
+    var currentSymbol: String {
+        currentStep < steps.count ? steps[currentStep].symbol : "arrow.up"
+    }
+
     /// Where each maneuver sits along the route, as distance-still-to-drive.
     ///
     /// Walked in travel order, each step matched only against the road ahead of

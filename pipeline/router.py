@@ -108,10 +108,20 @@ _TO_M = Transformer.from_crs(4326, CRS_METERS, always_xy=True)
 
 
 class Router:
+    # Columns the maneuver generator needs, and the graph build that writes
+    # them. Checked at load and refused loudly, rather than degraded silently:
+    # a graph built before the maneuver rework still *loads* and still routes,
+    # so the failure would be a server quietly answering every rotary with a
+    # slight right and every exit with nothing — which is the exact
+    # silent-disagreement case server/DEPLOY.md exists to warn about.
+    REQUIRED_EDGE_COLUMNS = ("junction", "dest_ref", "dest_name")
+    REQUIRED_NODE_COLUMNS = ("exit_ref",)
+
     def __init__(self, processed_dir: str):
         d = Path(processed_dir)
         self.edges = gpd.read_parquet(d / "graph_edges.parquet")
         self.nodes = pd.read_parquet(d / "graph_nodes.parquet")
+        self._require_columns()
 
         ids = self.nodes["node_id"].to_numpy()
         self.idx = {nid: i for i, nid in enumerate(ids)}
@@ -127,6 +137,45 @@ class Router:
         self._edge_tree = STRtree(self._edge_geom_m)
 
         self._build_directed()
+
+    def _require_columns(self):
+        missing = [c for c in self.REQUIRED_EDGE_COLUMNS
+                   if c not in self.edges.columns]
+        missing += [c for c in self.REQUIRED_NODE_COLUMNS
+                    if c not in self.nodes.columns]
+        if missing:
+            raise RuntimeError(
+                f"the graph is missing {', '.join(missing)} — it was built "
+                "before turn-by-turn maneuvers needed those tags. Rerun "
+                "pipeline/graph.py and copy BOTH parquets over; see "
+                "server/DEPLOY.md."
+            )
+
+    @cached_property
+    def is_roundabout(self):
+        """Per undirected edge, whether it is part of a rotary."""
+        j = self.edges["junction"].astype(str).str.lower()
+        return j.isin(("roundabout", "circular")).to_numpy()
+
+    @cached_property
+    def exits_at_node(self):
+        """Per node, how many roads leave it that are not part of a rotary.
+
+        Counted over *outgoing* directed edges, not attached ones: a one-way
+        street pointing into a rotary is an entrance, and counting it would put
+        "take the 2nd exit" one exit early for every driver who passed one.
+        """
+        leaves = ~self.is_roundabout[self.eidx]
+        return np.bincount(self.tail[leaves], minlength=self.n)
+
+    @cached_property
+    def maneuver_context(self):
+        exit_refs = {}
+        refs = self.nodes["exit_ref"].astype(str).to_numpy()
+        for i, ref in enumerate(refs):
+            if ref and ref != "nan":
+                exit_refs[i] = ref
+        return ManeuverContext(exit_refs, self.exits_at_node)
 
     def _build_directed(self):
         e = self.edges
@@ -383,8 +432,12 @@ class Router:
                 c = c[::-1]
             coords.append(c)
         # `coords` is the per-edge geometry in travel order; the steps generator
-        # uses it (with the edge names) to build maneuvers.
-        return RouteResult(rows, stitch(coords), coords, scores[edge_rows])
+        # uses it (with the edge names) to build maneuvers. `path` goes with it
+        # because two of those maneuvers are properties of the *junctions*
+        # rather than the roads: which numbered exit this is, and how many roads
+        # you pass going round a rotary.
+        return RouteResult(rows, stitch(coords), coords, scores[edge_rows],
+                           nodes=path, context=self.maneuver_context)
 
 
 def stitch(coord_arrays):
@@ -423,23 +476,135 @@ def _turn_delta(bearing_in, bearing_out):
     return (bearing_out - bearing_in + 180) % 360 - 180
 
 
-def _turn_phrase(bearing_in, bearing_out):
-    """Describe the turn from one heading to the next, e.g. 'Turn left'."""
+# How far back from a junction the approach heading is measured, and how far
+# past it the departure heading is.
+#
+# Not the adjacent vertex pair, which is what this used to use. OSM carries a
+# vertex roughly every 19 m but packs them far tighter through a junction, to
+# shape the corner: measured across the MA graph, 29% of edge ends have their
+# last two vertices under 10 m apart and 10% under 5 m. A bearing taken over
+# 4 m of geometry is mostly digitizing noise — the same defect that had
+# curvature rating cul-de-sacs above the Mohawk Trail, in a function that never
+# got the fix.
+#
+# And the noise is *biased*, which is what made it a user-visible bug rather
+# than jitter: the approach geometry curves into the turn, so the final few
+# metres already point round the corner, the measured heading change comes out
+# too small, and a real turn was announced as "Continue". A chord long enough
+# to clear the corner rounding, short enough not to swallow the turn itself.
+TURN_CHORD_M = 25.0
+
+
+def _dist_m(p, q):
+    """Metres between two [lon, lat] points, on the flat.
+
+    Called per vertex over a few tens of metres, where a spherical formula buys
+    millimetres and costs a trig call per candidate.
+    """
+    mid_lat = math.radians((p[1] + q[1]) / 2.0)
+    return math.hypot((q[0] - p[0]) * 111320.0 * math.cos(mid_lat),
+                      (q[1] - p[1]) * 110540.0)
+
+
+def _bearing_in(coords):
+    """Heading on arrival at the end of `coords`, over a `TURN_CHORD_M` chord."""
+    end = coords[-1]
+    for p in reversed(list(coords[:-1])):
+        if _dist_m(p, end) >= TURN_CHORD_M:
+            return _bearing(p, end)
+    # Shorter than the chord: the whole leg is the best baseline there is.
+    return _bearing(coords[0], end)
+
+
+def _bearing_out(coords):
+    """Heading on departure from the start of `coords`, over the same chord."""
+    start = coords[0]
+    for q in list(coords[1:]):
+        if _dist_m(start, q) >= TURN_CHORD_M:
+            return _bearing(start, q)
+    return _bearing(start, coords[-1])
+
+
+def _turn_modifier(bearing_in, bearing_out):
+    """Which way the road turns, as a maneuver modifier.
+
+    The vocabulary is OSRM's and Valhalla's, not prose — see `RouteResult.steps`
+    for why the wire format is a type plus a modifier rather than a sentence.
+    """
     delta = _turn_delta(bearing_in, bearing_out)
     magnitude = abs(delta)
     if magnitude < 20:
-        return "Continue"
+        return "straight"
     side = "right" if delta > 0 else "left"
     if magnitude < 45:
-        return f"Slight {side}"
+        return f"slight {side}"
     if magnitude < 120:
-        return f"Turn {side}"
-    return f"Sharp {side}"
+        return side
+    if magnitude < 160:
+        return f"sharp {side}"
+    return "uturn"
+
+
+_MODIFIER_PHRASE = {
+    "straight": "Continue",
+    "slight left": "Slight left", "left": "Turn left", "sharp left": "Sharp left",
+    "slight right": "Slight right", "right": "Turn right",
+    "sharp right": "Sharp right", "uturn": "Make a U-turn",
+}
+
+
+def _leg_kind(highway: str, junction: str) -> str:
+    """How a stretch of road behaves for the purpose of describing it.
+
+    A rotary and a slip road are not turns onto a differently-named street, and
+    describing them as though they were is what produced "Slight right" for a
+    motorway exit and nothing at all for a rotary.
+    """
+    if junction in ("roundabout", "circular"):
+        return "roundabout"
+    if highway.endswith("_link"):
+        return "ramp"
+    return "road"
+
+
+# The classes you "exit" rather than "turn off", and "merge" onto rather than
+# "continue" onto.
+_GRADE_SEPARATED = ("motorway", "trunk")
+
+_ORDINALS = ["", "1st", "2nd", "3rd", "4th", "5th", "6th", "7th", "8th"]
+
+
+def _ordinal(n: int) -> str:
+    """'2nd', for counting rotary exits. Beyond the table, a rotary with nine
+    exits is a roundabout interchange and the number is more use than the word.
+    """
+    return _ORDINALS[n] if 0 <= n < len(_ORDINALS) else f"{n}th"
+
+
+class ManeuverContext:
+    """What the step generator needs to know about the graph beyond the route.
+
+    Two questions the route alone cannot answer. Which numbered exit a junction
+    is — that lives on the mainline node, not on any edge of the route. And how
+    many roads leave each node of a rotary — which needs the *whole* graph's
+    adjacency, since the roads you pass without taking are by definition not on
+    your route, and they are exactly what "take the 2nd exit" counts.
+    """
+
+    def __init__(self, exit_ref: dict, exits_at_node):
+        self.exit_ref = exit_ref                # node index -> "26", "13A"
+        self.exits_at_node = exits_at_node      # node index -> outgoing non-rotary roads
+
+    def numbered_exit(self, node_idx):
+        return self.exit_ref.get(node_idx, "")
+
+    def leaves_the_rotary(self, node_idx):
+        return bool(self.exits_at_node[node_idx])
 
 
 class RouteResult:
     def __init__(self, edge_rows: gpd.GeoDataFrame, line, edge_coords=None,
-                 scores=None):
+                 scores=None, nodes=None, context: "ManeuverContext" = None):
         self.edges = edge_rows
         self.line = line
         # Per-edge [lon, lat] arrays in travel order (parallel to edge_rows),
@@ -449,6 +614,26 @@ class RouteResult:
         # with, aligned to edge_rows. None falls back to the stored neutral
         # column, which is right only when no weights were applied.
         self.scores = scores
+        # Node indices in travel order, one longer than `edges`: the junction
+        # each edge starts at, plus the destination. Exit numbers hang off
+        # these, so without them a route still describes its turns but never
+        # names an exit.
+        self.nodes = list(nodes) if nodes is not None else []
+        self.context = context
+
+    def _column(self, name):
+        """A route column, or blanks if this result was built without it.
+
+        The Router refuses to load a graph missing any of these (see
+        `REQUIRED_EDGE_COLUMNS`), so in production they are always present.
+        Tests build a `RouteResult` straight from a handful of geometries to
+        exercise the turn logic, and should not have to carry every tag to do
+        it.
+        """
+        if name in self.edges.columns:
+            return [("" if v is None or (isinstance(v, float) and math.isnan(v))
+                     else str(v)) for v in self.edges[name]]
+        return [""] * len(self.edges)
 
     @cached_property
     def km(self):
@@ -473,65 +658,250 @@ class RouteResult:
             out[label] = float(length_km[self.edges[column] >= threshold].sum())
         return out
 
+    def _legs(self):
+        """Group the route's edges into stretches worth one instruction each.
+
+        Consecutive edges merge when they are the same *kind* of road, carry the
+        same label, and do not turn sharply at the seam. Each of those three
+        conditions is load-bearing:
+
+        - Kind, because a rotary and a slip road are not streets. Merging a
+          rotary into the road that fed it is how a rotary produced no
+          instruction at all, and merging the segments of a rotary *together*
+          is what makes counting its exits possible.
+        - Label, because a turn onto a differently-named road is a maneuver.
+        - The seam, because a road can turn hard at a junction while keeping its
+          name, and a silent merge there swallows a real turn.
+
+        The rotary is the exception to the seam rule: it is a circle, so of
+        course it turns, and breaking it at every few degrees would emit a
+        stream of slight rights — which is exactly what the first test drive
+        got.
+        """
+        names, refs = self._column("name"), self._column("ref")
+        highways, junctions = self._column("highway"), self._column("junction")
+        dest_refs, dest_names = self._column("dest_ref"), self._column("dest_name")
+        lengths = self.edges["length_m"].to_numpy()
+        label = lambda i: names[i] or refs[i] or ""
+
+        legs = []
+        for i, pts in enumerate(self.edge_coords):
+            kind = _leg_kind(highways[i], junctions[i])
+            coords = [list(p) for p in pts]
+            if legs:
+                prev = legs[-1]
+                mergeable = prev["kind"] == kind and (
+                    kind == "roundabout" or prev["label"] == label(i))
+                if mergeable and (kind == "roundabout" or abs(_turn_delta(
+                        _bearing_in(prev["coords"]), _bearing_out(coords))) < 45):
+                    prev["coords"].extend(coords[1:])      # drop the shared vertex
+                    prev["length_m"] += float(lengths[i])
+                    prev["end"] = i + 1
+                    prev["dest_ref"] = prev["dest_ref"] or dest_refs[i]
+                    prev["dest_name"] = prev["dest_name"] or dest_names[i]
+                    continue
+            legs.append({
+                "kind": kind, "label": label(i), "highway": highways[i],
+                # The OSM `name` on its own, without the `ref` fallback. A
+                # rotary carrying only a route number is not a rotary *called*
+                # that: "Take the 1st exit at MA 122" reads as though the
+                # roundabout were named after the highway crossing it.
+                "name": names[i],
+                "coords": coords, "length_m": float(lengths[i]),
+                "start": i, "end": i + 1,
+                "dest_ref": dest_refs[i], "dest_name": dest_names[i],
+            })
+        return legs
+
+    def _roundabout_exit(self, leg):
+        """Which exit of a rotary this leg leaves by, or 0 if it can't be known.
+
+        Counted over the nodes the route actually traverses around the circle.
+        `build_edges` splits a way at every node two ways share, so every road
+        meeting the rotary is a node on it and none can be skipped — which is
+        what makes the count trustworthy rather than an estimate.
+
+        The entry node is deliberately excluded: the road you arrived on is not
+        one of the exits you pass, and counting it would put every instruction
+        one exit late.
+        """
+        if not self.context or not self.nodes:
+            return 0
+        passed = 0
+        for node_idx in self.nodes[leg["start"] + 1:leg["end"] + 1]:
+            if self.context.leaves_the_rotary(node_idx):
+                passed += 1
+        return passed
+
+    def _exit_number(self, leg):
+        """The signed exit number for a ramp leg, if the junction carries one."""
+        if not self.context or not self.nodes:
+            return ""
+        return self.context.numbered_exit(self.nodes[leg["start"]])
+
+    @staticmethod
+    def _destination(leg):
+        """Where a ramp says it goes, as it would read on the sign.
+
+        OSM separates multiple destinations with semicolons and splits the road
+        number (`destination:ref`, "I 93 North") from the places it serves
+        (`destination`, "Cambridgeport;Brookline"). Rendered here rather than in
+        graph.py so the wording stays with the other labels, and so re-wording
+        it never costs a graph rebuild.
+
+        Truncated, deliberately. A big interchange lists everything it serves —
+        Massachusetts' worst reads "I 93: South Station / Concord New Hampshire
+        / Quincy" — which is a sign you read at 60 mph, not a sentence anyone
+        can follow spoken aloud. The road number is the part a driver matches
+        against the overhead gantry, so it survives at the expense of the
+        places.
+        """
+        split = lambda s: [p.strip() for p in s.split(";") if p.strip()]
+        refs = split(leg["dest_ref"])[:2]
+        # One place alongside a road number, two when the number is all we have
+        # to go on.
+        names = split(leg["dest_name"])[:1 if refs else 2]
+        parts = [" / ".join(p) for p in (refs, names) if p]
+        return ": ".join(parts)
+
     def steps(self):
         """Turn-by-turn maneuvers for the client to follow.
 
-        Consecutive edges on the same road are merged into one "leg", then we
-        emit a step at the start of each: the first tells you which way to set
-        off, the rest are turns onto the next road, and a final step announces
-        arrival. Each step carries the coordinate of its maneuver and the
-        distance that instruction then carries you (the leg's length).
+        Each step is a *structured* maneuver — a `type`, a `modifier`, and
+        whichever of `exit_ref` / `destination` / `roundabout_exit` that type
+        needs — with `instruction` as the rendered English alongside it, not
+        instead of it. Three reasons the wire format is not just the sentence:
+        the app can style an exit differently from a turn, voice guidance needs
+        the parts separately ("in 500 feet, take exit 26"), and the vocabulary
+        is deliberately OSRM's and Valhalla's, so swapping the routing engine
+        later would not move the client.
+
+        The first step sets off, the last announces arrival, and each carries
+        the coordinate of its maneuver plus how far that instruction then
+        carries you.
         """
         if not self.edge_coords:
             return []
-        names = self.edges["name"].to_numpy()
-        refs = self.edges["ref"].to_numpy()
-        lengths = self.edges["length_m"].to_numpy()
-        label = lambda i: names[i] or refs[i] or "the road"
-
-        # Merge consecutive same-road edges into legs (label, coords, length).
-        # Same label alone isn't enough to merge: a road can turn sharply at a
-        # junction while keeping its name (and two different unnamed roads both
-        # label as "the road"), and a silent merge there would swallow a real
-        # turn. So a sharp heading change at the seam always starts a new leg.
-        legs = []
-        for i, pts in enumerate(self.edge_coords):
-            if legs and label(i) == legs[-1]["label"]:
-                prev = legs[-1]["coords"]
-                seam_turn = _turn_delta(_bearing(prev[-2], prev[-1]),
-                                        _bearing(pts[0], pts[1]))
-                if abs(seam_turn) < 45:
-                    legs[-1]["coords"].extend(pts[1:].tolist())   # drop shared vertex
-                    legs[-1]["length_m"] += lengths[i]
-                    continue
-            legs.append({"label": label(i), "coords": pts.tolist(),
-                         "length_m": float(lengths[i])})
-
+        legs = self._legs()
         steps = []
+
         for i, leg in enumerate(legs):
             pts = leg["coords"]
-            if i == 0:
-                instruction = f"Head {_compass(_bearing(pts[0], pts[1]))} on {leg['label']}"
+            previous = legs[i - 1] if i else None
+            step = {"type": "continue", "modifier": "straight",
+                    "name": leg["label"], "exit_ref": "", "destination": "",
+                    "roundabout_exit": 0}
+
+            if previous is None:
+                step["type"] = "depart"
+                step["modifier"] = "straight"
+                where = f" on {leg['label']}" if leg["label"] else ""
+                step["instruction"] = f"Head {_compass(_bearing_out(pts))}{where}"
             else:
-                prev = legs[i - 1]
-                phrase = _turn_phrase(_bearing(prev["coords"][-2], prev["coords"][-1]),
-                                      _bearing(pts[0], pts[1]))
-                if phrase == "Continue":
-                    instruction = f"Continue on {leg['label']}"
-                elif leg["label"] == "the road":
-                    instruction = phrase                       # "Turn left" — no useful name
-                elif leg["label"] == prev["label"]:
-                    instruction = f"{phrase} to stay on {leg['label']}"
+                modifier = _turn_modifier(_bearing_in(previous["coords"]),
+                                          _bearing_out(pts))
+                step["modifier"] = modifier
+                if leg["kind"] == "roundabout":
+                    self._describe_roundabout(step, leg, legs[i + 1:])
+                elif leg["kind"] == "ramp":
+                    self._describe_ramp(step, leg, legs[i + 1:], modifier)
+                elif (previous["kind"] == "ramp"
+                        and leg["highway"] in _GRADE_SEPARATED):
+                    step["type"] = "merge"
+                    onto = f" onto {leg['label']}" if leg["label"] else ""
+                    step["instruction"] = f"Merge{onto}"
                 else:
-                    instruction = f"{phrase} onto {leg['label']}"
-            steps.append({"instruction": instruction,
-                          "lat": round(pts[0][1], 6), "lon": round(pts[0][0], 6),
-                          "distance_m": round(leg["length_m"])})
+                    self._describe_turn(step, leg, previous, modifier)
+
+            # A rotary instruction already names the road you leave on, and an
+            # exit already names where the ramp goes. Emitting "Continue on X"
+            # a few metres later says nothing and arrives while the driver is
+            # still in the manoeuvre.
+            if (previous is not None and previous["kind"] in ("roundabout", "ramp")
+                    and step["type"] == "continue"):
+                steps[-1]["distance_m"] += round(leg["length_m"])
+                continue
+
+            step["lat"] = round(pts[0][1], 6)
+            step["lon"] = round(pts[0][0], 6)
+            step["distance_m"] = round(leg["length_m"])
+            steps.append(step)
 
         end = legs[-1]["coords"][-1]
         steps.append({"instruction": "Arrive at your destination",
-                      "lat": round(end[1], 6), "lon": round(end[0], 6), "distance_m": 0})
+                      "type": "arrive", "modifier": "straight", "name": "",
+                      "exit_ref": "", "destination": "", "roundabout_exit": 0,
+                      "lat": round(end[1], 6), "lon": round(end[0], 6),
+                      "distance_m": 0})
         return steps
+
+    def _describe_roundabout(self, step, leg, following):
+        """'Take the 2nd exit at Reid Rotary onto Elm Street'."""
+        step["type"] = "roundabout"
+        # Going round is not a turn; the exit number is the instruction, and a
+        # modifier here would fight it.
+        step["modifier"] = "straight"
+        nth = self._roundabout_exit(leg)
+        step["roundabout_exit"] = nth
+        onto = next((f["label"] for f in following if f["kind"] != "roundabout"), "")
+        step["name"] = onto or leg["label"]
+
+        where = f" at {leg['name']}" if leg["name"] else ""
+        # 693 of MA's 1,234 rotaries are named, so the fallback is common
+        # enough to have to read well on its own.
+        if nth:
+            instruction = f"Take the {_ordinal(nth)} exit{where}"
+        else:
+            instruction = f"At the roundabout{where}, take your exit"
+        if onto:
+            instruction += f" onto {onto}"
+        step["instruction"] = instruction
+
+    def _describe_ramp(self, step, leg, following, modifier):
+        """'Take exit 26 toward I 93 North: Boston'.
+
+        The fallback order is the one that never invents anything: the signed
+        exit number if the junction carries one (74% of Massachusetts' numbered
+        junctions do), then where the ramp says it goes, then the road it
+        actually joins, and only then a bare instruction. A ramp described as
+        "Slight right" — which is what every exit used to get, because 96% of
+        ramps carry no name and the label fell through to nothing — is
+        geometrically true and useless.
+        """
+        step["type"] = "exit"
+        number = self._exit_number(leg)
+        destination = self._destination(leg)
+        joins = next((f["label"] for f in following if f["kind"] != "ramp"), "")
+        step["exit_ref"] = number
+        step["destination"] = destination
+        step["name"] = leg["label"] or joins
+
+        side = "right" if "right" in modifier else "left" if "left" in modifier else ""
+        if number:
+            step["instruction"] = f"Take exit {number}"
+            if destination:
+                step["instruction"] += f" toward {destination}"
+        elif destination:
+            step["instruction"] = f"Take the exit toward {destination}"
+        elif joins:
+            step["instruction"] = f"Take the exit onto {joins}"
+        else:
+            step["instruction"] = f"Take the exit on the {side}" if side else "Take the exit"
+
+    def _describe_turn(self, step, leg, previous, modifier):
+        phrase = _MODIFIER_PHRASE[modifier]
+        if modifier == "straight":
+            step["type"] = "continue"
+            step["instruction"] = (f"Continue onto {leg['label']}" if leg["label"]
+                                   else "Continue")
+        else:
+            step["type"] = "turn"
+            if not leg["label"]:
+                step["instruction"] = phrase           # no useful name to offer
+            elif leg["label"] == previous["label"]:
+                step["instruction"] = f"{phrase} to stay on {leg['label']}"
+            else:
+                step["instruction"] = f"{phrase} onto {leg['label']}"
 
     def geojson(self):
         return {
