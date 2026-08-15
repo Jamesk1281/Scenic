@@ -11,7 +11,8 @@ Outputs:
   data/processed/graph_edges.parquet  u, v, length_m, minutes, score,
                                        c_water/c_coast/c_green/c_relief/...,
                                        name, ref, highway, junction,
-                                       dest_ref, dest_name, geometry (WGS84)
+                                       dest_ref, dest_name, n_<control>_fwd/rev,
+                                       geometry (WGS84)
 
 Usage: python graph.py <input.osm.pbf> <processed_dir>
 """
@@ -28,7 +29,8 @@ import shapely
 from pyproj import Transformer
 from shapely.strtree import STRtree
 
-from common import CRS_METERS, DRIVABLE, ONEWAY_FWD, ONEWAY_REV, PRIVATE_ACCESS
+from common import (CONTROL_COLUMNS, CONTROL_KINDS, CRS_METERS, DRIVABLE,
+                    ONEWAY_FWD, ONEWAY_REV, PRIVATE_ACCESS)
 from score import blend, components, composite
 
 # Assumed driving speed (km/h) per road class, used to turn edge length into
@@ -61,23 +63,54 @@ class GraphHandler(osmium.SimpleHandler):
         self.ways = []           # (tags-dict, [node_ids], [(lon,lat)])
         self.node_count = {}     # node_id -> times referenced (for junctions)
         self.exit_refs = {}      # node_id -> exit number ("26", "13A")
+        self.controls = {}       # node_id -> (kind, direction)
         self.errors = 0
 
     def node(self, n):
-        """Pick up exit numbers.
+        """Pick up exit numbers and traffic controls.
 
-        They live on the *mainline* node where the ramp diverges — an OSM
-        `highway=motorway_junction` carrying `ref=26` — and not on the ramp
+        Exit numbers live on the *mainline* node where the ramp diverges — an
+        OSM `highway=motorway_junction` carrying `ref=26` — and not on the ramp
         itself. That distinction is the whole reason this handler exists: 74%
         of Massachusetts' 1,363 junction nodes carry an exit number, while only
         4% of ramp ways carry any `ref` at all, and the ones that do hold the
         road number they lead to ("MA 3") rather than the exit. Reading the
         ramp would produce "Take exit MA 3".
+
+        Traffic controls ride along in the same pass, and are read here rather
+        than matched by proximity afterwards *because* they are nodes. A signal
+        or a stop sign is mapped as a node of the road it governs, so the way
+        that lists it is the road you stop on — no radius, no ambiguity. 87.5%
+        of Massachusetts' controls are a node of a drivable way (94.9% of
+        signals, 82.6% of stop signs); the remainder are on ways this pipeline
+        does not route over, and are correctly ignored rather than dragged onto
+        a nearby road. Matching by distance instead would be a guess with no
+        good answer: measured on the built graph, 81.7% of controls have more
+        than one candidate road within 15 m and 72.4% have three or more — a
+        stop sign at a crossroads is within a few metres of all four approaches
+        and governs one of them.
+
+        `direction` says which way the traffic it stops is travelling, in the
+        way's own node order, and 81% of Massachusetts' stop signs carry it. It
+        is what makes the cost per direction rather than per road: a stop sign
+        facing northbound traffic must not delay the driver heading south past
+        its back.
         """
-        if n.tags.get("highway") == "motorway_junction":
-            ref = n.tags.get("ref", "")
+        tags = n.tags
+        if tags.get("highway") == "motorway_junction":
+            ref = tags.get("ref", "")
             if ref:
                 self.exit_refs[n.id] = ref
+        kind = CONTROL_KINDS.get(tags.get("highway"))
+        if kind:
+            # Signals spell it `traffic_signals:direction`; everything else uses
+            # the bare tag. Anything other than a plain forward/backward —
+            # "both", a missing tag, `direction=45` on a stray compass bearing —
+            # falls through to charging both directions, which is the safe way
+            # to be wrong about a control that is definitely there.
+            direction = (tags.get("direction")
+                         or tags.get("traffic_signals:direction") or "")
+            self.controls[n.id] = (kind, direction.strip().lower())
 
     def way(self, w):
         hw = w.tags.get("highway")
@@ -133,8 +166,45 @@ class GraphHandler(osmium.SimpleHandler):
             self.node_count[nid] = self.node_count.get(nid, 0) + 1
 
 
-def build_edges(ways, node_count, to_m):
+def count_controls(ids, a, b, controls):
+    """The traffic controls a driver meets crossing `ids[a:b+1]`, per direction.
+
+    Returns a dict of the CONTROL_COLUMNS. A control is charged to the
+    traversal that *approaches* it, which is why this is not the simple
+    membership test it looks like it should be.
+
+    A junction node belongs to two edges at once — it ends one and begins the
+    next — so a signal sitting on it appears in both node lists. Charging both
+    would price every set of lights twice. Forward travel therefore pays for
+    everything from just past the segment's first node through to its last
+    (`a < i <= b`), and reverse travel for everything from the last node back
+    through to its first (`a <= i < b`). Each direction excludes the end it
+    departs from, so a control on a shared junction is paid for exactly once:
+    by the edge you arrive on, never by the one you leave on.
+
+    `direction` then narrows it further. A stop sign tagged `forward` faces
+    traffic moving along the way's node order and does not exist for anyone
+    going the other way — and because the two rules compose, such a sign at a
+    segment's first node is charged to neither traversal of *this* edge and to
+    the forward traversal of the edge that arrives there, which is exactly the
+    driver who has to stop.
+    """
+    counts = dict.fromkeys(CONTROL_COLUMNS, 0)
+    for i in range(a, b + 1):
+        found = controls.get(ids[i])
+        if not found:
+            continue
+        kind, direction = found
+        if i > a and direction != "backward":
+            counts[f"n_{kind}_fwd"] += 1
+        if i < b and direction != "forward":
+            counts[f"n_{kind}_rev"] += 1
+    return counts
+
+
+def build_edges(ways, node_count, to_m, controls=None):
     """Split each way at junction nodes (degree >= 2) into edges."""
+    controls = controls or {}
     rows = []
     for meta, ids, coords in ways:
         n = len(ids)
@@ -155,11 +225,21 @@ def build_edges(ways, node_count, to_m):
             rows.append({
                 "u": ids[a], "v": ids[b],
                 "length_m": length,
+                # Free-flow, and it stays that way. The two corrections that
+                # make this a real travel time — the per-class speed factor and
+                # the cost of the controls counted beside it — are applied by
+                # router.py when it loads. Baking them in here would also
+                # destroy the baseline `tools/analyze_trace.py` measures them
+                # against: it reads `length_m / minutes` as the speed the graph
+                # assumed, so a corrected column would have the next drive
+                # report a factor of 1.00 and no way to tell whether the
+                # correction was right.
                 "minutes": length / 1000.0 / meta["speed"] * 60.0,
                 "oneway": meta["oneway"],
                 "name": meta["name"], "ref": meta["ref"], "highway": meta["highway"],
                 "junction": meta["junction"],
                 "dest_ref": meta["dest_ref"], "dest_name": meta["dest_name"],
+                **count_controls(ids, a, b, controls),
                 "geometry": shapely.LineString(seg),
             })
     return rows
@@ -177,9 +257,21 @@ def main(pbf_path: str, processed_dir: str):
     fwd = Transformer.from_crs(4326, CRS_METERS, always_xy=True)
     to_m = lambda lons, lats: fwd.transform(lons, lats)
 
-    rows = build_edges(h.ways, h.node_count, to_m)
+    rows = build_edges(h.ways, h.node_count, to_m, h.controls)
     edges = gpd.GeoDataFrame(rows, geometry="geometry", crs=4326)
+    counts = edges[CONTROL_COLUMNS]
+    # A segment runs junction to junction, so its control count is a handful at
+    # most and uint8 is enormous headroom. Checked anyway because numpy wraps
+    # silently: 256 signals would become 0, and a road that costs nothing is
+    # exactly the bug this column exists to fix.
+    if counts.to_numpy().max() > np.iinfo("uint8").max:
+        raise RuntimeError("a single edge carries more than 255 controls — "
+                           "widen the dtype rather than wrapping it to zero")
+    edges[CONTROL_COLUMNS] = counts.astype("uint8")
     print(f"built {len(edges):,} edges in {time.time() - t0:.0f}s")
+    charged = edges[CONTROL_COLUMNS].to_numpy().sum()
+    print(f"{len(h.controls):,} traffic controls, charged {charged:,} times "
+          f"across both directions")
 
     # --- attach scenic score from the scored chunks the edge covers ---
     chunks = gpd.read_parquet(d / "scored_chunks.parquet").to_crs(CRS_METERS)

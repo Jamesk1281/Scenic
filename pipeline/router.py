@@ -5,6 +5,10 @@ runs a Dijkstra whose edge weight blends travel time with an "unscenic" penalty:
 
     weight = minutes + pref**PREF_CURVE * BETA * km * (1 - score/10)
 
+where `minutes` is driving time at the class's *measured* speed plus the time
+lost to the traffic signals and stop signs on that road in that direction — not
+the free-flow number stored in the graph. See SPEED_FACTOR and CONTROL_SECONDS.
+
 The penalty is a minutes-equivalent cost charged per kilometer of *unscenic*
 road (BETA min/km at full ugliness), so the router trades extra distance for
 beauty instead of only shaving seconds. `pref` (0..1) is the overall scenery
@@ -36,10 +40,70 @@ from scipy.sparse.csgraph import dijkstra
 from shapely.strtree import STRtree
 from pyproj import Transformer
 
-from common import CRS_METERS, ONEWAY_FWD, ONEWAY_REV
+from common import CONTROL_COLUMNS, CRS_METERS, ONEWAY_FWD, ONEWAY_REV
 from score import WEIGHTS, composite
 
-BETA = 7.0  # minutes-equivalent penalty per km of fully-unscenic road at pref=1
+# Minutes-equivalent penalty per km of fully-unscenic road at pref=1.
+#
+# Raised from 7.0 when travel time stopped being free-flow. This is a cost in
+# *minutes*, competing against a `minutes` term that grew — scenic back roads
+# got slower and picked up the stop signs on them, while motorways got 16%
+# faster and carry almost none — so the same 7.0 bought measurably less detour
+# than it used to. Measured over 20 routes, the share of a pref-0.25 route that
+# leaves the fastest road fell from 70% to 50% and the scenery it found fell
+# from 4.62 to 3.39 on the 0-10 scale: the slider's bottom half had quietly gone
+# soft. 10.0 restores it (71%, 4.39) and leaves the top half where it was — the
+# penalty saturates up there, so pref 1.0 moves from 5.49 to 5.58 and the routes
+# barely change.
+#
+# Read that as calibration, not preference: `pref` means the same thing to a
+# driver as it did before, and it takes a bigger number to mean it now.
+BETA = 10.0
+
+# --- Travel time --------------------------------------------------------------
+# `graph_edges.minutes` is free-flow — length over the speed limit, with nothing
+# charged for stopping. Measured against two recorded drives it ran 22% short of
+# the clock. The two corrections below close that, and are applied here at load
+# rather than baked into the parquet for two reasons: `tools/analyze_trace.py`
+# reads `length_m / minutes` as the speed the graph assumed, so a pre-corrected
+# column would have every future drive report a factor of 1.00 whether or not
+# the correction was any good; and re-fitting these as drives accumulate is then
+# a constant and a restart, not a 135 s rebuild plus copying 80 MB to the
+# serving box. See docs/junction-timing-plan.md §5.
+
+# Measured moving speed over the speed the graph assumed, per road class, with
+# stopped time excluded (that is priced separately below). From 63 km of trace
+# on 2026-08-14; only classes with at least 5 km behind them are listed, and
+# everything else — including `residential`, which is 62% of the network's km
+# and has 0.9 km of measurement — stays at 1.0 rather than being guessed.
+#
+# Motorway is above 1.0 because drivers exceed the posted limit by 16%, and 97%
+# of motorway km carry a real `maxspeed` tag, so that is measured against the
+# sign rather than against a fallback. An ETA predicts what the driver will do.
+SPEED_FACTOR = {
+    "motorway": 1.16,
+    "secondary": 0.93,
+    "tertiary": 0.89,
+    "primary": 0.86,
+}
+
+# Seconds lost per traffic control *met* — P(stop) and the delay when you do
+# stop, folded into the one number a static graph can charge. Fitted by
+# `tools/fit_junction_cost.py`: signals were met 53 times for 16 stops averaging
+# 31.7 s, stop signs 9 times for 6 stops averaging 14.0 s.
+#
+# These are an average over a quiet hour and a busy one, and that is the most a
+# static graph can be. The two drives met almost the same number of signals — 26
+# and 27 — and stopped at 4 and 12 of them, so fitting either drive alone gives
+# 2.7 s or 16.1 s per signal. The location of a signal is structural; the wait
+# at it is not. See docs/junction-timing-plan.md §10.
+#
+# Give-ways are the one number here that is a judgement rather than a
+# measurement — the two drives met none. Half a stop sign, on the grounds that
+# yielding is cheaper than stopping and that charging zero is a known error in a
+# known direction. Massachusetts has 839 of them against 17,567 stop signs, so
+# the choice moves an ETA by well under a tenth of a percent either way.
+CONTROL_SECONDS = {"signal": 9.5, "stop": 9.3, "giveway": 4.7}
 
 # The scenery penalty saturates — past a few minutes-per-km the router has taken
 # every detour worth taking — which used to leave the slider's top half handing
@@ -114,7 +178,7 @@ class Router:
     # so the failure would be a server quietly answering every rotary with a
     # slight right and every exit with nothing — which is the exact
     # silent-disagreement case server/DEPLOY.md exists to warn about.
-    REQUIRED_EDGE_COLUMNS = ("junction", "dest_ref", "dest_name")
+    REQUIRED_EDGE_COLUMNS = ("junction", "dest_ref", "dest_name", *CONTROL_COLUMNS)
     REQUIRED_NODE_COLUMNS = ("exit_ref",)
 
     def __init__(self, processed_dir: str):
@@ -146,8 +210,8 @@ class Router:
         if missing:
             raise RuntimeError(
                 f"the graph is missing {', '.join(missing)} — it was built "
-                "before turn-by-turn maneuvers needed those tags. Rerun "
-                "pipeline/graph.py and copy BOTH parquets over; see "
+                "before turn-by-turn maneuvers and junction timing needed those "
+                "tags. Rerun pipeline/graph.py and copy BOTH parquets over; see "
                 "server/DEPLOY.md."
             )
 
@@ -177,6 +241,38 @@ class Router:
                 exit_refs[i] = ref
         return ManeuverContext(exit_refs, self.exits_at_node)
 
+    def _driving_minutes(self) -> np.ndarray:
+        """Per undirected edge, free-flow time corrected to real moving speed.
+
+        Divided rather than multiplied: `SPEED_FACTOR` is measured speed over
+        assumed speed, and a road driven at 0.93 of its limit takes 1/0.93 as
+        long to cover.
+
+        Applied to the computed `minutes` and not to `graph.py`'s `SPEED_KMH`
+        fallback table, which is the trap this whole correction is arranged
+        around. The table is consulted only where OSM has no `maxspeed` tag, so
+        scaling it would move 3% of motorway km and 60% of secondary — landing
+        least on the classes whose factor is best measured, and saying nothing
+        about it.
+        """
+        factor = self.edges["highway"].map(SPEED_FACTOR).fillna(1.0).to_numpy()
+        return self.edges["minutes"].to_numpy() / factor
+
+    def _control_minutes(self) -> tuple[np.ndarray, np.ndarray]:
+        """Per undirected edge, minutes lost to traffic controls each way.
+
+        `graph.py` charges each control to the edge whose node list contains it
+        and to the direction it faces, so the forward and reverse counts differ:
+        a stop sign facing northbound traffic is on the southbound driver's road
+        and costs them nothing.
+        """
+        out = []
+        for direction in ("fwd", "rev"):
+            seconds = sum(cost * self.edges[f"n_{kind}_{direction}"].to_numpy()
+                          for kind, cost in CONTROL_SECONDS.items())
+            out.append(seconds / 60.0)
+        return out[0], out[1]
+
     def _build_directed(self):
         e = self.edges
         ui = e["u"].map(self.idx).to_numpy()
@@ -184,7 +280,8 @@ class Router:
         # Kept per undirected edge (not per directed slot) so snap() can pick
         # between the two ends of the road segment it landed on.
         self.edge_u_idx, self.edge_v_idx = ui, vi
-        minutes = e["minutes"].to_numpy()
+        minutes = self._driving_minutes()
+        control_fwd, control_rev = self._control_minutes()
         ow = e["oneway"].astype(str).str.lower()
 
         fwd_ok = ~ow.isin(ONEWAY_REV).to_numpy()
@@ -200,7 +297,12 @@ class Router:
         self.eidx = np.concatenate(eidx)        # back-reference to undirected edge row
         self.flip = np.concatenate(flip)
         self.km = e["length_m"].to_numpy() / 1000.0   # per undirected edge
-        self.d_minutes = minutes[self.eidx]
+        # The travel time Dijkstra optimises and RouteResult reports: driving
+        # time, plus whatever stopping the direction of travel is charged for.
+        # One array, used for both, so the ETA cannot describe a different
+        # journey from the one that was chosen.
+        self.d_minutes = minutes[self.eidx] + np.where(
+            self.flip, control_rev[self.eidx], control_fwd[self.eidx])
 
         # Parallel edges: more than one directed edge can join the same
         # (tail, head) — parallel roads between the same two junctions. scipy's
@@ -436,8 +538,16 @@ class Router:
         # because two of those maneuvers are properties of the *junctions*
         # rather than the roads: which numbered exit this is, and how many roads
         # you pass going round a rotary.
+        #
+        # The per-hop travel time Dijkstra actually weighted, carried rather
+        # than re-derived. Summing the edge table's `minutes` instead would
+        # report a free-flow, direction-blind number for a route chosen on a
+        # corrected, directional one — the same silent disagreement that once
+        # had `mean_score` reporting the neutral score for a route optimised
+        # under the user's beauty weights.
         return RouteResult(rows, stitch(coords), coords, scores[edge_rows],
-                           nodes=path, context=self.maneuver_context)
+                           nodes=path, context=self.maneuver_context,
+                           edge_minutes=self.d_minutes[chosen])
 
 
 def stitch(coord_arrays):
@@ -604,9 +714,14 @@ class ManeuverContext:
 
 class RouteResult:
     def __init__(self, edge_rows: gpd.GeoDataFrame, line, edge_coords=None,
-                 scores=None, nodes=None, context: "ManeuverContext" = None):
+                 scores=None, nodes=None, context: "ManeuverContext" = None,
+                 edge_minutes=None):
         self.edges = edge_rows
         self.line = line
+        # Per-edge travel time in travel order, as weighted. None falls back to
+        # the stored free-flow column, which is right only for a result built by
+        # hand — see `minutes`.
+        self.edge_minutes = edge_minutes
         # Per-edge [lon, lat] arrays in travel order (parallel to edge_rows),
         # used to build turn-by-turn steps. None for callers that don't need them.
         self.edge_coords = edge_coords or []
@@ -641,7 +756,16 @@ class RouteResult:
 
     @cached_property
     def minutes(self):
-        return self.edges["minutes"].sum()
+        """How long the drive takes — the number Dijkstra minimised.
+
+        Driving time at the class's measured speed plus the controls the
+        traversed direction is charged for, summed over the route. The edge
+        table's own `minutes` column is free-flow and direction-blind, and is
+        used only by a `RouteResult` built directly in a test.
+        """
+        if self.edge_minutes is None:
+            return self.edges["minutes"].sum()
+        return float(np.sum(self.edge_minutes))
 
     @cached_property
     def mean_score(self):

@@ -307,6 +307,111 @@ class TestStaleGraphIsRefused:
         with pytest.raises(RuntimeError, match="junction"):
             router._require_columns()
 
+    def test_a_graph_without_the_control_counts_is_refused_loudly(self):
+        """Same reasoning, one rework later. A graph built before junction
+        timing routes perfectly well and charges nothing for 29,772 traffic
+        signals and stop signs — travel times 22% short, with every test green.
+        """
+        import pandas as pd
+
+        router = Router.__new__(Router)
+        router.edges = pd.DataFrame({"u": [1], "v": [2], "junction": [""],
+                                     "dest_ref": [""], "dest_name": [""]})
+        router.nodes = pd.DataFrame({"node_id": [1], "lon": [0.0], "lat": [0.0],
+                                     "exit_ref": [""]})
+        with pytest.raises(RuntimeError, match="n_signal_fwd"):
+            router._require_columns()
+
+
+class TestTravelTime:
+    """Travel time is no longer free-flow, and the number reported has to be the
+    number that was minimised. See docs/junction-timing-plan.md."""
+
+    def test_the_reported_time_is_the_time_dijkstra_minimised(self, router):
+        """The tripwire for the whole change. At pref 0 the edge weight *is*
+        travel time, so the shortest-path distance to the destination is exactly
+        what the route should claim to take. If `RouteResult.minutes` ever goes
+        back to summing the edge table's free-flow column, this catches it — the
+        codebase has already shipped one bug of exactly this shape, where the
+        router optimised a live re-blend while `mean_score` read the stored
+        neutral column and the two disagreed by 1.9 points with nothing saying so.
+        """
+        from scipy.sparse import csr_matrix
+        from scipy.sparse.csgraph import dijkstra
+
+        s, t = self._od(router, BOSTON, WORCESTER)
+        result = router.route(s, t, 0.0)
+
+        weights = router._weights(0.0, router._edge_scores({}))
+        pair_w = np.full(router.n_pairs, np.inf)
+        np.minimum.at(pair_w, router.slot_pair, weights)
+        graph = csr_matrix((pair_w, (router.u_tail, router.u_head)),
+                           shape=(router.n, router.n))
+        shortest = dijkstra(graph, directed=True, indices=s)[t]
+        assert result.minutes == pytest.approx(shortest, rel=1e-9)
+
+    def test_the_reported_time_is_not_the_free_flow_column(self, router):
+        """The stored `minutes` is what the graph says a road takes if you never
+        slow down and never stop, and the correction moves *both ways*.
+
+        A scenic route comes out slower: back roads are driven below their limit
+        and carry the stop signs. A motorway route comes out faster, because
+        drivers exceed the posted limit by 16% and a motorway carries about one
+        signal per 100 km. Worth pinning in both directions — a correction that
+        only ever adds time would be a fudge factor rather than a measurement.
+        """
+        s, t = self._od(router, BOSTON, WORCESTER)
+        fast = router.route(s, t, 0.0)
+        scenic = router.route(s, t, 1.0)
+
+        assert scenic.minutes > scenic.edges["minutes"].sum()
+        assert fast.minutes < fast.edges["minutes"].sum()
+
+    def test_a_road_costs_more_in_the_direction_its_stop_sign_faces(self, router):
+        """The reason the counts are per direction rather than per road."""
+        edges = router.edges
+        asymmetric = np.where(
+            (edges["n_stop_fwd"].to_numpy() > edges["n_stop_rev"].to_numpy())
+            & (edges["oneway"].astype(str).str.lower() == "").to_numpy())[0]
+        if not len(asymmetric):
+            pytest.skip("no two-way road with a one-directional stop sign")
+
+        edge = asymmetric[0]
+        slots = np.where(router.eidx == edge)[0]
+        assert len(slots) == 2, "a two-way road should expand into two slots"
+        forward = slots[~router.flip[slots]][0]
+        reverse = slots[router.flip[slots]][0]
+        assert router.d_minutes[forward] > router.d_minutes[reverse]
+
+    def test_controls_and_speed_are_both_priced_in(self, router):
+        """Each term on its own, so a regression says which one broke."""
+        from router import CONTROL_SECONDS, SPEED_FACTOR
+
+        edges = router.edges
+        free = edges["minutes"].to_numpy()
+        driving = router._driving_minutes()
+        control_fwd, _ = router._control_minutes()
+
+        # Term 1: a class with a factor below 1 takes longer than free-flow.
+        slow = (edges["highway"] == "tertiary").to_numpy()
+        assert SPEED_FACTOR["tertiary"] < 1.0
+        assert (driving[slow] > free[slow]).all()
+        # ...and a class with no measurement is left exactly alone.
+        untouched = (edges["highway"] == "residential").to_numpy()
+        assert "residential" not in SPEED_FACTOR
+        assert driving[untouched] == pytest.approx(free[untouched])
+
+        # Term 2: an edge with one signal on it costs that many seconds.
+        one_signal = np.where((edges["n_signal_fwd"].to_numpy() == 1)
+                              & (edges["n_stop_fwd"].to_numpy() == 0)
+                              & (edges["n_giveway_fwd"].to_numpy() == 0))[0]
+        assert len(one_signal), "the graph should carry signals"
+        assert control_fwd[one_signal[0]] == pytest.approx(
+            CONTROL_SECONDS["signal"] / 60.0)
+
+    def _od(self, router, a, b):
+        return router.snap(*a)[0], router.snap(*b)[0]
+
 
 class TestRoutingOverTheGraph:
     def _od(self, router, a, b):

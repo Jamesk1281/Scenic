@@ -35,13 +35,21 @@ travel time for beauty via a single preference knob, and a native iOS app
 - [x] Drive traces: every drive records itself, so a test drive produces
       measurements instead of impressions — see
       [Measuring travel times](#measuring-travel-times)
-- [ ] More accurate travel times (currently free-flow: speed limit ÷ distance,
-      no stops or traffic — measured 10-25% optimistic against real drive times,
-      and worst on the surface roads scenic routes prefer). The app's "time
-      remaining" inherits this, and scales it by the fraction of route left.
-      The instrument is built; the correction is not applied yet, because
-      `minutes` is the *routing weight* and not just a display field — see
-      [Measuring travel times](#measuring-travel-times)
+- [x] More accurate travel times: routes are priced at the speed each road class
+      is really driven, plus the mapped traffic signals and stop signs on them,
+      in the direction those face. Measured against two recorded drives, error
+      falls from 22% to 5% pooled, and the ETA the app showed for one of them
+      goes from 13% out to 3%. What is left is congestion, which no static graph
+      predicts — see [Measuring travel times](#measuring-travel-times)
+- [ ] Time of day. A static cost is an average over a quiet hour and a busy one:
+      the two drives met almost the same number of signals — 26 and 27 — and
+      stopped at 4 and 12 of them. That variance, not the model, is what now
+      caps per-drive accuracy
+- [ ] Turn restrictions. The router never reads OSM's `type=restriction`
+      relations, and a node-indexed Dijkstra cannot express one — measured, 7 of
+      40 random long routes tell the driver to make a turn the map forbids.
+      Massachusetts has 8,694 of them. The fix is to expand only the ~4,700
+      restricted junctions, not the whole graph
 - [ ] Start from the exact point, not the nearest corner. `snap()` finds the
       road you're on and then routes from that road's *nearer end* — right
       street, but a median 99 m up it (p90 217 m), because graph nodes are
@@ -139,13 +147,22 @@ at some point:
 
 ## Measuring travel times
 
-Travel time is `length_m / speed_kmh`, summed over the route's edges
-(`graph.py`). `speed_kmh` is OSM's `maxspeed` tag where there is one and a
-per-class guess where there isn't — which is 77% of the network's kilometres,
-and 89% of residential. Nothing is charged for traffic lights, stop signs, turns
-or traffic, though MA has 11,348 mapped signals and 17,567 stop signs and two
-thirds of the graph's nodes are real intersections. The result is optimistic,
-worst on exactly the surface roads a scenic route prefers.
+Travel time was `length_m / speed_kmh`, summed over the route's edges — free
+flow, with nothing charged for traffic lights, stop signs, turns or traffic,
+though MA has 11,348 mapped signals and 17,567 stop signs. Measured against two
+recorded drives it ran 22% short of the clock.
+
+It is now two terms, both applied in `router.py` when the graph loads:
+
+    time = distance ÷ (speed limit × how fast that class is really driven)
+           + the controls on that road, in the direction they face
+
+`SPEED_FACTOR` holds the first (motorway 1.16 — drivers exceed the limit;
+tertiary 0.89), `CONTROL_SECONDS` the second (9.5 s per signal met, 9.3 s per
+stop sign — P(stop) and the wait folded together). `graph.py` counts the
+controls per edge per direction; both tables are fitted from traces by
+`tools/fit_junction_cost.py`. Full workings in
+[`docs/junction-timing-plan.md`](docs/junction-timing-plan.md).
 
 Guessing a correction would be calibrating against Apple Maps' model — traffic
 included — rather than against the road. So the app measures instead. Every
@@ -217,17 +234,25 @@ only in coarse bands. Rise over a single 20 m step is almost entirely phone-GPS
 noise, and read that way a dead-flat drive splits neatly into confident-looking
 uphill and downhill — the curvature mistake exactly. There is a test for it.
 
-Applying the correction is a separate change, and a bigger one than it looks:
-`minutes` is the Dijkstra weight, not a display field. Making time more expensive
-divides through as a smaller `BETA` — a 1.2x on minutes turns the scenery penalty
-of 7.0 into an effective 5.8 — and *per-class* factors don't rescale at all, they
-re-rank, pushing routes off the small roads onto arterials. So the honest ETA and
-the scenic/fast trade-off have to be retuned together.
+Applying the correction was a bigger change than it looks, and this warning
+turned out to be the right one: `minutes` is the Dijkstra weight, not a display
+field, so making time more expensive divides through as a *smaller effective*
+`BETA`. Measured after the fact, the pref slider's bottom half had gone soft —
+a pref-0.25 route found scenery of 3.39 where it used to find 4.62 — and `BETA`
+had to rise from 7.0 to 10.0 to mean the same thing to a driver. The top half
+was untouched, because the scenery penalty saturates up there.
+
+The re-ranking prediction was half right. Per-class factors do re-rank, but not
+toward arterials: arterials carry 123 traffic signals per 100 km against a
+motorway's 0.9, so the correction makes *them* the expensive option. What it
+rewards is motorway. Across 40–90 km trips the fastest route got 4% faster while
+the max-scenic one got 15% slower, so the honest gap between them widened from
+44% to 71% rather than narrowing.
 
 ## Tests
 
 ```sh
-.venv/bin/python -m pytest tests/          # backend: 155 tests
+.venv/bin/python -m pytest tests/          # backend: 182 tests
 ```
 
 The geometry and scoring maths run anywhere; the calibration, routing and API
@@ -253,15 +278,17 @@ carries them onto edges, and `router.py` re-blends them live per request. So:
   `c_...` column plus a `WEIGHTS` entry in `score.py`, then a score + graph
   rebuild. Add it to `BEAUTY_TYPES` in `router.py` only if users should be able
   to tune it (otherwise list it in `BASELINE`).
-- **More realistic travel times** land in `graph.py` (the `minutes` column):
-  free-flow speed is optimistic on local roads; a per-class speed factor and a
-  per-junction stop penalty are the cheap first fixes, real traffic data the
-  expensive one. Drive first and fit them to the trace —
-  [Measuring travel times](#measuring-travel-times) — rather than picking
-  numbers. Charge the junction penalty at nodes of degree >= 3 (and more where
-  OSM has a `highway=traffic_signals` or `stop` node) rather than per edge:
-  edges are also split where a way merely ends, so a flat per-edge cost prices
-  OSM's editing history instead of the road, the same trap curvature fell into.
+- **Retuning travel time** is `SPEED_FACTOR` and `CONTROL_SECONDS` in
+  `router.py` — constants and a restart, deliberately not a graph rebuild, so
+  re-fitting them as drives accumulate costs nothing. Drive first and fit them
+  to the trace with `tools/fit_junction_cost.py` rather than picking numbers.
+  This section used to warn against charging a junction penalty *per edge*,
+  because edges are also split where a way merely ends and a flat per-edge cost
+  would price OSM's editing history instead of the road — the same trap
+  curvature fell into. The warning stands; what dodges it is that the cost is
+  per *control node found in the way's node list*, so a split with no signal on
+  it costs nothing. Do not replace that with a per-edge or a nearest-edge
+  charge: 81.7% of MA's controls have more than one road within 15 m of them.
 - **A second region** is the same pipeline run on another Geofabrik extract.
   The MA-specific bits to generalize: the projection in `common.py`, the BBOX
   in `elevation.py`, the byway names in `score.py`, and the

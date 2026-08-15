@@ -19,6 +19,29 @@ DRIVABLE = {
 # skipped unless it also carries motor_vehicle=yes (a common override).
 PRIVATE_ACCESS = {"private", "no"}
 
+# The traffic controls a car has to stop at, mapped to the three kinds worth
+# telling apart. Massachusetts has 29,772 of them — 11,348 signals, 17,567 stop
+# signs, 839 give-ways and 18 mini-roundabouts — and the graph charged nothing
+# for any of them until 2026-08-15, which is most of why its travel times ran
+# 22% optimistic (see docs/junction-timing-plan.md).
+#
+# Mini-roundabouts join the give-ways: there are 18 in the state and only 7 sit
+# on a drivable way, so a column of their own would be a column of zeroes.
+CONTROL_KINDS = {
+    "traffic_signals": "signal",
+    "stop": "stop",
+    "give_way": "giveway",
+    "mini_roundabout": "giveway",
+}
+
+# One count per kind per direction of travel, written by graph.py and priced by
+# router.py. Here rather than in graph.py because the serving box deliberately
+# does not install the pipeline's dependencies (osmium, rasterio — see
+# server/DEPLOY.md), so router.py cannot import graph.py to learn the names of
+# the columns it has to read.
+CONTROL_COLUMNS = [f"n_{kind}_{d}" for kind in ("signal", "stop", "giveway")
+                   for d in ("fwd", "rev")]
+
 # oneway= values, and which direction they permit. Shared because graph.py and
 # router.py have to agree exactly: graph.py decides which nodes are mutually
 # reachable and router.py decides which edges may be traversed, so a road that

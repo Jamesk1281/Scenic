@@ -49,6 +49,23 @@ the scoring changes, then copy the two parquet files over.
 > about. Rerun `graph.py` and copy **both** parquets. Note the rebuild is now
 > ~135 s rather than ~30 s: reading node tags means a Python callback per node.
 
+> **Junction timing needs a rebuilt graph too, and this one will not start
+> without it either.** Travel time is no longer free-flow: `router.py` prices
+> each road at the speed its class is really driven and charges for the traffic
+> signals and stop signs on it, in the direction those face. The counts come
+> from OSM nodes `graph.py` used to discard, so `graph_edges.parquet` gains six
+> columns — `n_signal_fwd`/`_rev`, `n_stop_fwd`/`_rev`, `n_giveway_fwd`/`_rev`.
+>
+> `Router` checks for them at load and raises, because a graph that routes
+> perfectly well while charging nothing for 29,772 traffic controls answers
+> every ETA 22% short with nothing anywhere saying so. Rerun `graph.py` and copy
+> **both** parquets.
+>
+> The *seconds* each control is worth are not in the parquet — they live in
+> `CONTROL_SECONDS` and `SPEED_FACTOR` in `router.py`, so re-fitting them from
+> new drive traces is a code change and a restart rather than another rebuild
+> and another 80 MB copy over the tunnel.
+
 > **The code and the parquets must come from the same commit.** `router.py`
 > re-blends every edge's score live per request using `WEIGHTS` from `score.py`,
 > so a server running different scoring constants than the ones that built the
@@ -106,7 +123,7 @@ the first two are the usual Windows build headaches.
 .venv/bin/python -m pytest tests/
 ```
 
-With only the two graph parquets present, expect **125 passed, 3 skipped** — the
+With only the two graph parquets present, expect **179 passed, 3 skipped** — the
 skips need `scored_chunks.parquet`, a pipeline artifact the server never reads.
 What matters is that nothing *fails*: a failure here means the data and the code
 disagree. (Count the skips, not the passes — the pass count moves whenever a
