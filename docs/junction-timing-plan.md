@@ -370,14 +370,21 @@ rates absurd.
 
 | | actual | free-flow | + speed | + controls |
 | --- | --- | --- | --- | --- |
-| drive 1 | 41.2 | 36.0 (12.6%) | 39.4 (4.5%) | 44.3 (**7.4%**) |
-| drive 2 | 46.0 | 31.7 (31.2%) | 33.3 (27.6%) | 38.2 (**16.9%**) |
-| pooled | 87.2 | 67.7 (22.4%) | | 82.5 (**5.4%**) |
+| drive 1 | 41.2 | 37.0 (10.2%) | 39.0 (5.4%) | 43.9 (**6.5%**) |
+| drive 2 | 46.0 | 32.7 (29.0%) | 33.3 (27.6%) | 38.3 (**16.8%**) |
+| pooled | 87.2 | 69.7 (20.1%) | | 82.2 (**5.7%**) |
 
-**Both drives now come in under 20%, and the pooled error is 5.4% — which is the
+**Both drives come in under 20%, and the pooled error is 5.7% — which is the
 unexplained residual of §7 almost exactly.** Re-planned end to end through
 `server/app.py`, the ETA the app would show for drive 1 goes from 13.3% out to
-3.2%.
+**2.2%**.
+
+Drive 2 cannot be checked that way any more, and the reason is worth stating
+rather than hiding: at its recorded `pref` of 0.295 the router now returns a
+materially faster route than the one that was driven, so comparing its 28 min
+prediction against a 46 min drive down different roads measures nothing. The
+like-for-like figures above — predicted for the ground actually covered — are
+the ones to read.
 
 ### The speed term is the strong one
 
@@ -428,16 +435,86 @@ The correction rewards exactly the road type the scenic route is running away
 from. §8 was written from drives whose fast option was an arterial; generalising
 that to all trips was the error.
 
+### The fallback speed limits were the bigger defect all along
+
+Fitted per class, the surface roads came out **0.86 / 0.89 / 0.93** for primary /
+tertiary / secondary, which reads as three facts about three kinds of road. It
+was not. `SPEED_KMH` — the assumed limit where OSM has no `maxspeed` tag, which
+is **77% of the network's kilometres** — was a table of guesses, and the speed
+factor was quietly absorbing how wrong each one was.
+
+Read off the roads of the same class that *are* tagged (harmonic mean weighted
+by length, since that is the statistic that reproduces the right total time):
+
+| class | was | tagged roads say | untagged km it governs |
+| --- | --- | --- | --- |
+| **residential** | **30** | **40** | **36,871** |
+| trunk | 85 | 64 | 186 |
+| unclassified | 45 | 37 | 1,061 |
+| primary | 65 | 59 | 1,398 |
+| tertiary | 50 | 47 | 5,532 |
+| secondary | 55 | 53 | 4,862 |
+| motorway | 105 | 97 | 75 |
+
+30 km/h is not a speed limit Massachusetts posts anywhere. 40 (25 mph) is its
+statutory default in a thickly settled district, and it governs 56% of the
+state's road network.
+
+With the limits fixed, the same traces give **0.94 / 0.94 / 0.95** — the same
+number three times, from 52 km of driving. That is worth more than three fitted
+constants, because it *generalises*: `residential` has 41,348 km of network and
+0.9 km of trace behind it, and a rule every measured class agrees on is better
+evidence for it than its own noise. So `SPEED_FACTOR` is now one number for
+surface roads and one exception for motorway.
+
+### Junction size does not explain the gap between the drives
+
+The obvious next term, and the last one available from structure rather than
+from the clock: a signal where two arterials cross should cost more than one on
+a back street, and drive 2 was arterials while drive 1 was back roads.
+
+**It is not that.** Splitting the signals met by the class of road they sit on:
+
+| drive | major-road signals met | stops | s per signal met |
+| --- | --- | --- | --- |
+| drive 1 | 25 | 4 | **2.8** |
+| drive 2 | 24 | 10 | **14.0** |
+
+The same kind of signal, in the same number, at five times the cost. Nothing
+structural distinguishes them. This is the measurement that closes the question:
+the residual is the hour of the day, and no static term reaches it.
+
 ### BETA had to move, as §8's last section warned
 
 At `BETA = 7.0` the slider's bottom half went soft: a pref-0.25 route kept 50%
 of the fastest route's road where it used to keep 30%, and the scenery it found
-fell from 4.62 to 3.39. Swept over 20 routes, **10.0 restores it** (71% off the
-fastest road against a 70% baseline, scenery 4.39) and leaves the top half alone
-— pref 1.0 moves from 5.49 to 5.58, because the penalty saturates up there.
+fell from 4.62 to 3.39.
+
+Raising `BETA` alone then overcorrected — it fixed the bottom by handing it the
+*whole* gain, and the back half of the travel went inert (a guard in
+`test_the_whole_slider_does_something` caught it). `BETA` and `PREF_CURVE` are
+one calibration and have to be swept together. Share of the total scenery gain
+won by pref 0.25, and by the back half, over 10 routes:
+
+| BETA | curve | bottom | top | | BETA | curve | bottom | top |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 8 | 1.30 | 0.68 | 0.07 | | 10 | 1.30 | 0.77 | 0.05 |
+| 8 | 1.60 | 0.35 | 0.11 | | 10 | 2.00 | 0.34 | 0.12 |
+| **8** | **2.00** | **0.32** | **0.15** | | 12 | 2.00 | 0.35 | 0.10 |
+
+`BETA = 8.0, PREF_CURVE = 2.0`. Nothing reaches a flat 0.25/0.25 and nothing
+will: the penalty saturates, so past pref ~0.5 the router has already taken
+every detour worth taking and the ceiling is 5.6 on the 0–10 scale whatever
+these are set to.
+
+Note this overturns the note that used to sit on `PREF_CURVE` — "exponents above
+~1.5 overcorrect, trading the dead top for a dead bottom". That was true, and it
+was true *of `BETA = 7`*. A steep curve weakens every pref below 1.0, so with a
+small `BETA` it empties the bottom; with a larger one it does not. Neither
+constant means anything without the other.
 
 That is calibration, not preference: `pref` means the same thing to a driver as
-it did, and it takes a bigger number to mean it now.
+it did, and it takes different numbers to mean it now.
 
 ---
 

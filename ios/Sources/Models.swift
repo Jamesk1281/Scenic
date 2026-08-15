@@ -40,7 +40,10 @@ struct Geometry: Decodable {
 /// undecodable on a phone that hasn't been updated: an unrecognised type still
 /// has a perfectly good `instruction` to show.
 enum ManeuverType: String, Decodable {
-    case depart, turn, `continue`, roundabout, exit, merge, arrive, unknown
+    /// `fork` is "keep left/right" — a junction where the road you are on bends
+    /// past one that runs straighter, so holding the wheel takes you off route.
+    /// Not a turn: the arrow has to lean, not point.
+    case depart, turn, `continue`, roundabout, exit, merge, fork, arrive, unknown
 
     init(from decoder: Decoder) throws {
         let raw = try decoder.singleValueContainer().decode(String.self)
@@ -54,6 +57,7 @@ enum ManeuverType: String, Decodable {
         case .roundabout: return "arrow.triangle.turn.up.right.circle"
         case .exit:       return "arrow.turn.up.right"
         case .merge:      return "arrow.merge"
+        case .fork:       return "arrow.triangle.branch"
         case .arrive:     return "flag.checkered"
         case .turn, .continue, .unknown: return "arrow.up"
         }

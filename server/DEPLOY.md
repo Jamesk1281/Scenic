@@ -14,12 +14,13 @@ Only a few files are needed to *serve* routes — never the OSM/elevation data o
 the pipeline scripts:
 
 - **Data** (build locally, copy over): `data/processed/graph_edges.parquet` +
-  `graph_nodes.parquet` (~87 MB total).
+  `graph_nodes.parquet` + `turn_restrictions.parquet` (~87 MB total; the third
+  is well under a megabyte and the server refuses to start without it).
 - **Code**: `server/app.py`, and `pipeline/router.py` + `common.py` + `score.py`
   (router imports the latter two for shared constants and the scoring weights).
 
 Regenerate the graph locally with the pipeline (see the top-level README) when
-the scoring changes, then copy the two parquet files over.
+the scoring changes, then copy all three parquet files over.
 
 > Deploying the length-weighted edge scoring needs a `graph.py` rerun and a
 > fresh copy of both parquets. The old ones still *load* under the new code —
@@ -58,8 +59,12 @@ the scoring changes, then copy the two parquet files over.
 >
 > `Router` checks for them at load and raises, because a graph that routes
 > perfectly well while charging nothing for 29,772 traffic controls answers
-> every ETA 22% short with nothing anywhere saying so. Rerun `graph.py` and copy
-> **both** parquets.
+> every ETA 22% short with nothing anywhere saying so.
+>
+> The same build also writes a third file, `turn_restrictions.parquet`, without
+> which the router cannot tell a legal turn from an illegal one — measured, 18%
+> of long routes then contain a movement OSM forbids. It too is refused loudly
+> at load. Rerun `graph.py` and copy **all three** parquets.
 >
 > The *seconds* each control is worth are not in the parquet — they live in
 > `CONTROL_SECONDS` and `SPEED_FACTOR` in `router.py`, so re-fitting them from
@@ -93,8 +98,9 @@ interpreter path, so they break if the folder is moved or contains a space.
 git clone https://github.com/Jamesk1281/Scenic.git C:\Scenic
 ```
 
-Copy `graph_edges.parquet` and `graph_nodes.parquet` into
-`C:\Scenic\data\processed\` (USB stick or a cloud folder; they are gitignored).
+Copy `graph_edges.parquet`, `graph_nodes.parquet` and
+`turn_restrictions.parquet` into `C:\Scenic\data\processed\` (USB stick or a
+cloud folder; they are gitignored).
 
 ### 2. Virtualenv — serve dependencies only
 
@@ -123,7 +129,7 @@ the first two are the usual Windows build headaches.
 .venv/bin/python -m pytest tests/
 ```
 
-With only the two graph parquets present, expect **179 passed, 3 skipped** — the
+With only the two graph parquets present, expect **186 passed, 3 skipped** — the
 skips need `scored_chunks.parquet`, a pipeline artifact the server never reads.
 What matters is that nothing *fails*: a failure here means the data and the code
 disagree. (Count the skips, not the passes — the pass count moves whenever a

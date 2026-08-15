@@ -48,7 +48,7 @@ sys.path.insert(0, str(ROOT / "pipeline"))
 sys.path.insert(0, str(ROOT / "tools"))
 
 from common import CONTROL_COLUMNS, CRS_METERS  # noqa: E402
-from router import CONTROL_SECONDS, SPEED_FACTOR  # noqa: E402
+from router import CONTROL_SECONDS, SPEED_FACTOR, SURFACE_SPEED_FACTOR  # noqa: E402
 from analyze_trace import (attach_road_class, load, segments,  # noqa: E402
                            steps, stops)
 
@@ -369,7 +369,7 @@ def evaluate(drive, edges, cost):
     known = s[s.assumed_ms.notna() & (s.assumed_ms > 0)]
     actual = s.dt_s.sum() / 60.0
     free = (known.dist_m / known.assumed_ms).sum() / 60.0
-    factor = known.highway.map(SPEED_FACTOR).fillna(1.0).to_numpy()
+    factor = known.highway.map(SPEED_FACTOR).fillna(SURFACE_SPEED_FACTOR).to_numpy()
     speed = (known.dist_m.to_numpy() / (known.assumed_ms.to_numpy() * factor)).sum() / 60.0
     full = speed + control_minutes(drive["driven"], edges, cost)
     err = lambda p: abs(p - actual) / max(actual, 1e-9)

@@ -13,6 +13,8 @@ Outputs:
                                        name, ref, highway, junction,
                                        dest_ref, dest_name, n_<control>_fwd/rev,
                                        geometry (WGS84)
+  data/processed/turn_restrictions.parquet
+                                       via_node, from_edge, to_edge, kind
 
 Usage: python graph.py <input.osm.pbf> <processed_dir>
 """
@@ -33,14 +35,49 @@ from common import (CONTROL_COLUMNS, CONTROL_KINDS, CRS_METERS, DRIVABLE,
                     ONEWAY_FWD, ONEWAY_REV, PRIVATE_ACCESS)
 from score import blend, components, composite
 
-# Assumed driving speed (km/h) per road class, used to turn edge length into
-# travel time when OSM has no maxspeed tag.
+# Assumed speed limit (km/h) per road class, used where OSM has no maxspeed tag
+# — which is 77% of the network's kilometres, so these numbers matter more than
+# the tagged ones do.
+#
+# They used to be guesses. They are now read off the roads of the same class
+# that *are* tagged, as the harmonic mean weighted by length — harmonic because
+# it is the speed that reproduces the right total travel time, which is the only
+# thing this table is for. Re-derive with the query in
+# docs/junction-timing-plan.md §13.
+#
+# The one that mattered: `residential` was 30, and 4,477 tagged kilometres say
+# 40. Massachusetts posts 25 mph (40 km/h) as its statutory default in a thickly
+# settled district and does not post 19 mph anywhere — the old number was not a
+# speed limit at all. It governs 36,871 km of road, 56% of the state's network.
+#
+# `trunk` was 85 against a measured 64, and `unclassified` 45 against 37.
+# The `_link` classes have single-digit tagged kilometres behind them and are
+# left as they were rather than fitted to noise; likewise `living_street`, where
+# the tag's own meaning (a street pedestrians share) is better evidence than
+# 7.5 km of it.
+#
+# Note these are *posted limits*, not driving speeds. How much faster or slower
+# a class is actually driven is SPEED_FACTOR in router.py, measured separately —
+# and separating them is the point. Folded together, `residential` looked like a
+# class people drive at 1.51x the limit; it is really a class whose limit the
+# graph had wrong by a third.
 SPEED_KMH = {
-    "motorway": 105, "motorway_link": 60, "trunk": 85, "trunk_link": 50,
-    "primary": 65, "primary_link": 45, "secondary": 55, "secondary_link": 40,
-    "tertiary": 50, "tertiary_link": 38, "unclassified": 45, "residential": 30,
+    "motorway": 97, "motorway_link": 58, "trunk": 64, "trunk_link": 50,
+    "primary": 59, "primary_link": 45, "secondary": 53, "secondary_link": 40,
+    "tertiary": 47, "tertiary_link": 38, "unclassified": 37, "residential": 40,
     "living_street": 12,
 }
+
+# OSM turn-restriction relations worth reading: the ones that forbid a movement
+# outright, and the ones that permit only one and so forbid the rest.
+#
+# `no_right_turn_on_red` is deliberately absent — it restricts *when* you may
+# turn, not whether, and treating it as a ban would route drivers around 40
+# junctions they are allowed to use.
+NO_TURN = {"no_left_turn", "no_right_turn", "no_straight_on", "no_u_turn",
+           "no_entry", "no_exit"}
+ONLY_TURN = {"only_straight_on", "only_left_turn", "only_right_turn",
+             "only_u_turn"}
 
 
 def parse_maxspeed(v: str) -> float | None:
@@ -64,7 +101,53 @@ class GraphHandler(osmium.SimpleHandler):
         self.node_count = {}     # node_id -> times referenced (for junctions)
         self.exit_refs = {}      # node_id -> exit number ("26", "13A")
         self.controls = {}       # node_id -> (kind, direction)
+        self.restrictions = []   # (kind, from_way, via_node, to_way)
+        self.skipped_restrictions = {}
         self.errors = 0
+
+    def relation(self, r):
+        """Collect turn restrictions: "no left here", "only straight on there".
+
+        A restriction is a property of a *pair* of roads meeting at a junction,
+        which is the one thing a graph keyed by nodes cannot say — so these are
+        carried out to router.py, which splits the junction to say it. Reading
+        them at all is new: measured on 2026-08-15, 7 of 40 random long
+        Massachusetts routes told the driver to make a turn the map forbids.
+
+        Only the `via`-node form is taken. The 604 `via`-way restrictions —
+        "no U-turn via the crossover", where the forbidden movement spans a
+        whole little road rather than a point — need the search to remember more
+        than one junction back, and are left for later rather than approximated.
+        """
+        if r.tags.get("type") not in ("restriction", "restriction:motorcar"):
+            return
+        kind = (r.tags.get("restriction")
+                or r.tags.get("restriction:motorcar") or "")
+        # `no_left_turn @ (Mo-Fr 07:00-15:00)` — a conditional restriction, of
+        # which Massachusetts has two. Enforced unconditionally: routing a
+        # driver around a turn they could have made costs them a minute, and
+        # the other way costs them a ticket.
+        kind = kind.split("@")[0].strip()
+        if kind not in NO_TURN and kind not in ONLY_TURN:
+            self.skipped_restrictions[kind or "(untagged)"] = \
+                self.skipped_restrictions.get(kind or "(untagged)", 0) + 1
+            return
+        frm = to = via = None
+        for m in r.members:
+            if m.role == "from" and m.type == "w":
+                frm = m.ref
+            elif m.role == "to" and m.type == "w":
+                to = m.ref
+            elif m.role == "via" and m.type == "n":
+                via = m.ref
+            elif m.role == "via" and m.type == "w":
+                via = None
+                break
+        if frm and to and via:
+            self.restrictions.append((kind, frm, via, to))
+        else:
+            self.skipped_restrictions["via-way or incomplete"] = \
+                self.skipped_restrictions.get("via-way or incomplete", 0) + 1
 
     def node(self, n):
         """Pick up exit numbers and traffic controls.
@@ -141,6 +224,9 @@ class GraphHandler(osmium.SimpleHandler):
             oneway = "yes"
         meta = {
             "highway": hw,
+            # Kept only long enough to resolve turn restrictions, which name
+            # their roads by way id, and dropped before the parquet is written.
+            "way_id": w.id,
             "name": w.tags.get("name", ""),
             "ref": w.tags.get("ref", ""),
             # Kept rather than merely consulted. `junction` was already read
@@ -224,6 +310,7 @@ def build_edges(ways, node_count, to_m, controls=None):
                 continue
             rows.append({
                 "u": ids[a], "v": ids[b],
+                "way_id": meta["way_id"],
                 "length_m": length,
                 # Free-flow, and it stays that way. The two corrections that
                 # make this a real travel time — the per-class speed factor and
@@ -243,6 +330,61 @@ def build_edges(ways, node_count, to_m, controls=None):
                 "geometry": shapely.LineString(seg),
             })
     return rows
+
+
+def resolve_restrictions(edges, restrictions):
+    """Turn (kind, from-way, via-node, to-way) into forbidden edge-row pairs.
+
+    A way becomes several edges — `build_edges` splits it at every junction — so
+    "you may not turn from way 123 into way 456" has to be pinned to the two
+    *segments* that actually touch the junction. Resolved here, against the
+    final edge table, because `largest_component` renumbers the rows and a
+    restriction that names the wrong row silently bans an unrelated turn
+    somewhere else in the state.
+
+    `only_*` is expanded into its complement while the whole junction is in
+    hand: "only straight on" is every other exit forbidden, and saying it that
+    way means router.py needs one rule instead of two. The U-turn back onto the
+    road you came in on is left out of that complement — a shortest path cannot
+    make one anyway, and banning it would cost a node copy to say so.
+
+    Returns a frame of (via_node, from_edge, to_edge, kind) and a count of what
+    could not be resolved, which is expected to be non-zero: a restriction whose
+    roads were dropped as unroutable, or which never reached the largest
+    component, has nothing left to forbid.
+    """
+    by_way = {}
+    for row, way in enumerate(edges["way_id"].to_numpy()):
+        by_way.setdefault(way, []).append(row)
+    u, v = edges["u"].to_numpy(), edges["v"].to_numpy()
+    at_node = {}
+    for row in range(len(edges)):
+        at_node.setdefault(u[row], []).append(row)
+        if v[row] != u[row]:
+            at_node.setdefault(v[row], []).append(row)
+
+    def touching(way, via):
+        return [r for r in by_way.get(way, ()) if u[r] == via or v[r] == via]
+
+    out, unresolved = [], 0
+    for kind, frm, via, to in restrictions:
+        from_rows, to_rows = touching(frm, via), touching(to, via)
+        if not from_rows or not to_rows:
+            unresolved += 1
+            continue
+        for f in from_rows:
+            if kind in NO_TURN:
+                # A pure backtrack is unreachable by a shortest path, so saying
+                # so would cost a junction copy and forbid nothing.
+                banned = [t for t in to_rows if t != f]
+            else:
+                allowed = set(to_rows) | {f}
+                banned = [t for t in at_node.get(via, ()) if t not in allowed]
+            for t in banned:
+                out.append((via, f, t, kind))
+
+    frame = pd.DataFrame(out, columns=["via_node", "from_edge", "to_edge", "kind"])
+    return frame.drop_duplicates(subset=["via_node", "from_edge", "to_edge"]), unresolved
 
 
 def main(pbf_path: str, processed_dir: str):
@@ -287,9 +429,22 @@ def main(pbf_path: str, processed_dir: str):
     nodes = node_table(edges, h.exit_refs)
     print(f"{(nodes['exit_ref'] != '').sum():,} nodes carry an exit number")
 
+    # --- turn restrictions, resolved against the final row numbering ---
+    banned, unresolved = resolve_restrictions(edges, h.restrictions)
+    print(f"{len(h.restrictions):,} via-node restrictions read "
+          f"({unresolved:,} name roads this graph does not carry, "
+          f"{dict(h.skipped_restrictions)} skipped) -> "
+          f"{len(banned):,} forbidden turns at "
+          f"{banned['via_node'].nunique():,} junctions")
+    # Internal only: the way id exists to resolve the restrictions above, and a
+    # column nothing reads is a column that goes stale.
+    edges = edges.drop(columns=["way_id"])
+
     edges.to_parquet(d / "graph_edges.parquet")
     nodes.to_parquet(d / "graph_nodes.parquet")
-    print(f"wrote graph_edges.parquet + graph_nodes.parquet in {time.time() - t0:.0f}s")
+    banned.to_parquet(d / "turn_restrictions.parquet")
+    print(f"wrote graph_edges + graph_nodes + turn_restrictions in "
+          f"{time.time() - t0:.0f}s")
     print(f"edge score: mean {edges['score'].mean():.2f}, "
           f"length {edges['length_m'].sum()/1000:.0f} km total")
 

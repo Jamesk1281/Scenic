@@ -51,14 +51,26 @@ from score import WEIGHTS, composite
 # faster and carry almost none — so the same 7.0 bought measurably less detour
 # than it used to. Measured over 20 routes, the share of a pref-0.25 route that
 # leaves the fastest road fell from 70% to 50% and the scenery it found fell
-# from 4.62 to 3.39 on the 0-10 scale: the slider's bottom half had quietly gone
-# soft. 10.0 restores it (71%, 4.39) and leaves the top half where it was — the
-# penalty saturates up there, so pref 1.0 moves from 5.49 to 5.58 and the routes
-# barely change.
+# from 4.62 to 3.39 on the 0-10 scale: the slider's bottom half had gone soft.
 #
 # Read that as calibration, not preference: `pref` means the same thing to a
 # driver as it did before, and it takes a bigger number to mean it now.
-BETA = 10.0
+#
+# BETA and PREF_CURVE are **one calibration** and have to be swept together —
+# raising BETA alone fixes the bottom of the slider by handing the whole gain to
+# it. Over 10 routes, the share of the total scenery gain won by pref 0.25 and
+# by the back half (0.5 -> 1.0):
+#
+#     BETA  curve    bottom   top          BETA  curve    bottom   top
+#      8.0   1.30      0.68  0.07          10.0   1.30      0.77  0.05
+#      8.0   1.60      0.35  0.11          10.0   2.00      0.34  0.12
+#      8.0   2.00      0.32  0.15          12.0   2.00      0.35  0.10
+#
+# 8.0 with a curve of 2.0 is the most even the pair can be made. Nothing reaches
+# a flat 0.25/0.25 and nothing will: the penalty saturates, so past pref ~0.5
+# the router has already taken every detour worth taking, and the ceiling is
+# 5.6 on the 0-10 scale whatever these are set to.
+BETA = 8.0
 
 # --- Travel time --------------------------------------------------------------
 # `graph_edges.minutes` is free-flow — length over the speed limit, with nothing
@@ -71,21 +83,29 @@ BETA = 10.0
 # a constant and a restart, not a 135 s rebuild plus copying 80 MB to the
 # serving box. See docs/junction-timing-plan.md §5.
 
-# Measured moving speed over the speed the graph assumed, per road class, with
-# stopped time excluded (that is priced separately below). From 63 km of trace
-# on 2026-08-14; only classes with at least 5 km behind them are listed, and
-# everything else — including `residential`, which is 62% of the network's km
-# and has 0.9 km of measurement — stays at 1.0 rather than being guessed.
+# Measured moving speed over the posted limit, with stopped time excluded (that
+# is priced separately below). From 63 km of trace on 2026-08-14.
 #
-# Motorway is above 1.0 because drivers exceed the posted limit by 16%, and 97%
-# of motorway km carry a real `maxspeed` tag, so that is measured against the
-# sign rather than against a fallback. An ETA predicts what the driver will do.
-SPEED_FACTOR = {
-    "motorway": 1.16,
-    "secondary": 0.93,
-    "tertiary": 0.89,
-    "primary": 0.86,
-}
+# **One number, because the roads agree.** Fitted per class, the surface roads
+# came out 0.86 / 0.89 / 0.93 for primary / tertiary / secondary, which looks
+# like three facts about three kinds of road. It was not: `SPEED_KMH` had the
+# posted limits wrong by different amounts on each, and the factor was quietly
+# absorbing that. With the limits read off the tagged roads instead (see
+# graph.py) the same traces give **0.94 / 0.94 / 0.95** — the same number three
+# times, from 52 km of driving.
+#
+# That is worth more than three fitted constants. It generalises: `residential`
+# has 0.9 km of trace behind it and 41,348 km of network, and a rule backed by
+# every class that *was* measured is better evidence for it than its own noise
+# (which says 1.16, and which is a tenth of a percent of the drive). Anything
+# not named below gets the surface-road number.
+#
+# Motorway is the one real exception and stays measured: drivers exceed the
+# posted limit by 16%, and 97% of motorway km carry a real `maxspeed` tag, so
+# that is measured against the sign rather than against a fallback. An ETA
+# predicts what the driver will do, not what the sign says.
+SPEED_FACTOR = {"motorway": 1.16}
+SURFACE_SPEED_FACTOR = 0.95
 
 # Seconds lost per traffic control *met* — P(stop) and the delay when you do
 # stop, folded into the one number a static graph can charge. Fitted by
@@ -109,10 +129,16 @@ CONTROL_SECONDS = {"signal": 9.5, "stop": 9.3, "giveway": 4.7}
 # every detour worth taking — which used to leave the slider's top half handing
 # back an identical route. Most of that was really the compressed score scale
 # (see RAW_BASE in score.py): with the full 0-10 range in play the penalty
-# discriminates enough that a near-linear slider already spreads well. This mild
-# exponent evens out what remains. Measured over four routes, exponents above
-# ~1.5 overcorrect, trading the dead top for a dead bottom.
-PREF_CURVE = 1.3
+# discriminates enough that a near-linear slider already spreads well.
+#
+# This was 1.3, on a measurement over four routes that exponents above ~1.5
+# "overcorrect, trading the dead top for a dead bottom". That was true and it
+# was true *of BETA = 7*: a steep curve weakens every pref below 1.0, so with a
+# small BETA it empties the bottom. The two constants trade against each other
+# exactly that way, and the sweep above BETA settles both at once — at 8.0 a
+# curve of 2.0 leaves the bottom alive (32% of the gain at pref 0.25) and is the
+# only setting that gets a real share into the back half of the travel.
+PREF_CURVE = 2.0
 
 # --- Beauty types -----------------------------------------------------------
 # The six *tunable* beauty types — the kinds of scenery a driver would actually
@@ -185,6 +211,7 @@ class Router:
         d = Path(processed_dir)
         self.edges = gpd.read_parquet(d / "graph_edges.parquet")
         self.nodes = pd.read_parquet(d / "graph_nodes.parquet")
+        self.restrictions = self._read_restrictions(d)
         self._require_columns()
 
         ids = self.nodes["node_id"].to_numpy()
@@ -201,6 +228,25 @@ class Router:
         self._edge_tree = STRtree(self._edge_geom_m)
 
         self._build_directed()
+
+    @staticmethod
+    def _read_restrictions(d: Path):
+        """The turns OSM forbids, or a loud failure.
+
+        Refused rather than defaulted to empty for the same reason the columns
+        above are: a graph with no restriction table routes beautifully and
+        tells roughly one long route in five to make a turn that is illegal,
+        with every test green and nothing in any log.
+        """
+        path = d / "turn_restrictions.parquet"
+        if not path.exists():
+            raise RuntimeError(
+                f"{path.name} is missing — this graph was built before the "
+                "router read turn restrictions, so it cannot tell a legal turn "
+                "from an illegal one. Rerun pipeline/graph.py and copy ALL "
+                "THREE parquets over; see server/DEPLOY.md."
+            )
+        return pd.read_parquet(path)
 
     def _require_columns(self):
         missing = [c for c in self.REQUIRED_EDGE_COLUMNS
@@ -221,13 +267,17 @@ class Router:
         j = self.edges["junction"].astype(str).str.lower()
         return j.isin(("roundabout", "circular")).to_numpy()
 
-    @cached_property
-    def exits_at_node(self):
+    def _count_exits_at_node(self):
         """Per node, how many roads leave it that are not part of a rotary.
 
         Counted over *outgoing* directed edges, not attached ones: a one-way
         street pointing into a rotary is an entrance, and counting it would put
         "take the 2nd exit" one exit early for every driver who passed one.
+
+        Taken before the graph is expanded for turn restrictions, and kept.
+        Afterwards a junction's roads are duplicated once per approach that has
+        a restriction, so counting then would report a rotary with five exits as
+        having nine and send the driver round it twice.
         """
         leaves = ~self.is_roundabout[self.eidx]
         return np.bincount(self.tail[leaves], minlength=self.n)
@@ -239,7 +289,174 @@ class Router:
         for i, ref in enumerate(refs):
             if ref and ref != "nan":
                 exit_refs[i] = ref
-        return ManeuverContext(exit_refs, self.exits_at_node)
+        return ManeuverContext(exit_refs, self.exits_at_node,
+                               self.departure_bearings)
+
+    def _apply_turn_restrictions(self, banned):
+        """Split each junction that forbids a turn into one node per approach.
+
+        A turn restriction is a property of the *pair* (road you came in on,
+        road you leave by), and a Dijkstra over nodes has no memory of the
+        first — arriving at a junction, it knows only where it is. Measured
+        2026-08-15, that cost 7 of 40 random long Massachusetts routes at least
+        one movement the map explicitly forbids.
+
+        The textbook fix is to edge-expand the whole graph: every directed edge
+        becomes a node and every turn an edge. That is ruled out here — it
+        roughly triples E on a router whose latency scales as E^1.20. But the
+        restrictions are sparse, so only the junctions that carry one need
+        splitting, and the other 300,000-odd nodes are left exactly as they are.
+
+        For a junction V and an approach `s` that forbids something, a copy of V
+        is made, `s` is pointed at the copy instead, and the copy is given only
+        the exits `s` is allowed to take. A driver arriving any other way still
+        arrives at V itself and can still go anywhere, which is what makes this
+        cheap: V keeps its own edges and is still a perfectly good place to
+        start a route from.
+
+        **The ordering below is load-bearing.** Every approach is redirected
+        before any copy is given its exits, so that a copy's exits inherit the
+        redirected head rather than the original node. Done the other way round,
+        a driver who reached V through a restricted approach would leave along a
+        *duplicate* edge — one that no restriction is keyed to — and evade the
+        restriction at the *next* junction along. That is a bug that only shows
+        up two junctions away from the thing being fixed.
+        """
+        # Identity until proven otherwise, so callers never have to ask whether
+        # the graph was expanded.
+        self.real_node = np.arange(self.n)
+        self.node_copies = {}
+        if banned.empty:
+            return
+
+        by_edge = self._group(self.eidx, len(self.edges))
+        by_tail = self._group(self.tail, self.n)
+
+        forbidden = {}
+        for via, from_edge, to_edge in banned[["via_node", "from_edge",
+                                               "to_edge"]].itertuples(index=False):
+            v = self.idx.get(via)
+            if v is None:
+                continue
+            arriving = self._slot(by_edge, from_edge, self.head, v)
+            leaving = self._slot(by_edge, to_edge, self.tail, v)
+            if arriving is None or leaving is None:
+                continue
+            forbidden.setdefault(arriving, set()).add(leaving)
+
+        # Phase 1: decide the copies, before anything is rewired.
+        plan, next_idx = [], self.n
+        for arriving, blocked in forbidden.items():
+            v = int(self.head[arriving])
+            exits = self._members(by_tail, v)
+            legal = [o for o in exits if o not in blocked]
+            # Nothing left to take, or nothing actually blocked — either way a
+            # copy would only add edges. Stranding an approach with no exit
+            # would be worse than the illegal turn: it makes roads unreachable.
+            if not legal or len(legal) == len(exits):
+                continue
+            plan.append((arriving, next_idx, legal))
+            next_idx += 1
+
+        if not plan:
+            return
+
+        real = np.arange(next_idx)
+        for arriving, copy, _ in plan:
+            real[copy] = self.head[arriving]
+        # ...every redirect first (see the docstring), then every exit.
+        for arriving, copy, _ in plan:
+            self.head[arriving] = copy
+
+        tails, heads, eidx, flip = [], [], [], []
+        for _, copy, legal in plan:
+            for o in legal:
+                tails.append(copy)
+                heads.append(self.head[o])      # already redirected if it had to be
+                eidx.append(self.eidx[o])
+                flip.append(self.flip[o])
+
+        self.tail = np.concatenate([self.tail, np.array(tails, dtype=self.tail.dtype)])
+        self.head = np.concatenate([self.head, np.array(heads, dtype=self.head.dtype)])
+        self.eidx = np.concatenate([self.eidx, np.array(eidx, dtype=self.eidx.dtype)])
+        self.flip = np.concatenate([self.flip, np.array(flip, dtype=bool)])
+        self.d_minutes = np.concatenate([self.d_minutes,
+                                         self.d_minutes[np.array([o for _, _, legal
+                                                                  in plan for o in legal])]])
+        self.real_node = real
+        self.n = next_idx
+
+        # Which node indices stand for the same junction. A route *to* a split
+        # junction may legitimately end at any of them — arriving is never the
+        # forbidden part, only continuing — so `route` takes the cheapest.
+        copies = {}
+        for _, copy, _ in plan:
+            copies.setdefault(int(real[copy]), []).append(copy)
+        self.node_copies = {v: np.array([v] + c) for v, c in copies.items()}
+
+    @cached_property
+    def _by_tail(self):
+        return self._group(self.tail, self.n)
+
+    def outgoing_slots(self, node_idx):
+        """Every directed edge leaving a junction, as slot indices.
+
+        For inspecting a junction rather than routing over it — what a driver
+        can see leaving it, which is what `tools/audit_directions.py` compares
+        the instructions against.
+        """
+        return self._members(self._by_tail, node_idx)
+
+    def slot_coords(self, slot):
+        """A slot's geometry as [lon, lat] in the direction it is driven."""
+        coords = shapely.get_coordinates(
+            self.edges.geometry.values[self.eidx[slot]])
+        return coords[::-1] if self.flip[slot] else coords
+
+    def departure_bearings(self, node_idx):
+        """The compass bearing of every road leaving a junction.
+
+        What the step generator needs to know whether "carry on" is an
+        instruction or a trap. Computed on demand rather than precomputed for
+        all 750,000 directed edges: a route asks about a few hundred junctions
+        and three roads each, which is a millisecond, against a table that would
+        cost seconds at every startup to answer questions almost none of it is
+        ever asked.
+        """
+        out = []
+        for slot in self.outgoing_slots(node_idx):
+            coords = self.slot_coords(slot)
+            if len(coords) >= 2:
+                out.append(_bearing_out(coords))
+        return out
+
+    @staticmethod
+    def _group(key, size):
+        """CSR-style grouping of slot indices by `key`, without building a dict.
+
+        Same shape as the node-pair index below it, and for the same reason: a
+        dict keyed by boxed ints over three quarters of a million slots costs
+        hundreds of megabytes on a box that already holds the graph twice.
+        """
+        order = np.argsort(key, kind="stable")
+        return order, np.searchsorted(key[order], np.arange(size + 1))
+
+    @staticmethod
+    def _members(grouped, key):
+        order, start = grouped
+        return order[start[key]:start[key + 1]]
+
+    def _slot(self, grouped, edge_row, ends, node):
+        """The directed slot of `edge_row` whose `ends` array meets `node`.
+
+        A two-way road expands into two slots; the restriction means the one
+        pointing the right way. `ends` is `self.head` to find the approach into
+        a junction and `self.tail` to find the exit out of it.
+        """
+        for s in self._members(grouped, edge_row):
+            if ends[s] == node:
+                return int(s)
+        return None
 
     def _driving_minutes(self) -> np.ndarray:
         """Per undirected edge, free-flow time corrected to real moving speed.
@@ -255,7 +472,8 @@ class Router:
         least on the classes whose factor is best measured, and saying nothing
         about it.
         """
-        factor = self.edges["highway"].map(SPEED_FACTOR).fillna(1.0).to_numpy()
+        factor = (self.edges["highway"].map(SPEED_FACTOR)
+                  .fillna(SURFACE_SPEED_FACTOR).to_numpy())
         return self.edges["minutes"].to_numpy() / factor
 
     def _control_minutes(self) -> tuple[np.ndarray, np.ndarray]:
@@ -303,6 +521,13 @@ class Router:
         # journey from the one that was chosen.
         self.d_minutes = minutes[self.eidx] + np.where(
             self.flip, control_rev[self.eidx], control_fwd[self.eidx])
+
+        # Counted on the plain graph, before junctions start being duplicated.
+        self.exits_at_node = self._count_exits_at_node()
+        # ...and then duplicated, which is what makes turn restrictions
+        # expressible. Everything below reads tail/head/eidx/flip, so it has to
+        # come after this and not before.
+        self._apply_turn_restrictions(self.restrictions)
 
         # Parallel edges: more than one directed edge can join the same
         # (tail, head) — parallel roads between the same two junctions. scipy's
@@ -479,6 +704,16 @@ class Router:
         g = csr_matrix((pair_w, (self.u_tail, self.u_head)), shape=(self.n, self.n))
         dist, pred = dijkstra(g, directed=True, indices=src_idx,
                               return_predecessors=True)
+        # A junction split for turn restrictions stands at several indices, one
+        # per approach that forbids something. Any of them is a legitimate place
+        # to *arrive* — the restriction is on continuing through, and a route
+        # that ends here does not continue — so take whichever is cheapest.
+        # The source needs no such treatment: the original index keeps all of
+        # the junction's exits, which is right for a driver setting off from it
+        # with no direction of arrival to be restricted by.
+        targets = self.node_copies.get(dst_idx)
+        if targets is not None:
+            dst_idx = int(targets[np.argmin(dist[targets])])
         if not np.isfinite(dist[dst_idx]):
             return None
         # reconstruct node path
@@ -545,8 +780,13 @@ class Router:
         # corrected, directional one — the same silent disagreement that once
         # had `mean_score` reporting the neutral score for a route optimised
         # under the user's beauty weights.
+        # Back to real junctions before anything reads them. `path` may run
+        # through the per-approach copies that turn restrictions created, and
+        # everything downstream — exit numbers, rotary exit counts — is keyed by
+        # the junction itself.
+        real = [int(self.real_node[p]) for p in path]
         return RouteResult(rows, stitch(coords), coords, scores[edge_rows],
-                           nodes=path, context=self.maneuver_context,
+                           nodes=real, context=self.maneuver_context,
                            edge_minutes=self.d_minutes[chosen])
 
 
@@ -604,6 +844,19 @@ def _turn_delta(bearing_in, bearing_out):
 # to clear the corner rounding, short enough not to swallow the turn itself.
 TURN_CHORD_M = 25.0
 
+# How much road behind a junction is gathered before that chord is taken off it.
+#
+# The chord alone is not enough, because the road it is measured on may be
+# shorter than the chord: `build_edges` splits a way at every junction, so a
+# short block between two of them is a whole edge, and `_bearing_in` falls back
+# to whatever it has — which on a 10 m block is the corner rounding again. That
+# does not matter much for deciding whether a turn is "slight"; it matters a
+# great deal for `fork_side`, which compares the route's heading against every
+# other road at the junction and is deciding whether to say anything at all.
+# Measured, taking the heading over one short edge missed forks on 12% of
+# routes that gathering 60 m of approach then finds.
+APPROACH_M = 60.0
+
 
 def _dist_m(p, q):
     """Metres between two [lon, lat] points, on the flat.
@@ -624,6 +877,20 @@ def _bearing_in(coords):
             return _bearing(p, end)
     # Shorter than the chord: the whole leg is the best baseline there is.
     return _bearing(coords[0], end)
+
+
+def _approach(legs):
+    """The road leading into the seam after `legs`, back at least APPROACH_M.
+
+    Walks back across leg boundaries rather than trusting the last one to be
+    long enough. See APPROACH_M.
+    """
+    coords = list(legs[-1]["coords"])
+    k = len(legs) - 2
+    while k >= 0 and _dist_m(coords[0], coords[-1]) < APPROACH_M:
+        coords = list(legs[k]["coords"])[:-1] + coords
+        k -= 1
+    return coords
 
 
 def _bearing_out(coords):
@@ -701,15 +968,49 @@ class ManeuverContext:
     your route, and they are exactly what "take the 2nd exit" counts.
     """
 
-    def __init__(self, exit_ref: dict, exits_at_node):
+    def __init__(self, exit_ref: dict, exits_at_node, departures=None):
         self.exit_ref = exit_ref                # node index -> "26", "13A"
         self.exits_at_node = exits_at_node      # node index -> outgoing non-rotary roads
+        # node index -> bearings of every road leaving it. A callable rather
+        # than a table; see Router.departure_bearings.
+        self.departures = departures
 
     def numbered_exit(self, node_idx):
         return self.exit_ref.get(node_idx, "")
 
     def leaves_the_rotary(self, node_idx):
         return bool(self.exits_at_node[node_idx])
+
+    def fork_side(self, node_idx, arrival, taken):
+        """Which way to keep when a *straighter* road leaves the same junction.
+
+        Returns "left", "right", or "" when carrying straight on is right.
+
+        This is the failure the route itself cannot see. Every instruction can
+        be correct and the driver still end up on the wrong road, because a road
+        that keeps its name is allowed to bend at a junction while a side road
+        carries on dead ahead — and a driver who is told nothing does what the
+        wheel is already doing. Measured over 60 routes before this existed, it
+        happened on 78% of them.
+
+        Only a *straighter* rival counts. A road peeling off at 40 degrees while
+        the route goes straight needs no instruction; nobody drifts onto it.
+        """
+        if self.departures is None:
+            return ""
+        wanted = _turn_delta(arrival, taken)
+        best = None
+        for bearing in self.departures(node_idx):
+            delta = _turn_delta(arrival, bearing)
+            if abs(delta) > 150:
+                continue                      # the road you arrived on
+            if abs(delta - wanted) < 1e-6:
+                continue                      # the road the route takes
+            if abs(delta) < abs(wanted) and (best is None or abs(delta) < abs(best)):
+                best = delta
+        if best is None:
+            return ""
+        return "left" if wanted < best else "right"
 
 
 class RouteResult:
@@ -812,11 +1113,21 @@ class RouteResult:
         for i, pts in enumerate(self.edge_coords):
             kind = _leg_kind(highways[i], junctions[i])
             coords = [list(p) for p in pts]
+            fork = ""
             if legs:
                 prev = legs[-1]
+                # Whether a straighter road leaves this seam — the thing that
+                # turns a silent merge into a wrong turn. Asked before merging,
+                # because if the answer is yes then merging is exactly what must
+                # not happen, however gentle the bend and however unchanged the
+                # street name.
+                if kind != "roundabout" and self.context is not None:
+                    fork = self.context.fork_side(
+                        self.nodes[i] if i < len(self.nodes) else -1,
+                        _bearing_in(_approach(legs)), _bearing_out(coords))
                 mergeable = prev["kind"] == kind and (
                     kind == "roundabout" or prev["label"] == label(i))
-                if mergeable and (kind == "roundabout" or abs(_turn_delta(
+                if mergeable and not fork and (kind == "roundabout" or abs(_turn_delta(
                         _bearing_in(prev["coords"]), _bearing_out(coords))) < 45):
                     prev["coords"].extend(coords[1:])      # drop the shared vertex
                     prev["length_m"] += float(lengths[i])
@@ -826,6 +1137,7 @@ class RouteResult:
                     continue
             legs.append({
                 "kind": kind, "label": label(i), "highway": highways[i],
+                "fork": fork,
                 # The OSM `name` on its own, without the `ref` fallback. A
                 # rotary carrying only a route number is not a rotary *called*
                 # that: "Take the 1st exit at MA 122" reads as though the
@@ -934,6 +1246,14 @@ class RouteResult:
                     step["type"] = "merge"
                     onto = f" onto {leg['label']}" if leg["label"] else ""
                     step["instruction"] = f"Merge{onto}"
+                elif leg.get("fork") and modifier in ("straight", "slight left",
+                                                      "slight right"):
+                    # A gentle bend past a road that runs straighter. "Continue"
+                    # is true and useless here — the driver has to be told which
+                    # side to hold. A sharper turn needs no help: "Turn left" is
+                    # already unambiguous, so it falls through to the usual
+                    # wording below.
+                    self._describe_fork(step, leg, previous)
                 else:
                     self._describe_turn(step, leg, previous, modifier)
 
@@ -1011,6 +1331,26 @@ class RouteResult:
             step["instruction"] = f"Take the exit onto {joins}"
         else:
             step["instruction"] = f"Take the exit on the {side}" if side else "Take the exit"
+
+    @staticmethod
+    def _describe_fork(step, leg, previous):
+        """'Keep left to stay on Washington Street'.
+
+        The OSRM vocabulary calls this a fork and pairs it with a slight-side
+        modifier, which is what the app needs to draw the right arrow — the
+        maneuver is not a turn, and an arrow that says one would be worse than
+        none at a junction the driver is already worried about.
+        """
+        side = leg["fork"]
+        step["type"] = "fork"
+        step["modifier"] = f"slight {side}"
+        label = leg["label"]
+        if label and previous and label == previous["label"]:
+            step["instruction"] = f"Keep {side} to stay on {label}"
+        elif label:
+            step["instruction"] = f"Keep {side} onto {label}"
+        else:
+            step["instruction"] = f"Keep {side}"
 
     def _describe_turn(self, step, leg, previous, modifier):
         phrase = _MODIFIER_PHRASE[modifier]

@@ -323,6 +323,91 @@ class TestStaleGraphIsRefused:
             router._require_columns()
 
 
+class TestTurnRestrictions:
+    """A Dijkstra over nodes cannot say "not from that road", so the junctions
+    that need to say it are split into one node per approach."""
+
+    def test_the_graph_carries_restrictions_and_splits_the_junctions(self, router):
+        assert len(router.restrictions) > 1000, "Massachusetts has thousands"
+        assert len(router.node_copies) > 100
+        # Cheap, which is the whole argument for doing it this way rather than
+        # edge-expanding a graph whose latency scales as E^1.20.
+        assert router.n < len(router.nodes) * 1.05
+
+    def test_a_split_junction_forbids_the_turn_from_the_restricted_approach(self, router):
+        """...and only from that one. The copy exists so the driver arriving one
+        way is stopped while everyone else carries on as before."""
+        banned = router.restrictions
+        by_edge = router._group(router.eidx, len(router.edges))
+        # The approach's head is a *copy* by now — that is the whole point — so
+        # look the junction up through `real_node` rather than expecting the
+        # slot to still point at it.
+        arrives_at = router.real_node[router.head]
+        checked = 0
+        for via, from_edge, to_edge in banned[["via_node", "from_edge",
+                                               "to_edge"]].itertuples(index=False):
+            v = router.idx.get(via)
+            if v is None:
+                continue
+            arriving = router._slot(by_edge, from_edge, arrives_at, v)
+            leaving = router._slot(by_edge, to_edge, router.tail, v)
+            if arriving is None or leaving is None:
+                continue
+            copy = int(router.head[arriving])
+            if copy == v:
+                continue        # no copy was made; see _apply_turn_restrictions
+            reachable = {int(router.eidx[s]) for s in router.outgoing_slots(copy)}
+            assert to_edge not in reachable, \
+                f"the forbidden turn is still available from the copy at {via}"
+            # The junction itself is untouched, so anyone else still gets there.
+            assert to_edge in {int(router.eidx[s])
+                               for s in router.outgoing_slots(v)}
+            checked += 1
+            if checked >= 200:
+                break
+        assert checked > 50, "not enough resolved restrictions to check"
+
+    def test_arriving_at_a_split_junction_still_works(self, router):
+        """Arriving is never the forbidden part — only continuing through — so
+        a route *to* a split junction must find it from any direction."""
+        v = next(iter(router.node_copies))
+        lat, lon = router.nodes["lat"].iat[v], router.nodes["lon"].iat[v]
+        s, _ = router.snap(*BOSTON)
+        t, _ = router.snap(lat, lon)
+        assert router.route(s, t, 0.0) is not None
+
+    def test_a_graph_without_the_restriction_table_is_refused(self, tmp_path):
+        with pytest.raises(RuntimeError, match="turn_restrictions"):
+            Router._read_restrictions(tmp_path)
+
+
+class TestForks:
+    """The failure that does not look like one: every instruction correct, and
+    the driver still ends up on the wrong road."""
+
+    def test_a_straighter_road_makes_the_bend_an_instruction(self):
+        """A road that keeps its name and bends 15 degrees at a junction, past a
+        side road that carries straight on. Merged silently, the app says
+        nothing and the wheel takes the driver onto the side road.
+        """
+        context = ManeuverContext({}, np.zeros(4), lambda node: [0.0, 15.0])
+        # Arriving due north, the route leaves on 15 and something leaves on 0.
+        assert context.fork_side(1, 0.0, 15.0) == "right"
+        assert context.fork_side(1, 0.0, 0.0) == ""      # the route *is* straight
+
+    def test_a_road_peeling_off_needs_no_instruction(self):
+        """The other side of it: the route goes straight and a side road leaves
+        at 40 degrees. Nobody drifts onto that, and announcing it would bury the
+        turns that matter."""
+        context = ManeuverContext({}, np.zeros(4), lambda node: [0.0, 40.0])
+        assert context.fork_side(1, 0.0, 0.0) == ""
+
+    def test_the_road_you_came_in_on_is_not_a_fork(self):
+        """It is behind you; leaving by it is a U-turn, not a drift."""
+        context = ManeuverContext({}, np.zeros(4), lambda node: [180.0, 30.0])
+        assert context.fork_side(1, 0.0, 30.0) == ""
+
+
 class TestTravelTime:
     """Travel time is no longer free-flow, and the number reported has to be the
     number that was minimised. See docs/junction-timing-plan.md."""
@@ -385,21 +470,29 @@ class TestTravelTime:
 
     def test_controls_and_speed_are_both_priced_in(self, router):
         """Each term on its own, so a regression says which one broke."""
-        from router import CONTROL_SECONDS, SPEED_FACTOR
+        from router import CONTROL_SECONDS, SPEED_FACTOR, SURFACE_SPEED_FACTOR
 
         edges = router.edges
         free = edges["minutes"].to_numpy()
         driving = router._driving_minutes()
         control_fwd, _ = router._control_minutes()
 
-        # Term 1: a class with a factor below 1 takes longer than free-flow.
-        slow = (edges["highway"] == "tertiary").to_numpy()
-        assert SPEED_FACTOR["tertiary"] < 1.0
-        assert (driving[slow] > free[slow]).all()
-        # ...and a class with no measurement is left exactly alone.
+        # Term 1, and it moves both ways. A surface road is driven below its
+        # limit, so it takes longer than free-flow...
+        assert SURFACE_SPEED_FACTOR < 1.0
+        surface = (edges["highway"] == "tertiary").to_numpy()
+        assert (driving[surface] > free[surface]).all()
+        # ...while a motorway is driven above it and takes less. A correction
+        # that only ever added time would be a fudge factor, not a measurement.
+        assert SPEED_FACTOR["motorway"] > 1.0
+        fast = (edges["highway"] == "motorway").to_numpy()
+        assert (driving[fast] < free[fast]).all()
+        # A class nobody drove enough of to measure gets the surface number
+        # rather than 1.0 — every class that *was* measured agreed on it.
         untouched = (edges["highway"] == "residential").to_numpy()
         assert "residential" not in SPEED_FACTOR
-        assert driving[untouched] == pytest.approx(free[untouched])
+        assert driving[untouched] == pytest.approx(free[untouched]
+                                                   / SURFACE_SPEED_FACTOR)
 
         # Term 2: an edge with one signal on it costs that many seconds.
         one_signal = np.where((edges["n_signal_fwd"].to_numpy() == 1)
@@ -592,10 +685,16 @@ class TestReportedScenery:
         expected = (live * length).sum() / length.sum()
         assert route.mean_score == pytest.approx(expected, rel=1e-12)
 
+        # ...and that those are genuinely the user's scores rather than the
+        # stored column. Compared per edge, not as an average: a route re-chosen
+        # under new weights can average out near the neutral number by
+        # coincidence, and this assertion used to make that coincidence a
+        # failure — it broke when a travel-time change moved this route to one
+        # whose two averages land 0.046 apart. The per-edge arrays cannot
+        # coincide, and they are what the defect was about.
         stored = route.edges["score"].to_numpy()
-        assert route.mean_score != pytest.approx(
-            (stored * length).sum() / length.sum(), abs=0.05), \
-            "weights that reshape the route must reshape its reported score"
+        assert np.abs(live - stored).max() > 0.5, \
+            "the reported scores are the stored neutral column, not the user's"
 
     def test_neutral_requests_still_report_the_precomputed_score(self, router):
         s, t = self._od(router, WORCESTER, BOSTON)

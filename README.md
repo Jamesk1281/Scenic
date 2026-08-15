@@ -38,26 +38,34 @@ travel time for beauty via a single preference knob, and a native iOS app
 - [x] More accurate travel times: routes are priced at the speed each road class
       is really driven, plus the mapped traffic signals and stop signs on them,
       in the direction those face. Measured against two recorded drives, error
-      falls from 22% to 5% pooled, and the ETA the app showed for one of them
-      goes from 13% out to 3%. What is left is congestion, which no static graph
+      falls from 22% to 5.7% pooled, and the ETA the app showed for one of
+      them goes from 13.3% out to 2.2%. What is left is congestion, which no static graph
       predicts — see [Measuring travel times](#measuring-travel-times)
 - [ ] Time of day. A static cost is an average over a quiet hour and a busy one:
       the two drives met almost the same number of signals — 26 and 27 — and
       stopped at 4 and 12 of them. That variance, not the model, is what now
       caps per-drive accuracy
-- [ ] Turn restrictions. The router never reads OSM's `type=restriction`
-      relations, and a node-indexed Dijkstra cannot express one — measured, 7 of
-      40 random long routes tell the driver to make a turn the map forbids.
-      Massachusetts has 8,694 of them. The fix is to expand only the ~4,700
-      restricted junctions, not the whole graph
+- [x] Directions a driver can follow. Two measurable ways a route misleads
+      someone, both now audited by `tools/audit_directions.py` over 120 random
+      routes: turns OSM forbids (18% of routes → 1%, by splitting the 3,078
+      junctions that carry a restriction into one node per approach), and
+      junctions where holding the wheel takes you off route with no instruction
+      (78% of routes → 0%). See
+      [`docs/directions-accuracy.md`](docs/directions-accuracy.md)
+- [ ] Lane guidance. Nothing reads `turn:lanes`, so nothing ever says "use the
+      right two lanes" — and at a multi-lane exit the wrong lane is a missed
+      exit however good the maneuver is
+- [ ] `via`-way turn restrictions (604 in MA), where the forbidden movement
+      spans a whole road rather than a junction. Needs the search to remember
+      more than one junction back
 - [ ] Start from the exact point, not the nearest corner. `snap()` finds the
       road you're on and then routes from that road's *nearer end* — right
       street, but a median 99 m up it (p90 217 m), because graph nodes are
       junctions. Splitting the snapped edge into two virtual nodes per request
       would take that to zero
-- [ ] Drive the routes and judge them. Scoring is calibrated and the nav code is
-      written, but none of it has met real GPS yet; route *quality* is the one
-      question a laptop cannot answer.
+- [ ] Drive the routes and judge them. Two drives (63 km, 2026-08-14) have now
+      met real GPS and fixed the clock, but route *quality* — is this actually a
+      nice road? — is still the one question a laptop cannot answer.
 
 > The early MapLibre web demo was retired to focus on iOS; it lives in git
 > history (`git show 82044e2`) and is cheap to revive on the same API if needed.
@@ -157,12 +165,21 @@ It is now two terms, both applied in `router.py` when the graph loads:
     time = distance ÷ (speed limit × how fast that class is really driven)
            + the controls on that road, in the direction they face
 
-`SPEED_FACTOR` holds the first (motorway 1.16 — drivers exceed the limit;
-tertiary 0.89), `CONTROL_SECONDS` the second (9.5 s per signal met, 9.3 s per
-stop sign — P(stop) and the wait folded together). `graph.py` counts the
-controls per edge per direction; both tables are fitted from traces by
+`SPEED_FACTOR` holds the first (0.95 on surface roads; motorway 1.16, because
+drivers exceed the limit), `CONTROL_SECONDS` the second (9.5 s per signal met,
+9.3 s per stop sign — P(stop) and the wait folded together). `graph.py` counts
+the controls per edge per direction; both tables are fitted from traces by
 `tools/fit_junction_cost.py`. Full workings in
 [`docs/junction-timing-plan.md`](docs/junction-timing-plan.md).
+
+The third defect was underneath both: `SPEED_KMH`, the assumed limit where OSM
+has no `maxspeed` tag — 77% of the network's kilometres — was a table of
+guesses. Read off the tagged roads of the same class instead, `residential` goes
+from 30 km/h to 40 (25 mph, Massachusetts' statutory default; 30 is not a limit
+posted anywhere in the state) across 36,871 km of road, and `trunk` from 85 to
+64. That table was doing most of the damage: with it fixed, the per-class speed
+factors collapse from 0.86/0.89/0.93 to 0.94/0.94/0.95 — one number, not three,
+which is why one number can now cover the classes with no measurement at all.
 
 Guessing a correction would be calibrating against Apple Maps' model — traffic
 included — rather than against the road. So the app measures instead. Every
@@ -252,7 +269,7 @@ the max-scenic one got 15% slower, so the honest gap between them widened from
 ## Tests
 
 ```sh
-.venv/bin/python -m pytest tests/          # backend: 182 tests
+.venv/bin/python -m pytest tests/          # backend: 189 tests
 ```
 
 The geometry and scoring maths run anywhere; the calibration, routing and API
