@@ -36,7 +36,7 @@ import numpy as np
 import pandas as pd
 import shapely
 from scipy.sparse import csr_matrix
-from scipy.sparse.csgraph import dijkstra
+from scipy.sparse.csgraph import connected_components, dijkstra
 from shapely.strtree import STRtree
 from pyproj import Transformer
 
@@ -360,6 +360,12 @@ class Router:
 
         if not plan:
             return
+        # ...and then thinned, because a split that enforces a turn can also
+        # take away the last way into somewhere. See _keep_network_reachable.
+        plan = self._keep_network_reachable(plan, by_tail)
+        if not plan:
+            return
+        next_idx = self.n + len(plan)
 
         real = np.arange(next_idx)
         for arriving, copy, _ in plan:
@@ -394,6 +400,94 @@ class Router:
             copies.setdefault(int(real[copy]), []).append(copy)
         self.node_copies = {v: np.array([v] + c) for v, c in copies.items()}
 
+    def _candidate_ends(self, plan):
+        """The (tail, head) the graph would have if `plan` were applied.
+
+        Built off to the side so a plan can be tested before anything is
+        committed, and in the same order the commit relies on: every approach
+        redirected first, then each copy's exits read the redirected heads.
+        """
+        head = self.head.copy()
+        for arriving, copy, _ in plan:
+            head[arriving] = copy
+        tails, heads = [], []
+        for _, copy, legal in plan:
+            for o in legal:
+                tails.append(copy)
+                heads.append(head[o])
+        return (np.concatenate([self.tail, np.array(tails, dtype=self.tail.dtype)]),
+                np.concatenate([head, np.array(heads, dtype=head.dtype)]))
+
+    def _strands(self, entry, by_tail, stranded):
+        """Whether this split is why some junction lost its last way in."""
+        arriving, _, legal = entry
+        v = int(self.head[arriving])
+        kept = set(legal)
+        return any(int(self.head[o]) in stranded
+                   for o in self._members(by_tail, v) if o not in kept)
+
+    def _keep_network_reachable(self, plan, by_tail):
+        """Drop the splits that would cut part of the network off.
+
+        `graph.py` runs `largest_component` and guarantees the graph it writes
+        is one strongly connected piece — but it runs that check on the
+        *unexpanded* graph, so it says nothing about the graph this class
+        actually routes over. A split takes exits away from an approach, and
+        taking exits away can leave a pocket of road with no legal way in.
+
+        Measured on the Massachusetts graph, the unchecked expansion turned 1
+        strongly connected component into 120 and left 5 junctions that `snap`
+        still returns and `route` then cannot reach — which `server/app.py`
+        answers as "no route found between those points" for an address
+        plainly on the map, at a snap offset of 0.0 m. That is verbatim the
+        failure `largest_component` exists to prevent, re-opened one layer
+        below it with nothing checking.
+
+        Same trade-off the per-approach guard above already makes, widened
+        from one junction to the whole network: an illegal turn left in is
+        cheaper than a road nobody can drive to. On the current graph it gives
+        up 7 of 3,795 splits to buy back all 5 junctions, converges in two
+        rounds, and costs one strong-components pass each — 90 ms on a 2.0 s
+        load, paid once at startup.
+        """
+        # The copy indices have to stay contiguous from self.n, because the
+        # candidate graph is sized off len(plan) and `real` below is an arange
+        # over them — so renumber after every thinning, not just at the end.
+        renumber = lambda p: [(arriving, self.n + i, legal)
+                              for i, (arriving, _, legal) in enumerate(p)]
+        plan = renumber(plan)
+        for _ in range(8):
+            tail, head = self._candidate_ends(plan)
+            size = self.n + len(plan)
+            g = csr_matrix((np.ones(len(tail)), (tail, head)), shape=(size, size))
+            n_comp, label = connected_components(g, directed=True,
+                                                 connection="strong")
+            if n_comp == 1:
+                break
+            biggest = np.bincount(label).argmax()
+            # A junction every one of whose approaches was redirected keeps no
+            # edges under its own index, so it always falls out of the largest
+            # component — but `route` arrives at it through one of its copies
+            # (see `node_copies`), so it is only really stranded if none of
+            # those made it either. Counting those as strandings is counting
+            # the mechanism working.
+            stands_for = {}
+            for arriving, copy, _ in plan:
+                stands_for.setdefault(int(self.head[arriving]), []).append(copy)
+            stranded = {int(v) for v in np.flatnonzero(label[:self.n] != biggest)
+                        if all(label[c] != biggest
+                               for c in stands_for.get(int(v), ()))}
+            if not stranded:
+                break
+            kept = [p for p in plan if not self._strands(p, by_tail, stranded)]
+            if len(kept) == len(plan):
+                # Nothing in the plan explains the strandings, so there is no
+                # subset to fall back to. Enforce none of them rather than
+                # serve a graph with roads no route can reach.
+                return []
+            plan = renumber(kept)
+        return plan
+
     @cached_property
     def _by_tail(self):
         return self._group(self.tail, self.n)
@@ -409,8 +503,7 @@ class Router:
 
     def slot_coords(self, slot):
         """A slot's geometry as [lon, lat] in the direction it is driven."""
-        coords = shapely.get_coordinates(
-            self.edges.geometry.values[self.eidx[slot]])
+        coords = shapely.get_coordinates(self._geom[self.eidx[slot]])
         return coords[::-1] if self.flip[slot] else coords
 
     def departure_bearings(self, node_idx):
@@ -493,6 +586,12 @@ class Router:
 
     def _build_directed(self):
         e = self.edges
+        # Resolved once. Reaching it as `self.edges.geometry.values` costs a
+        # pandas __getitem__ and a geopandas _get_geometry per call, and
+        # slot_coords/_collect between them make a few thousand of those per
+        # route — measured at 86% of slot_coords' own cost, all of it spent
+        # re-finding the column rather than reading geometry.
+        self._geom = e.geometry.values
         ui = e["u"].map(self.idx).to_numpy()
         vi = e["v"].map(self.idx).to_numpy()
         # Kept per undirected edge (not per directed slot) so snap() can pick
@@ -658,35 +757,45 @@ class Router:
             dv = (self._nx[v] - x) ** 2 + (self._ny[v] - y) ** 2
             node = u if du <= dv else v
         else:
-            node = self._forward_end(x, y, u, v, heading)
+            node = self._forward_end(self._edge_geom_m[e], point, u, v, heading)
         return node, float(self._edge_geom_m[e].distance(point))
 
-    def _forward_end(self, x: float, y: float, u: int, v: int,
+    def _forward_end(self, line, point, u: int, v: int,
                      heading: float) -> int:
-        """Whichever of a segment's two ends lies more nearly ahead of a driver
-        at (x, y) travelling on `heading`.
+        """Whichever of a segment's two ends lies ahead *along the road* for a
+        driver at `point` travelling on `heading`.
+
+        Compared against the road's own tangent where the driver is standing,
+        not against the straight line to each end. Those agree on a straight
+        segment and part company on a curved one: a loop ramp that turns
+        through more than 90 degrees has its far end *behind* the driver as the
+        crow flies while still being the end they are driving toward. Measured
+        over 3,857 mid-edge samples, three chose the junction just passed —
+        among them a 635 m motorway_link loop — which is the reroute-turns-you-
+        around failure `heading` exists to prevent.
 
         Bearings are taken in projected metres rather than on the sphere.
         `CRS_METERS` is a conformal conic, so a grid bearing differs from a true
         one by the convergence angle — under 1.5 degrees anywhere in
-        Massachusetts, against a decision that is almost always ~180 degrees
-        apart. The approximation is nowhere near the margin.
+        Massachusetts, against a decision that is 180 degrees wide. The
+        approximation is nowhere near the margin.
         """
-        best, best_delta = None, None
-        for node in (u, v):
-            dx, dy = self._nx[node] - x, self._ny[node] - y
-            # The driver standing exactly on a junction gives no direction to
-            # it; the other end still does.
-            if dx == 0.0 and dy == 0.0:
-                continue
-            # Easting/northing, so a compass bearing is atan2(east, north).
-            bearing = math.degrees(math.atan2(dx, dy)) % 360.0
-            delta = abs((bearing - heading + 180.0) % 360.0 - 180.0)
-            if best_delta is None or delta < best_delta:
-                best, best_delta = node, delta
-        # Both ends degenerate to the driver's own position: nothing to choose
-        # between, and returning a valid node matters more than which.
-        return u if best is None else best
+        coords = shapely.get_coordinates(line)
+        if len(coords) < 2:
+            return u
+        # The vertex pair the driver is standing between. `project` gives the
+        # distance along the line to their nearest point on it.
+        step = np.hypot(np.diff(coords[:, 0]), np.diff(coords[:, 1]))
+        along = np.concatenate([[0.0], np.cumsum(step)])
+        k = int(np.searchsorted(along, line.project(point), side="right")) - 1
+        k = min(max(k, 0), len(coords) - 2)
+        dx, dy = coords[k + 1] - coords[k]
+        if dx == 0.0 and dy == 0.0:
+            return u
+        # Easting/northing, so a compass bearing is atan2(east, north). The
+        # geometry runs u -> v, so agreeing with the tangent means heading for v.
+        tangent = math.degrees(math.atan2(dx, dy)) % 360.0
+        return v if abs(_turn_delta(heading, tangent)) <= 90.0 else u
 
     def route(self, src_idx: int, dst_idx: int, pref: float, weights: dict = None):
         # Scored once, then used for both jobs: choosing the route and reporting
@@ -764,7 +873,7 @@ class Router:
         # traversed against its stored direction so the points run start -> end.
         coords = []
         for k in chosen:
-            c = shapely.get_coordinates(self.edges.geometry.values[self.eidx[k]])
+            c = shapely.get_coordinates(self._geom[self.eidx[k]])
             if self.flip[k]:
                 c = c[::-1]
             coords.append(c)
@@ -881,9 +990,12 @@ def _dist_m(p, q):
 def _bearing_in(coords):
     """Heading on arrival at the end of `coords`, over a `TURN_CHORD_M` chord."""
     end = coords[-1]
-    for p in reversed(list(coords[:-1])):
-        if _dist_m(p, end) >= TURN_CHORD_M:
-            return _bearing(p, end)
+    # Walked by index: the scan stops after a few vertices, and `coords` can be
+    # a merged leg of several hundred, so slicing and reversing it copies the
+    # whole thing twice to read three of it.
+    for k in range(len(coords) - 2, -1, -1):
+        if _dist_m(coords[k], end) >= TURN_CHORD_M:
+            return _bearing(coords[k], end)
     # Shorter than the chord: the whole leg is the best baseline there is.
     return _bearing(coords[0], end)
 
@@ -905,9 +1017,9 @@ def _approach(legs):
 def _bearing_out(coords):
     """Heading on departure from the start of `coords`, over the same chord."""
     start = coords[0]
-    for q in list(coords[1:]):
-        if _dist_m(start, q) >= TURN_CHORD_M:
-            return _bearing(start, q)
+    for k in range(1, len(coords)):
+        if _dist_m(start, coords[k]) >= TURN_CHORD_M:
+            return _bearing(start, coords[k])
     return _bearing(start, coords[-1])
 
 
@@ -939,23 +1051,30 @@ _MODIFIER_PHRASE = {
 }
 
 
+# The classes you "exit" rather than "turn off", and "merge" onto rather than
+# "continue" onto.
+_GRADE_SEPARATED = ("motorway", "trunk")
+
+
 def _leg_kind(highway: str, junction: str) -> str:
     """How a stretch of road behaves for the purpose of describing it.
 
     A rotary and a slip road are not turns onto a differently-named street, and
     describing them as though they were is what produced "Slight right" for a
     motorway exit and nothing at all for a rotary.
+
+    Only a *grade-separated* link is an exit, though. OSM tags every slip lane
+    `*_link`, and 18% of the ones a route uses are 40-90 m at-grade connectors
+    between ordinary streets — a corner cut across, not a junction you leave
+    the highway by. Called ramps they came out as "Take the exit onto Ocean
+    Street" over a `sharp left`, which is both the wrong words and, because
+    `_describe_ramp` keeps the modifier, the wrong arrow beside them.
     """
     if junction in ("roundabout", "circular"):
         return "roundabout"
-    if highway.endswith("_link"):
+    if highway.endswith("_link") and highway[:-len("_link")] in _GRADE_SEPARATED:
         return "ramp"
     return "road"
-
-
-# The classes you "exit" rather than "turn off", and "merge" onto rather than
-# "continue" onto.
-_GRADE_SEPARATED = ("motorway", "trunk")
 
 _ORDINALS = ["", "1st", "2nd", "3rd", "4th", "5th", "6th", "7th", "8th"]
 
@@ -1045,6 +1164,7 @@ class RouteResult:
         # names an exit.
         self.nodes = list(nodes) if nodes is not None else []
         self.context = context
+        self._steps = None      # memo for steps(); see there
 
     def _column(self, name):
         """A route column, or blanks if this result was built without it.
@@ -1121,23 +1241,41 @@ class RouteResult:
         legs = []
         for i, pts in enumerate(self.edge_coords):
             kind = _leg_kind(highways[i], junctions[i])
-            coords = [list(p) for p in pts]
-            fork = ""
+            coords = pts.tolist()
+            fork, arrival = "", None
             if legs:
                 prev = legs[-1]
+                # One arrival heading for the seam, gathered back over
+                # APPROACH_M and reused by everything that asks about it: the
+                # fork test here, the merge test below, and the turn modifier
+                # in `steps`. They used to take their own, and the other two
+                # took it over the previous leg alone — which on a block
+                # shorter than the chord is the corner rounding TURN_CHORD_M
+                # exists to get away from. Measured over 150 routes, that had
+                # five turns announced to the wrong side.
+                arrival = _bearing_in(_approach(legs))
+                departure = _bearing_out(coords)
                 # Whether a straighter road leaves this seam — the thing that
                 # turns a silent merge into a wrong turn. Asked before merging,
                 # because if the answer is yes then merging is exactly what must
                 # not happen, however gentle the bend and however unchanged the
                 # street name.
-                if kind != "roundabout" and self.context is not None:
+                #
+                # Not asked when leaving a rotary. The straighter road there is
+                # the rotary itself, which the driver has just been told to
+                # leave, so the answer is always yes and always useless: 12 of
+                # 150 routes said "Take the 1st exit ... onto X" and then, two
+                # metres later, "Keep right onto X".
+                if (kind != "roundabout" and prev["kind"] != "roundabout"
+                        and self.context is not None):
                     fork = self.context.fork_side(
                         self.nodes[i] if i < len(self.nodes) else -1,
-                        _bearing_in(_approach(legs)), _bearing_out(coords))
+                        arrival, departure)
                 mergeable = prev["kind"] == kind and (
                     kind == "roundabout" or prev["label"] == label(i))
-                if mergeable and not fork and (kind == "roundabout" or abs(_turn_delta(
-                        _bearing_in(prev["coords"]), _bearing_out(coords))) < 45):
+                if mergeable and not fork and (kind == "roundabout"
+                                               or abs(_turn_delta(arrival,
+                                                                  departure)) < 45):
                     prev["coords"].extend(coords[1:])      # drop the shared vertex
                     prev["length_m"] += float(lengths[i])
                     prev["end"] = i + 1
@@ -1147,6 +1285,10 @@ class RouteResult:
             legs.append({
                 "kind": kind, "label": label(i), "highway": highways[i],
                 "fork": fork,
+                # The heading the driver arrives on at this leg's start, over
+                # APPROACH_M of road behind it. None on the first leg, which
+                # nobody arrives at. See the comment above.
+                "arrival": arrival,
                 # The OSM `name` on its own, without the `ref` fallback. A
                 # rotary carrying only a route number is not a rotary *called*
                 # that: "Take the 1st exit at MA 122" reads as though the
@@ -1224,9 +1366,16 @@ class RouteResult:
         The first step sets off, the last announces arrival, and each carries
         the coordinate of its maneuver plus how far that instruction then
         carries you.
+
+        Memoised, because at pref=0 `server/app.py` hands the same RouteResult
+        back under both the fastest and the scenic key, and `geojson()` would
+        otherwise build the whole list twice off identical data.
         """
+        if self._steps is not None:
+            return self._steps
         if not self.edge_coords:
-            return []
+            self._steps = []
+            return self._steps
         legs = self._legs()
         steps = []
 
@@ -1243,8 +1392,9 @@ class RouteResult:
                 where = f" on {leg['label']}" if leg["label"] else ""
                 step["instruction"] = f"Head {_compass(_bearing_out(pts))}{where}"
             else:
-                modifier = _turn_modifier(_bearing_in(previous["coords"]),
-                                          _bearing_out(pts))
+                # The arrival heading `_legs` gathered for this seam, not one
+                # taken over the previous leg alone — see `_legs`.
+                modifier = _turn_modifier(leg["arrival"], _bearing_out(pts))
                 step["modifier"] = modifier
                 if leg["kind"] == "roundabout":
                     self._describe_roundabout(step, leg, legs[i + 1:])
@@ -1266,10 +1416,15 @@ class RouteResult:
                 else:
                     self._describe_turn(step, leg, previous, modifier)
 
-            # A rotary instruction already names the road you leave on, and an
-            # exit already names where the ramp goes. Emitting "Continue on X"
-            # a few metres later says nothing and arrives while the driver is
-            # still in the manoeuvre.
+            # Two instructions the driver cannot act on separately, describing
+            # one junction. A rotary already names the road you leave on and an
+            # exit already names where the ramp goes, so "Continue on X" a few
+            # metres later says nothing and arrives mid-manoeuvre — but the rule
+            # is about the *gap*, not about what kind of road preceded it. Gated
+            # on the previous leg being a rotary or a ramp, it missed the
+            # commonest shape of all: a corner cut across a slip lane, emitting
+            # "Turn right onto Plymouth Street" and then, 8 m on, "Turn right to
+            # stay on Plymouth Street".
             #
             # The same is true when the follow-on is a slight turn rather than a
             # continue — "Take the exit onto Saint James Street" then, 40 m on,
@@ -1282,7 +1437,22 @@ class RouteResult:
             # would leave the driver with nothing to follow for two kilometres.
             # And never for a sharp turn, where which way you go is the
             # instruction and the earlier one did not say.
-            if previous is not None and previous["kind"] in ("roundabout", "ramp"):
+            if previous is not None:
+                # The bound is on the leg being left, and it applies to both
+                # ways of folding — a "Continue" is only redundant when the
+                # instruction it would follow is still on screen. Measured over
+                # 150 routes, charging it to `repeats` alone folded away 104
+                # follow-ons after a leg of 60 m or more, one of them a 759 m
+                # ramp and one leaving 1,636 m of road with nothing to follow.
+                crowded = previous["length_m"] < MIN_INSTRUCTION_GAP_M
+                # A "Continue" is not an action, so it earns its place only
+                # with room on both sides: enough road behind it that the
+                # rotary or exit instruction has been dealt with, and enough
+                # ahead that it is not itself superseded before the driver has
+                # read it. Folding on the near side alone swaps one crowded
+                # pair for another a few metres further on.
+                idle = (step["type"] == "continue"
+                        and (crowded or leg["length_m"] < MIN_INSTRUCTION_GAP_M))
                 # ...but never a fork. That one exists precisely because the
                 # road ahead is not the road to take, so folding it back into
                 # "the same road, already named" is the bug it was written to
@@ -1290,10 +1460,9 @@ class RouteResult:
                 # back into 120 routes.
                 repeats = (step["type"] != "fork"
                            and step["name"] and step["name"] == steps[-1]["name"]
-                           and previous["length_m"] < MIN_INSTRUCTION_GAP_M
                            and step["modifier"] not in ("sharp left", "sharp right",
                                                         "uturn"))
-                if step["type"] == "continue" or repeats:
+                if idle or (crowded and repeats):
                     steps[-1]["distance_m"] += round(leg["length_m"])
                     continue
 
@@ -1308,6 +1477,7 @@ class RouteResult:
                       "exit_ref": "", "destination": "", "roundabout_exit": 0,
                       "lat": round(end[1], 6), "lon": round(end[0], 6),
                       "distance_m": 0})
+        self._steps = steps
         return steps
 
     def _describe_roundabout(self, step, leg, following):

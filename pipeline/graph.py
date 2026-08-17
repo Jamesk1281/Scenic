@@ -252,7 +252,7 @@ class GraphHandler(osmium.SimpleHandler):
             self.node_count[nid] = self.node_count.get(nid, 0) + 1
 
 
-def count_controls(ids, a, b, controls):
+def count_controls(ids, a, b, controls, node_count=None):
     """The traffic controls a driver meets crossing `ids[a:b+1]`, per direction.
 
     Returns a dict of the CONTROL_COLUMNS. A control is charged to the
@@ -274,13 +274,29 @@ def count_controls(ids, a, b, controls):
     segment's first node is charged to neither traversal of *this* edge and to
     the forward traversal of the edge that arrives there, which is exactly the
     driver who has to stop.
+
+    That last rule only means anything on a node one way owns. `direction` is
+    written in the node order of the single way the control governs, and this
+    function runs once per way listing the node — so where several ways meet,
+    "forward" is read as each of their node orders in turn and the delay lands
+    on whichever approaches OSM happened to digitize in that direction.
+    Measured, 5,360 of Massachusetts' 29,772 controls sit exactly on a graph
+    junction node, so a main road can pay for a sign facing the side street
+    one way and nothing the other, and reversing its digitization swaps them.
+    `node_count` identifies those nodes; on them the tag is dropped and the
+    arrival rule above is left to do the work, which charges each approach
+    exactly once — the four-way signal every one of whose approaches faces a
+    red light being the case the tag was getting wrong in both directions.
     """
     counts = dict.fromkeys(CONTROL_COLUMNS, 0)
+    node_count = node_count or {}
     for i in range(a, b + 1):
         found = controls.get(ids[i])
         if not found:
             continue
         kind, direction = found
+        if node_count.get(ids[i], 1) >= 2:
+            direction = ""
         if i > a and direction != "backward":
             counts[f"n_{kind}_fwd"] += 1
         if i < b and direction != "forward":
@@ -326,7 +342,7 @@ def build_edges(ways, node_count, to_m, controls=None):
                 "name": meta["name"], "ref": meta["ref"], "highway": meta["highway"],
                 "junction": meta["junction"],
                 "dest_ref": meta["dest_ref"], "dest_name": meta["dest_name"],
-                **count_controls(ids, a, b, controls),
+                **count_controls(ids, a, b, controls, node_count),
                 "geometry": shapely.LineString(seg),
             })
     return rows
@@ -371,6 +387,16 @@ def resolve_restrictions(edges, restrictions):
         from_rows, to_rows = touching(frm, via), touching(to, via)
         if not from_rows or not to_rows:
             unresolved += 1
+            continue
+        # A no-U-turn is the one kind that routinely names the same way on both
+        # sides, and `build_edges` has already split that way at this junction —
+        # so `to_rows` holds the segment *beyond* the node as well as the one
+        # the driver came in on. The movement being forbidden is leaving by the
+        # segment you arrived on; the other segment is driving straight through.
+        # Banning by way alone here bans the straight-through and never the
+        # U-turn, which is the mainline movement, and a shortest path would
+        # never have made the U-turn anyway.
+        if kind == "no_u_turn" and frm == to:
             continue
         for f in from_rows:
             if kind in NO_TURN:

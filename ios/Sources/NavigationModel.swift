@@ -169,13 +169,28 @@ final class NavigationModel {
     /// genuinely wrong route is not followed far.
     private static let joinGraceSeconds: TimeInterval = 45
 
+    /// How close counts as having *reached* the new line, as opposed to merely
+    /// not being far from it.
+    ///
+    /// Deliberately tighter than `offRouteMeters`. `hasJoinedRoute` can share
+    /// one threshold with the off-route trigger because it is a latch and so
+    /// cannot chatter; `awaitingJoin` is re-armed on every `adopt`, so sharing
+    /// it there gives the loop a way back. A route whose line runs ~60 m off —
+    /// a frontage road, the far carriageway of a divided highway — puts one
+    /// fix inside and the next outside, and the single fix inside clears the
+    /// suppression for good: reroutes then resume at the cooldown, 8 s apart,
+    /// each resetting the banner to the first instruction. The deadband means
+    /// clearing it takes a fix that is actually *on* the road, not one
+    /// hovering at the boundary.
+    private static let joinConfirmMeters: Double = 30
+
     /// True once the driver has reached a newly adopted route, or waited long
     /// enough that they clearly aren't going to.
     private func settleAwaitingJoin(_ here: RouteProgress) {
         guard awaitingJoin else { return }
         let expired = now().timeIntervalSince(awaitingJoinSince ?? .distantPast)
             > Self.joinGraceSeconds
-        if here.offRoute <= Self.offRouteMeters || expired {
+        if here.offRoute <= Self.joinConfirmMeters || expired {
             awaitingJoin = false
             awaitingJoinSince = nil
         }
@@ -488,6 +503,13 @@ final class NavigationModel {
                                                    Self.usableHeading(origin))
         else { return generation == rerouteGeneration ? .failed : .superseded }
         guard generation == rerouteGeneration else { return .superseded }
+        // The drive can end while a reroute is in the air. `update` stops
+        // looking at fixes once `arrived` latches and NavView stops the
+        // location stream with it, so a route adopted after that point is
+        // never corrected: the map redraws a fresh multi-kilometre line under
+        // "You've arrived", and `remainingMeters` goes from 0 back to a whole
+        // new trip, with no fix left to undo either.
+        guard !arrived else { return .superseded }
 
         adopt(wantFastest ? response.fastest : response.scenic, reason: reason)
         // Count the driver as on the route even though they are not on it yet:

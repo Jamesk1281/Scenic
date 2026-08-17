@@ -8,13 +8,17 @@ import sys
 
 import pytest
 
-from conftest import DATA, ROOT
+from conftest import DATA, ROOT, ROUTER_DATA
 
 
 @pytest.fixture(scope="session")
 def client():
-    if not (DATA / "graph_edges.parquet").exists():
-        pytest.skip("built graph missing — run the pipeline first")
+    # The whole set: importing `app` builds a Router at module scope, and that
+    # raises on any one of them missing rather than degrading.
+    missing = [f for f in ROUTER_DATA if not (DATA / f).exists()]
+    if missing:
+        pytest.skip(f"built graph missing ({', '.join(missing)}) — "
+                    "run the pipeline first")
     import os
     os.environ.setdefault("SCENIC_DATA", str(DATA))
     sys.path.insert(0, str(ROOT / "server"))

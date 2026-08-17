@@ -93,19 +93,36 @@ struct RouteStep: Decodable, Identifiable {
     /// The icon for this step, refined by the turn direction where there is
     /// one — a left turn and a right turn are the same `type`, and the arrow
     /// is the part a driver reads at a glance.
+    /// Exits and forks carry a side too, and this used to ignore it: an `exit`
+    /// drew a hardcoded right arrow next to "Take the exit on the left", and
+    /// "Keep left" and "Keep right" drew the same branch glyph. A fork is the
+    /// one maneuver whose *entire* content is which side to hold, so that was
+    /// the arrow with the least to say and the most riding on it.
     var symbol: String {
-        guard maneuver == .turn, let modifier else { return maneuver.symbol }
-        switch modifier {
-        case "left":         return "arrow.turn.up.left"
-        case "right":        return "arrow.turn.up.right"
-        case "slight left":  return "arrow.up.left"
-        case "slight right": return "arrow.up.right"
-        case "sharp left":   return "arrow.uturn.left"
-        case "sharp right":  return "arrow.uturn.right"
-        case "uturn":        return "arrow.uturn.down"
-        default:             return "arrow.up"
+        switch maneuver {
+        case .turn:
+            switch modifier ?? "" {
+            case "left":         return "arrow.turn.up.left"
+            case "right":        return "arrow.turn.up.right"
+            case "slight left":  return "arrow.up.left"
+            case "slight right": return "arrow.up.right"
+            case "sharp left":   return "arrow.uturn.left"
+            case "sharp right":  return "arrow.uturn.right"
+            case "uturn":        return "arrow.uturn.down"
+            default:             return maneuver.symbol
+            }
+        case .exit: return leansLeft ? "arrow.turn.up.left" : "arrow.turn.up.right"
+        // Leaning rather than pointing — a fork is not a turn, and an arrow
+        // that says one would be worse than none.
+        case .fork: return leansLeft ? "arrow.up.left" : "arrow.up.right"
+        default:    return maneuver.symbol
         }
     }
+
+    /// Which way the modifier leans. Right is the fallback because it is the
+    /// common side for both maneuvers that use this, and because the server's
+    /// own wording falls back the same way.
+    private var leansLeft: Bool { modifier?.hasSuffix("left") ?? false }
 
     var id: String { "\(lat),\(lon),\(instruction)" }
     var coordinate: CLLocationCoordinate2D {

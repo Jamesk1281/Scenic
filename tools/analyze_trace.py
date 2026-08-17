@@ -160,14 +160,35 @@ CONTROL_NEAR_M = 45.0
 # point is where the route changes road, which is the junction itself.
 MANEUVER_NEAR_M = 35.0
 
-# Which of router.py's steps are actually turns. It also emits "Head <compass>
-# on X" at the trip start, "Continue on X" where a leg seam is under 20 degrees
-# (the road merely changes name), and "Arrive at your destination" at the end —
-# none of which is a junction a car stops at. Counting them blamed idling at the
-# start point, whose coordinate *is* step 0, on "a turn", and _stop_report then
-# folded that into the structural share it describes as predictable from OSM —
-# corrupting the signals-vs-congestion split the exercise turns on.
-TURN_PREFIXES = ("Turn", "Slight", "Sharp")
+# Which of router.py's steps are actually junctions a car can stop at. It also
+# emits "Head <compass> on X" at the trip start, "Continue on X" where a leg
+# seam is under 20 degrees (the road merely changes name), and "Arrive at your
+# destination" at the end — none of which is one. Counting them blamed idling at
+# the start point, whose coordinate *is* step 0, on "a turn", and _stop_report
+# then folded that into the structural share it describes as predictable from
+# OSM — corrupting the signals-vs-congestion split the exercise turns on.
+#
+# Read off the step's `type`, which router.py sends on every step and
+# DriveTrace records, rather than off the English. Matching prose was already
+# wrong once: rotaries, exits, merges and forks got their own wordings and
+# stopped matching a prefix list written against the old ones, so every stop at
+# a rotary silently became "unexplained — traffic" and inflated the congestion
+# share that CONTROL_SECONDS is fitted around.
+MANEUVER_TYPES = {"turn", "roundabout", "exit", "merge", "fork"}
+
+# The fallback for traces recorded before the app logged `type`. Covers the
+# current vocabulary as well as the old one — "Keep left", "Merge onto X",
+# "Take the 2nd exit", "Make a U-turn" — because a trace can predate the type
+# and still postdate the wording.
+TURN_PREFIXES = ("Turn", "Slight", "Sharp", "Keep", "Merge", "Take", "Make")
+
+
+def is_maneuver(step) -> bool:
+    """Whether a route step is a junction, not a start, a name change or an end."""
+    kind = str(step.get("type", "") or "")
+    if kind:
+        return kind in MANEUVER_TYPES
+    return str(step.get("instruction", "")).startswith(TURN_PREFIXES)
 
 # Altitude noise on a phone is metres, and one step covers ~15 m of road. Rise
 # over run with a run that short is almost entirely noise: ±1.5 m of residual
@@ -658,7 +679,7 @@ def report(paths, edges, control=None):
 
         drive_stops = stops(drive_steps)
         maneuvers = [s for route, _ in parts for s in route.get("steps", [])
-                     if str(s.get("instruction", "")).startswith(TURN_PREFIXES)]
+                     if is_maneuver(s)]
         drive_stops = classify_stops(drive_stops, control, maneuvers)
         stopped_min = drive_stops.seconds.sum() / 60.0
         print(f"  stopped  {stopped_min:5.1f} min over {len(drive_stops)} stops"

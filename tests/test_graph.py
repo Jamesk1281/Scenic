@@ -186,6 +186,32 @@ class TestControlCounting:
             counts = count_controls(self.IDS, 0, 2, {11: ("giveway", tag)})
             assert counts["n_giveway_fwd"] == counts["n_giveway_rev"] == 1
 
+    def test_a_direction_tag_is_ignored_where_several_ways_meet(self):
+        """`direction` is written in the node order of the *one* way the control
+        governs, and count_controls runs once per way that lists the node. At a
+        shared junction those are different ways, so "forward" gets read as each
+        of their node orders in turn and the delay lands on whichever approaches
+        OSM happened to digitize that way. 5,360 of Massachusetts' 29,772
+        controls sit on such a node. There the tag is dropped and the
+        arrive-only rule is left to charge each approach exactly once.
+        """
+        shared = {11: 2}                          # node 11 is where two ways meet
+        controls = {11: ("stop", "forward")}
+        arriving = count_controls(self.IDS, 0, 1, controls, shared)
+        leaving = count_controls(self.IDS, 1, 2, controls, shared)
+
+        # Both approaches to the junction pay, and neither departure does.
+        assert arriving["n_stop_fwd"] == 1 and arriving["n_stop_rev"] == 0
+        assert leaving["n_stop_rev"] == 1 and leaving["n_stop_fwd"] == 0
+
+    def test_a_direction_tag_still_counts_on_a_way_that_owns_the_node(self):
+        """The other 82%: a sign mid-way, on a node no other way touches, still
+        costs the direction it faces and nothing to the traffic behind it."""
+        counts = count_controls(self.IDS, 0, 2, {11: ("stop", "forward")},
+                                {11: 1})
+        assert counts["n_stop_fwd"] == 1
+        assert counts["n_stop_rev"] == 0
+
     def test_a_road_with_no_controls_carries_every_column_as_zero(self):
         """The columns have to exist on every edge — a missing one becomes NaN
         in the parquet and NaN minutes in the router."""

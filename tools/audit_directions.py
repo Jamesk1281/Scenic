@@ -234,7 +234,7 @@ def silent_forks(router, result, steps):
         # way at every junction, and a 10 m block between two of them would
         # otherwise put the whole measurement back on the noise it is avoiding.
         arrival = _bearing_in(_approach(result.edge_coords, i))
-        taken = abs(_turn_delta(arrival, _bearing_out(result.edge_coords[i])))
+        taken = _turn_delta(arrival, _bearing_out(result.edge_coords[i]))
         node = result.nodes[i]
 
         straighter, close = False, False
@@ -242,14 +242,21 @@ def silent_forks(router, result, steps):
             coords = router.slot_coords(slot)
             if len(coords) < 2:
                 continue
-            rival = abs(_turn_delta(arrival, _bearing_out(coords)))
+            # Signed, and compared signed — as `ManeuverContext.fork_side`
+            # does. Taking abs() of both first measures the difference of two
+            # turn *magnitudes* rather than the angle between the two roads,
+            # which is wrong in both directions: a route bearing +5 past a
+            # rival at -40 are 45 degrees apart and were being booked as an
+            # ambiguous fork, while a genuine +30/-30 Y-fork came out as a
+            # difference of zero and was discarded as the road the route takes.
+            rival = _turn_delta(arrival, _bearing_out(coords))
             # The road you came in on is not a rival: leaving by it is a U-turn,
             # which no driver makes by carrying straight on.
-            if rival > 150:
+            if abs(rival) > 150:
                 continue
             if abs(rival - taken) < 1e-6:
                 continue        # this is the road the route takes
-            if rival < taken:
+            if abs(rival) < abs(taken):
                 straighter = True
             if abs(rival - taken) < FORK_DEGREES:
                 close = True

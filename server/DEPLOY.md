@@ -129,11 +129,16 @@ the first two are the usual Windows build headaches.
 .venv/bin/python -m pytest tests/
 ```
 
-With only the two graph parquets present, expect **186 passed, 3 skipped** — the
-skips need `scored_chunks.parquet`, a pipeline artifact the server never reads.
-What matters is that nothing *fails*: a failure here means the data and the code
+With all three parquets copied over, expect **191 passed, 0 skipped**. With none
+of them — a fresh clone — expect **132 passed, 59 skipped**: everything that
+needs a built graph steps aside cleanly rather than erroring, so a skip here
+means "the data isn't here yet" and never "the data is wrong".
+
+What matters is that nothing *fails*: a failure means the data and the code
 disagree. (Count the skips, not the passes — the pass count moves whenever a
-test is added, and a stale number in this file is its own false alarm.)
+test is added, and a stale number in this file is its own false alarm.) If you
+see *errors* rather than skips, the graph is present but partial — most likely
+`turn_restrictions.parquet` never made it across.
 
 ### 4. Run the API
 

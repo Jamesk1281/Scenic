@@ -17,6 +17,12 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 DATA = Path(os.environ.get("SCENIC_DATA", ROOT / "data" / "processed"))
 
+# Everything `Router.__init__` reads. It raises on any one of them being
+# absent, so anything that builds a Router has to require the whole set or the
+# skip below turns into an error.
+ROUTER_DATA = ("graph_edges.parquet", "graph_nodes.parquet",
+               "turn_restrictions.parquet")
+
 
 def _require(*files):
     missing = [f for f in files if not (DATA / f).exists()]
@@ -41,7 +47,13 @@ def edges():
 
 @pytest.fixture(scope="session")
 def router():
-    """A loaded Router. Slow to build, so it is shared across the session."""
-    _require("graph_edges.parquet", "graph_nodes.parquet")
+    """A loaded Router. Slow to build, so it is shared across the session.
+
+    All three parquets, because `Router` refuses to load without the
+    restriction table — so naming only the first two here turns "the data
+    isn't built" from a clean skip into an error in fixture setup, on exactly
+    the box `server/DEPLOY.md` tells the operator to read this run on.
+    """
+    _require(*ROUTER_DATA)
     from router import Router
     return Router(str(DATA))

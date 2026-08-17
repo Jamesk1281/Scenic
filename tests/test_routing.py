@@ -253,7 +253,7 @@ class TestManeuverGeneration:
         the ramp says it goes, then the road it actually joins."""
         legs = [
             ([_point(0, 0), _point(0, 200)], "", "primary", "", "", ""),
-            ([_point(0, 200), _point(*_along(30, 150))], "", "primary_link", "", "", ""),
+            ([_point(0, 200), _point(*_along(30, 150))], "", "motorway_link", "", "", ""),
             ([_point(*_along(30, 150)), _point(200, 400)], "Chestnut Street", "primary", "", "", ""),
         ]
         steps = self._result(legs, nodes=[0, 1, 2, 3],
@@ -559,15 +559,21 @@ class TestRoutingOverTheGraph:
         way you came. The first test drive did exactly that. With a heading,
         snap should take the end ahead of the driver instead — and the two
         opposite headings on one road must give the two different ends.
+
+        The heading fed in is the road's own tangent, because that is the
+        heading a driver on it actually has. Asking instead for the straight
+        line to an endpoint — which is what this test used to do — is both
+        unphysical and circular: on a ramp that turns through more than 90
+        degrees the far end lies *behind* the driver as the crow flies, so the
+        straight-line answer is the junction they just left, and a `snap` that
+        agreed with it was agreeing with the bug. The chord below is taken off
+        `interpolate`, independently of how `_forward_end` finds its tangent.
         """
         import math
 
         import numpy as np
 
         node_id = router.nodes["node_id"].to_numpy()
-        lat = router.nodes["lat"].to_numpy()
-        lon = router.nodes["lon"].to_numpy()
-        row_of = {int(nid): k for k, nid in enumerate(node_id)}
         edges = router.edges
         u, v = edges["u"].to_numpy(), edges["v"].to_numpy()
 
@@ -585,7 +591,8 @@ class TestRoutingOverTheGraph:
         candidates = np.where(edges["length_m"].to_numpy() > 200)[0]
         checked = wrong = 0
         for i in rng.choice(candidates, size=150, replace=False):
-            mid = edges.geometry.values[i].interpolate(0.5, normalized=True)
+            line = edges.geometry.values[i]
+            mid = line.interpolate(0.5, normalized=True)
             a, b = int(u[i]), int(v[i])
             # Only meaningful where the nearest road really is this one; a
             # parallel service road would otherwise put us on a different edge
@@ -593,10 +600,14 @@ class TestRoutingOverTheGraph:
             if node_id[router.snap(mid.y, mid.x)[0]] not in (a, b):
                 continue
             checked += 1
-            toward_a = bearing(mid.y, mid.x, lat[row_of[a]], lon[row_of[a]])
-            toward_b = bearing(mid.y, mid.x, lat[row_of[b]], lon[row_of[b]])
-            got_a = node_id[router.snap(mid.y, mid.x, heading=toward_a)[0]]
-            got_b = node_id[router.snap(mid.y, mid.x, heading=toward_b)[0]]
+            # Driving the geometry's own direction takes you to v; turn round
+            # and it takes you to u.
+            back = line.interpolate(0.45, normalized=True)
+            ahead = line.interpolate(0.55, normalized=True)
+            along = bearing(back.y, back.x, ahead.y, ahead.x)
+            got_b = node_id[router.snap(mid.y, mid.x, heading=along)[0]]
+            got_a = node_id[router.snap(mid.y, mid.x,
+                                        heading=(along + 180.0) % 360.0)[0]]
             if got_a != a or got_b != b:
                 wrong += 1
         assert checked > 100, "too few usable samples to conclude anything"
