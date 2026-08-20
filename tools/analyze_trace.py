@@ -2,7 +2,7 @@
 
     .venv/bin/python tools/analyze_trace.py data/processed traces/*.ndjson
 
-The router's travel times are free-flow — `length / speed_limit`, with nothing
+The *graph's* travel times are free-flow — `length / speed_limit`, with nothing
 charged for lights, stop signs, turns or traffic (`SPEED_KMH` in graph.py). That
 is known to be optimistic. This turns "known" into a number, and splits it into
 the two separate defects it is made of, because they need different fixes:
@@ -22,6 +22,14 @@ Adding the speed factor and the junction cost together and calling it one fudge
 factor would fit this drive and nothing else: they scale with different things
 (distance vs. junction count), so a route with twice the intersections needs a
 different correction, and only the split can tell you that.
+
+Both corrections landed on 2026-08-15 and live in `router.py`, which applies
+them when it loads the graph — so **the numbers here are the uncorrected
+baseline, not what the app told the driver.** Nothing in this file reads
+`SPEED_FACTOR` or `CONTROL_SECONDS`, deliberately: a measurement that already
+had the correction folded in could not be used to re-fit it. For the corrected
+error, and to re-fit either table from a new drive, run
+`tools/fit_junction_cost.py` over the same traces.
 
 There is a third, smaller question the trace can answer — whether the back roads
 are slow because of the corners or because of the climb — reported as measured
@@ -1046,9 +1054,22 @@ def report(paths, edges, control=None):
         # Like for like: matched ground on both sides of the ratio. See headline().
         print(f"ALL DRIVES  {total['km']:.1f} km driven, of which {total['matched_km']:.1f} km "
               f"snapped to a road")
+        # "the graph", not "the router". Everything above is priced from each
+        # edge's stored `minutes`, which is free-flow: router.py multiplies by
+        # SPEED_FACTOR and adds CONTROL_SECONDS when it loads, and none of that
+        # is in the parquet. So this is the *uncorrected* baseline — the number
+        # the corrections exist to close, and the input to fit_junction_cost.py,
+        # not a verdict on what the app told the driver. Labelled "the router"
+        # until 2026-08-20, which reads as a regression report on a correction
+        # that is working: the same two drives are 5.7% pooled once it is applied.
         print(f"            {total['matched_min']:.1f} min actual vs "
               f"{total['predicted_min']:.1f} min predicted for that ground "
-              f"→ the router is {1 - total['predicted_min'] / total['matched_min']:.0%} optimistic")
+              f"→ the graph's free-flow times are "
+              f"{1 - total['predicted_min'] / total['matched_min']:.0%} optimistic")
+        print("            (before SPEED_FACTOR and CONTROL_SECONDS, which "
+              "router.py applies at load —")
+        print("             run tools/fit_junction_cost.py for the corrected "
+              "error, and to re-fit them)")
     print()
 
     # Before the timing chain, and never inside it: this is the only section that
