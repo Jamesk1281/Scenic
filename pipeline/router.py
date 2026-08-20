@@ -28,6 +28,7 @@ writes out/route_fastest.geojson and out/route_scenic.geojson.
 import json
 import math
 import sys
+import warnings
 from functools import cached_property
 from pathlib import Path
 
@@ -257,8 +258,8 @@ class Router:
             raise RuntimeError(
                 f"the graph is missing {', '.join(missing)} — it was built "
                 "before turn-by-turn maneuvers and junction timing needed those "
-                "tags. Rerun pipeline/graph.py and copy BOTH parquets over; see "
-                "server/DEPLOY.md."
+                "tags. Rerun pipeline/graph.py and copy ALL THREE parquets "
+                "over; see server/DEPLOY.md."
             )
 
     @cached_property
@@ -484,13 +485,58 @@ class Router:
                 # Nothing in the plan explains the strandings, so there is no
                 # subset to fall back to. Enforce none of them rather than
                 # serve a graph with roads no route can reach.
+                #
+                # Said out loud, because the consequence is invisible: every
+                # restriction in the state goes unenforced and routes go back to
+                # instructing turns the map forbids, while the graph still loads
+                # and every test still passes. `_strands` only blames a split
+                # whose removed exit points *directly* at a stranded node, so a
+                # pocket stranded two hops out lands here rather than being
+                # thinned. If this ever prints, that one-hop attribution is the
+                # thing to widen.
+                warnings.warn(
+                    f"turn restrictions disabled entirely: {len(stranded)} "
+                    "junction(s) lost their last way in and no split in the "
+                    "plan explains it, so none of the "
+                    f"{len(plan)} splits could be applied. Routes may now "
+                    "contain turns OSM forbids.", RuntimeWarning, stacklevel=2)
                 return []
             plan = renumber(kept)
+        else:
+            # Fell out of the loop with the last thinning untested. Returning
+            # `plan` here would ship exactly the disconnected graph this
+            # function exists to prevent, so check it once more and give the
+            # restrictions up if it is still stranding.
+            tail, head = self._candidate_ends(plan)
+            size = self.n + len(plan)
+            g = csr_matrix((np.ones(len(tail)), (tail, head)), shape=(size, size))
+            if connected_components(g, directed=True,
+                                    connection="strong")[0] != 1:
+                warnings.warn(
+                    "turn restrictions disabled entirely: the split plan still "
+                    "cuts the network into more than one strongly connected "
+                    "piece after 8 thinning rounds.", RuntimeWarning,
+                    stacklevel=2)
+                return []
         return plan
 
     @cached_property
     def _by_tail(self):
         return self._group(self.tail, self.n)
+
+    @cached_property
+    def _dep_bearing(self):
+        """Per directed slot, its departure bearing, or NaN until first asked.
+
+        float64 and not float32 deliberately. `ManeuverContext.fork_side`
+        identifies the road the route itself takes by `abs(delta - wanted) <
+        1e-6`, and float32 carries about 1e-5 degrees here — enough to miss that
+        test, stop excluding the route's own road, and turn it into its own
+        "straighter rival". The 3 MB saved would buy a spurious fork. At float64
+        the cached value is bit-identical to the one computed in place, so
+        memoizing changes nothing but the time.
+        """
+        return np.full(len(self.tail), np.nan)
 
     def outgoing_slots(self, node_idx):
         """Every directed edge leaving a junction, as slot indices.
@@ -511,16 +557,35 @@ class Router:
 
         What the step generator needs to know whether "carry on" is an
         instruction or a trap. Computed on demand rather than precomputed for
-        all 750,000 directed edges: a route asks about a few hundred junctions
-        and three roads each, which is a millisecond, against a table that would
-        cost seconds at every startup to answer questions almost none of it is
-        ever asked.
+        all 750,000 directed edges, which would cost seconds at every startup to
+        answer questions almost none of it is ever asked.
+
+        Memoized per slot, though, because "on demand" was being re-paid on
+        every request for values that cannot change: a slot's first
+        `TURN_CHORD_M` is a property of the graph, not of the trip. Measured on
+        one Boston-Pittsfield request, 1,586 calls here drove 3,590
+        `shapely.get_coordinates` calls and 29 ms — 58-60% of all step
+        generation, and paid again for the fastest result and the scenic one. It
+        matters most on a reroute, where the junctions are the ones already
+        asked about: the junction set of a mid-drive reroute overlapped the route
+        it replaced 1,026 of 1,026. The table is one float per slot (6 MB, see
+        `_dep_bearing` for why not half that) and starts empty, so nothing is
+        paid at startup for roads never driven.
         """
+        slots = self.outgoing_slots(node_idx)
+        cache = self._dep_bearing
         out = []
-        for slot in self.outgoing_slots(node_idx):
+        for slot in slots:
+            cached = cache[slot]
+            if not math.isnan(cached):
+                out.append(float(cached))
+                continue
             coords = self.slot_coords(slot)
-            if len(coords) >= 2:
-                out.append(_bearing_out(coords))
+            if len(coords) < 2:
+                continue        # no bearing to have; not cacheable as a number
+            bearing = _bearing_out(coords)
+            cache[slot] = bearing
+            out.append(bearing)
         return out
 
     @staticmethod

@@ -167,4 +167,26 @@ final class ModelsTests: XCTestCase {
         XCTAssertNotEqual(decode("left").symbol, decode("right").symbol)
         XCTAssertNotEqual(decode("left").symbol, decode("slight left").symbol)
     }
+
+    /// A course just short of due north must not round its way out of the range
+    /// the server accepts. `%.1f` turns 359.97 into "360.0", and both
+    /// `_parse_heading` and `Router.snap` take a half-open 0..<360 — so the
+    /// heading was silently dropped and the reroute fell back to nearer-end
+    /// snapping precisely when a driver was heading north.
+    func test_a_heading_just_short_of_north_stays_in_range() {
+        for course in [359.95, 359.97, 359.99, 360.0] {
+            let sent = RouteService.headingParameter(course)
+            XCTAssertEqual(sent, "0.0",
+                           "course \(course) was sent as \(sent), which the server drops")
+        }
+    }
+
+    /// ...without disturbing the ordinary cases, including the one the existing
+    /// reroute test covers.
+    func test_ordinary_headings_are_sent_to_one_decimal() {
+        XCTAssertEqual(RouteService.headingParameter(0), "0.0")
+        XCTAssertEqual(RouteService.headingParameter(90), "90.0")
+        XCTAssertEqual(RouteService.headingParameter(182.44), "182.4")
+        XCTAssertEqual(RouteService.headingParameter(359.9), "359.9")
+    }
 }

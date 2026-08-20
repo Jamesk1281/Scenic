@@ -55,7 +55,12 @@ Compress(app)
 
 print(f"loading graph from {PROCESSED} ...")
 ROUTER = Router(PROCESSED)
-print(f"ready: {ROUTER.n:,} nodes")
+# len(ROUTER.nodes), not ROUTER.n: the router overwrites `n` with the
+# turn-restriction-expanded index count (~+1.2%), so reporting it here made
+# /api/health disagree with graph_nodes.parquet after a code-only deploy on
+# identical data — a false alarm in the one number a smoke check compares.
+print(f"ready: {len(ROUTER.nodes):,} nodes "
+      f"({ROUTER.n:,} routing slots after turn-restriction splits)")
 
 
 def _parse_ll(s: str):
@@ -73,16 +78,25 @@ def _parse_heading(args):
     whole route over it would turn a missing heading into a failed reroute.
 
     Dropped, specifically, and never wrapped: `-1 % 360` is 359, so normalising
-    the range would turn "I don't know which way I'm facing" into a confident
+    a *negative* would turn "I don't know which way I'm facing" into a confident
     due-north, and point the reroute at the wrong end of the road.
+
+    Exactly 360.0 is the one value folded rather than dropped, because it is not
+    a client error — it is what rounding a legal course to one decimal produces.
+    A driver headed due north reports 359.97, which any `%.1f` formatter sends as
+    "360.0"; dropping that fell back to nearer-end snapping precisely when the
+    heading was most worth having. Folding is safe here and not above because
+    the sign check has already run.
     """
     raw = args.get("heading")
     if raw is None or raw == "":
         return None
     value = float(raw)          # a non-numeric heading is a real bad request
+    if value < 0.0 or value > 360.0:
+        return None
     # The same 0..360 window `Router.snap` accepts, so both layers agree on
     # what "usable" means rather than each having its own idea.
-    return value if 0.0 <= value < 360.0 else None
+    return value % 360.0
 
 
 def _parse_weights(args):
@@ -135,7 +149,8 @@ def api_route():
 
 @app.get("/api/health")
 def health():
-    return jsonify(status="ok", nodes=ROUTER.n)
+    return jsonify(status="ok", nodes=len(ROUTER.nodes),
+                   routing_slots=ROUTER.n)
 
 
 @app.get("/")
@@ -151,7 +166,8 @@ def index():
     return jsonify(
         service="scenic-api",
         status="ok",
-        nodes=ROUTER.n,
+        nodes=len(ROUTER.nodes),
+        routing_slots=ROUTER.n,
         endpoints={
             "/api/route": "from=LAT,LON&to=LAT,LON[&pref=0..1][&w_<type>=0..4]",
             "/api/health": "liveness check",

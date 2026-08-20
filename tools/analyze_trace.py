@@ -184,9 +184,20 @@ TURN_PREFIXES = ("Turn", "Slight", "Sharp", "Keep", "Merge", "Take", "Make")
 
 
 def is_maneuver(step) -> bool:
-    """Whether a route step is a junction, not a start, a name change or an end."""
+    """Whether a route step is a junction, not a start, a name change or an end.
+
+    `"unknown"` counts as *no* type, not as an unrecognised one. The app decodes
+    a missing `type` to `ManeuverType.unknown`, whose rawValue is the string
+    "unknown", and older builds wrote that into the trace — so treating any
+    non-empty string as authoritative suppressed the fallback below for every
+    step of such a drive, made `maneuvers` empty, and had `classify_stops` book
+    every stop at every junction as "unexplained — traffic". That inflates the
+    congestion share this file exists to separate out, which is the share
+    CONTROL_SECONDS is fitted against. The app now emits "" instead; this keeps
+    the traces already on disk readable.
+    """
     kind = str(step.get("type", "") or "")
-    if kind:
+    if kind and kind != "unknown":
         return kind in MANEUVER_TYPES
     return str(step.get("instruction", "")).startswith(TURN_PREFIXES)
 

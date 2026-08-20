@@ -134,9 +134,16 @@ def _along(bearing_deg, metres):
 class TestManeuverGeneration:
     """The four things the first test drive got wrong."""
 
-    def _result(self, legs, nodes=None, context=None):
+    def _result(self, legs, nodes=None, context=None, lengths=None):
         """`legs` is a list of (coords, name, highway, junction, dest_ref,
-        dest_name)."""
+        dest_name).
+
+        `lengths` overrides the per-edge `length_m`, which otherwise defaults to
+        100 m each. It has to be settable to reach anything gated on
+        MIN_INSTRUCTION_GAP_M (60 m): with every leg at 100 m no fixture can
+        make two instructions crowd each other, which is why the step-folding
+        rules had no tests at all.
+        """
         import geopandas as gpd
         rows = gpd.GeoDataFrame(
             {"name": [x[1] for x in legs],
@@ -145,7 +152,8 @@ class TestManeuverGeneration:
              "junction": [x[3] for x in legs],
              "dest_ref": [x[4] for x in legs],
              "dest_name": [x[5] for x in legs],
-             "length_m": [100.0] * len(legs),
+             "length_m": ([100.0] * len(legs) if lengths is None
+                          else [float(v) for v in lengths]),
              "geometry": [shapely.LineString(x[0]) for x in legs]},
             crs=4326,
         )
@@ -292,6 +300,87 @@ class TestManeuverGeneration:
                                  "lat", "lon", "distance_m"}
 
 
+class TestCrowdedInstructionsAreFolded:
+    """The only code in the router that *deletes* a maneuver, and it had no
+    tests — `grep MIN_INSTRUCTION_GAP tests/` came back empty.
+
+    Worth its own class because the rule is a four-way predicate over two legs
+    and the failure modes point in opposite directions: fold too eagerly and a
+    real instruction disappears silently; fold too little and the driver gets
+    two instructions for one junction, 8 m apart, which is what it was written
+    to stop (measured: 50 crowded same-name pairs over 120 routes, down to 10).
+
+    The fixtures below are the documented shape — "Take the exit onto Saint
+    James Street" followed by "Continue onto Saint James Street" — and the pairs
+    differ *only* in `length_m`, so they pin the boundary itself rather than the
+    wording either side of it.
+    """
+
+    _result = TestManeuverGeneration._result
+
+    def _ramp_then_road(self, ramp_m):
+        """Motorway, then a ramp of `ramp_m`, then a road sharing the ramp's
+        name. Geometry is fixed; only the charged length changes."""
+        p0, p1 = _point(0, 0), _point(0, 300)
+        de, dn = _along(30, 40)
+        p2 = _point(de, 300 + dn)
+        oe, on = _along(45, 300)
+        p3 = _point(de + oe, 300 + dn + on)
+        legs = [
+            ([p0, p1], "I-90", "motorway", "", "", ""),
+            ([p1, p2], "Saint James Street", "motorway_link", "", "", ""),
+            ([p2, p3], "Saint James Street", "tertiary", "", "", ""),
+        ]
+        return self._result(legs, lengths=[300.0, ramp_m, 300.0]).steps()
+
+    def test_a_follow_on_for_the_road_just_named_is_folded_away(self):
+        """A 40 m ramp cannot carry two instructions. The exit already names the
+        road, so "Continue onto Saint James Street" 40 m later says nothing new
+        and arrives mid-manoeuvre."""
+        steps = self._ramp_then_road(40.0)
+        assert [s["type"] for s in steps] == ["depart", "exit", "arrive"], \
+            f"expected the follow-on folded away, got {[s['type'] for s in steps]}"
+        assert steps[1]["instruction"] == "Take the exit onto Saint James Street"
+
+    def test_the_same_follow_on_survives_on_a_long_ramp(self):
+        """The bound that keeps this from swallowing real events: the merge at
+        the end of a long ramp is its own instruction. Identical fixture, one
+        number changed."""
+        steps = self._ramp_then_road(300.0)
+        assert [s["type"] for s in steps] == \
+            ["depart", "exit", "continue", "arrive"], \
+            f"a 300 m ramp's follow-on was folded: {[s['type'] for s in steps]}"
+        assert steps[2]["instruction"] == "Continue onto Saint James Street"
+
+    @pytest.mark.parametrize("ramp_m", [40.0, 300.0])
+    def test_folding_never_loses_distance(self, ramp_m):
+        """Whatever is folded, the metres are carried onto the step that
+        absorbed it. Dropping them would under-report the trip and leave the
+        banner counting down to a junction that is further away than it says."""
+        steps = self._ramp_then_road(ramp_m)
+        assert sum(s["distance_m"] for s in steps) == \
+            pytest.approx(300.0 + ramp_m + 300.0)
+
+    def test_a_sharp_turn_is_not_folded_even_when_crowded(self):
+        """`repeats` exempts sharp turns and U-turns by name. A hairpin off a
+        20 m block keeps the same street name and is still the one thing on the
+        route a driver absolutely has to be told about."""
+        p0, p1 = _point(0, 0), _point(0, 100)
+        de, dn = _along(90, 20)
+        p2 = _point(de, 100 + dn)
+        be, bn = _along(200, 200)
+        p3 = _point(de + be, 100 + dn + bn)
+        steps = self._result([
+            ([p0, p1], "A Street", "residential", "", "", ""),
+            ([p1, p2], "B Street", "residential", "", "", ""),
+            ([p2, p3], "B Street", "residential", "", "", ""),
+        ], lengths=[100.0, 20.0, 200.0]).steps()
+        modifiers = [s["modifier"] for s in steps]
+        assert "uturn" in modifiers, \
+            f"the hairpin was folded or softened away: {modifiers}"
+        assert sum(s["distance_m"] for s in steps) == pytest.approx(320.0)
+
+
 class TestStaleGraphIsRefused:
     def test_a_graph_without_the_maneuver_tags_is_refused_loudly(self):
         """A graph built before this rework still loads and still routes — it
@@ -367,14 +456,78 @@ class TestTurnRestrictions:
                 break
         assert checked > 50, "not enough resolved restrictions to check"
 
+    def test_no_route_makes_a_turn_the_map_forbids(self, router):
+        """The property the whole split mechanism exists for, asserted on routes.
+
+        The two tests above check the *mechanism* — that a copy exists and lacks
+        the forbidden exit. Neither can see under-enforcement: they `continue`
+        past every restriction that did not produce a copy, so a regression that
+        enforced 51 of 4,538 would leave both green. And the defect being fixed
+        was never a property of a junction, it was a property of a drive: "7 of
+        40 random long Massachusetts routes told the driver to make a turn the
+        map forbids."
+
+        So: drive real routes and read the turns back off them. This also covers
+        `_keep_network_reachable` returning `[]`, which disables every
+        restriction at once and is otherwise visible only as a warning.
+        """
+        forbidden = {
+            (int(via), int(f), int(t))
+            for via, f, t in router.restrictions[
+                ["via_node", "from_edge", "to_edge"]].itertuples(index=False)
+        }
+        assert forbidden, "no restrictions to check"
+
+        node_id = router.nodes["node_id"].to_numpy()
+        rng = np.random.default_rng(11)
+        n = len(router.nodes)
+        violations, routed = [], 0
+        for _ in range(300):
+            if routed >= 30:
+                break
+            a, b = (int(x) for x in rng.integers(0, n, 2))
+            route = router.route(a, b, 0.7)
+            if route is None or len(route.edges) < 3:
+                continue
+            routed += 1
+            # `nodes` is one longer than `edges`: nodes[i] is the junction the
+            # driver reaches at the end of edge i - 1 and leaves by edge i.
+            rows = list(route.edges.index)
+            for i in range(1, len(rows)):
+                via = int(node_id[route.nodes[i]])
+                triple = (via, int(rows[i - 1]), int(rows[i]))
+                if triple in forbidden:
+                    violations.append(triple)
+        assert routed >= 20, f"only {routed} routes succeeded"
+        assert not violations, (
+            f"{len(violations)} forbidden turn(s) over {routed} routes: "
+            f"{violations[:5]}")
+
     def test_arriving_at_a_split_junction_still_works(self, router):
         """Arriving is never the forbidden part — only continuing through — so
-        a route *to* a split junction must find it from any direction."""
-        v = next(iter(router.node_copies))
-        lat, lon = router.nodes["lat"].iat[v], router.nodes["lon"].iat[v]
+        a route *to* a split junction must find it from any direction.
+
+        The junction has to be one with **no in-edges under its own index**, or
+        this tests nothing. A junction only some of whose approaches were
+        redirected keeps its own incoming edges and is reachable whether or not
+        `route` consults `node_copies`, so picking an arbitrary split (the first
+        one this iterated, node 35193, has two of its own) passed with the
+        retargeting deleted outright. 114 of the 3,075 splits have none, and
+        those are the ones that answer "no route found" for an address on the map
+        if it regresses.
+        """
+        indegree = np.bincount(router.head, minlength=router.n)
+        fully_redirected = [v for v in router.node_copies if indegree[v] == 0]
+        assert fully_redirected, \
+            "no junction had every approach redirected — nothing to test"
+
         s, _ = router.snap(*BOSTON)
-        t, _ = router.snap(lat, lon)
-        assert router.route(s, t, 0.0) is not None
+        for v in fully_redirected[:20]:
+            # Straight to the node index, not via snap() on its lat/lon: snap
+            # returns whichever end of the nearest *segment* it likes, which on
+            # this graph is often a neighbour rather than the split itself.
+            assert router.route(s, int(v), 0.0) is not None, \
+                f"split junction {v} is unreachable"
 
     def test_a_graph_without_the_restriction_table_is_refused(self, tmp_path):
         with pytest.raises(RuntimeError, match="turn_restrictions"):
@@ -494,13 +647,42 @@ class TestTravelTime:
         assert driving[untouched] == pytest.approx(free[untouched]
                                                    / SURFACE_SPEED_FACTOR)
 
-        # Term 2: an edge with one signal on it costs that many seconds.
-        one_signal = np.where((edges["n_signal_fwd"].to_numpy() == 1)
-                              & (edges["n_stop_fwd"].to_numpy() == 0)
-                              & (edges["n_giveway_fwd"].to_numpy() == 0))[0]
-        assert len(one_signal), "the graph should carry signals"
-        assert control_fwd[one_signal[0]] == pytest.approx(
-            CONTROL_SECONDS["signal"] / 60.0)
+        # Term 2: stopping costs time, and n of them cost n times as much.
+        #
+        # Asserted against a physical band and a ratio, not against
+        # `CONTROL_SECONDS[...] / 60`. That expectation was imported from the
+        # module under test, so it reduced to `0 == approx(0)` and the whole test
+        # passed with every control priced at zero — the one mutation that ought
+        # to fail loudest here. The band has to survive a re-fit from the next
+        # drive, so it is deliberately wide; what it cannot survive is a control
+        # costing nothing, or costing a minute.
+        def only(kind):
+            others = [k for k in ("signal", "stop", "giveway") if k != kind]
+            sel = edges[f"n_{kind}_fwd"].to_numpy() > 0
+            for o in others:
+                sel &= edges[f"n_{o}_fwd"].to_numpy() == 0
+            return sel
+
+        for kind in ("signal", "stop"):
+            sel = only(kind)
+            assert sel.sum(), f"the graph should carry {kind}s"
+            n = edges[f"n_{kind}_fwd"].to_numpy()[sel]
+            seconds = control_fwd[sel] * 60.0 / n      # per encounter
+            assert seconds.min() > 1.0, \
+                f"a {kind} costs {seconds.min():.2f}s — stopping must cost time"
+            assert seconds.max() < 60.0, \
+                f"a {kind} costs {seconds.max():.1f}s, which is not a stop"
+            # Linear in the count: two signals cost twice one, so the per
+            # encounter figure is the same whatever n is on that edge.
+            assert seconds.std() < 1e-9, \
+                f"{kind} cost is not proportional to how many you meet"
+
+        # And the two kinds are priced separately rather than sharing a number.
+        per = {k: (control_fwd[only(k)] * 60.0
+                   / edges[f"n_{k}_fwd"].to_numpy()[only(k)])[0]
+               for k in ("signal", "stop")}
+        assert per["signal"] != pytest.approx(per["stop"], abs=1e-9) \
+            or CONTROL_SECONDS["signal"] == CONTROL_SECONDS["stop"]
 
     def _od(self, router, a, b):
         return router.snap(*a)[0], router.snap(*b)[0]
@@ -762,11 +944,24 @@ class TestBeautyWeightsAreWellBehaved:
         assert coastal.scenery_km()["coast"] > neutral.scenery_km()["coast"]
 
     def test_pref_curve_shapes_the_scenery_cost(self, router):
-        """The scenery term must scale as pref**PREF_CURVE, not linearly — that
-        is what keeps the slider's low end fine-grained."""
+        """The scenery term must scale as pref**2, not linearly — that is what
+        keeps the slider's low end fine-grained.
+
+        The expected ratio is written out rather than computed as
+        `0.5 ** PREF_CURVE`. Importing the exponent from the module under test
+        made this pass for *any* value of it, including the linear curve the
+        docstring forbids and the 1.3 the sweep at the top of router.py rejected
+        (it hands 68% of the scenery gain to the bottom quarter of the slider).
+        A deliberate re-sweep of BETA/PREF_CURVE should have to touch this line;
+        an accidental revert should not be able to.
+        """
         neutral = router._edge_scores({})
         half = router._weights(0.5, neutral) - router.d_minutes
         full = router._weights(1.0, neutral) - router.d_minutes
         moving = full > 0
         ratio = half[moving].sum() / full[moving].sum()
-        assert ratio == pytest.approx(0.5 ** PREF_CURVE, rel=1e-9)
+        assert ratio == pytest.approx(0.25, rel=1e-9), (
+            f"half-strength scenery cost is {ratio:.4f} of full; expected 0.25 "
+            f"for a squared curve (linear would be 0.50, 1.3 would be 0.41)")
+        assert PREF_CURVE == 2.0, \
+            "the curve moved; re-derive the sweep table in router.py with it"

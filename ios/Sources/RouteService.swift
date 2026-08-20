@@ -65,6 +65,23 @@ enum RouteService {
         return URLSession(configuration: configuration)
     }()
 
+    /// The `heading` query value: one decimal place, folded into [0, 360).
+    ///
+    /// Rounded first and folded second, because it is the *rounding* that leaves
+    /// the range. `CLLocation.course` is [0, 360), so a driver headed due north
+    /// can report 359.97 — which `%.1f` renders as "360.0", and both
+    /// `_parse_heading` and `Router.snap` take a half-open 0..<360 and drop it.
+    /// The reroute then fell back to the nearer graph node, which mid-drive is
+    /// as often as not the junction just passed: the turn-the-car-around failure
+    /// the `heading` parameter exists to prevent, firing only when heading north.
+    ///
+    /// Folding before rounding would fix nothing, since 359.97 is already in
+    /// range. Extracted so the wrap has a test without a network call.
+    static func headingParameter(_ heading: CLLocationDirection) -> String {
+        let rounded = (heading * 10).rounded() / 10
+        return String(format: "%.1f", rounded.truncatingRemainder(dividingBy: 360))
+    }
+
     /// Request the fastest and scenic routes between two points.
     /// - Parameters:
     ///   - pref: 0 = fastest, 1 = most scenic (overall scenery strength).
@@ -92,7 +109,7 @@ enum RouteService {
         ] + weights.map { type, weight in
             URLQueryItem(name: "w_\(type)", value: String(format: "%.2f", weight))
         } + (heading.map {
-            [URLQueryItem(name: "heading", value: String(format: "%.1f", $0))]
+            [URLQueryItem(name: "heading", value: headingParameter($0))]
         } ?? [])
 
         let (data, response) = try await session.data(from: components.url!)

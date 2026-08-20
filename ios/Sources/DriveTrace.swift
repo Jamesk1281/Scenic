@@ -175,7 +175,14 @@ final class DriveTrace {
             "steps": feature.properties.steps.map {
                 ["instruction": $0.instruction, "lat": $0.lat, "lon": $0.lon,
                  "distance_m": $0.distance_m,
-                 "type": $0.maneuver.rawValue,
+                 // The decoded type, or "" when the server sent none — never
+                 // `maneuver`, whose nil fallback is the *string* "unknown".
+                 // analyze_trace treats any non-empty type as authoritative, so
+                 // logging "unknown" told it "this is a maneuver kind I don't
+                 // recognise" instead of "there was no type here", suppressing
+                 // its prose fallback and booking every stop at a junction as
+                 // congestion — which is the split CONTROL_SECONDS is fitted on.
+                 "type": $0.type?.rawValue ?? "",
                  "modifier": $0.modifier ?? ""] as [String: Any]
             },
         ], flush: true)

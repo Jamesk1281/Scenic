@@ -204,6 +204,40 @@ final class RerouteTests: XCTestCase {
         await waitFor { !model.isRerouting }
     }
 
+    /// The drive can end while the "switch to fastest" request is still in the
+    /// air. That abandons the attempt with nothing newer behind it, so the pref
+    /// and the styling staked on it have to be handed back — otherwise the
+    /// arrival screen shows the gray fastest line with the button hidden for a
+    /// switch that never happened, and `pref` stays 0 for the rest of the
+    /// session, quietly discarding the scenic intent of every later reroute.
+    ///
+    /// Distinct from a *superseded* attempt, which is left alone on purpose
+    /// because a newer request owns the state by then. Folding the two together
+    /// is what made this reachable.
+    func test_arriving_mid_request_unwinds_the_switch_to_fastest() async {
+        let backend = Backend()
+        let model = joined(backend)
+        XCTAssertEqual(model.pref, 0.8)
+
+        let switching = Task { await model.switchToFastest(from: Fixture.fixAt(600)) }
+        await waitFor { backend.inFlight == 1 }
+        XCTAssertTrue(model.followingFastest)
+        XCTAssertEqual(model.pref, 0)
+
+        // The last fix of the drive lands while the request is outstanding.
+        model.update(Fixture.fixAt(5000))
+        XCTAssertTrue(model.arrived, "the fixture did not reach the destination")
+
+        backend.reply(0, with: Fixture.response(fastest: Fixture.straightRoute(),
+                                                scenic: Fixture.straightRoute()))
+        _ = await switching.value
+
+        XCTAssertFalse(model.followingFastest,
+                       "followingFastest stayed set for a switch that never landed")
+        XCTAssertEqual(model.pref, 0.8,
+                       "pref stayed at 0, so later reroutes lose the scenic intent")
+    }
+
     func test_a_superseded_reroute_does_not_overwrite_the_newer_one() async {
         // The defect this guards: tapping "Fastest" while an off-route reroute
         // was still in flight left two requests running, and whichever answered

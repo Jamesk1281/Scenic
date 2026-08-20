@@ -94,7 +94,11 @@ final class NavigationModel {
 
     /// The scenic preference we re-route with — preserved on off-route reroutes,
     /// dropped to 0 (fastest) when the user switches.
-    private var pref: Double
+    /// `private(set)` rather than `private`, matching `followingFastest`: the
+    /// two are set together by `switchToFastest` and have to be unwound
+    /// together, so a test that can see one and not the other can only assert
+    /// half of that.
+    private(set) var pref: Double
     private let weights: [String: Double]
 
     /// The clock the re-routing guards read.
@@ -467,18 +471,30 @@ final class NavigationModel {
         // would draw the gray "fastest" line and hide the button — with no
         // fastest route ever adopted, so no way to retry — while every later
         // off-route reroute silently asked for pref 0, discarding the scenic
-        // intent on the strength of a request that failed. A *superseded*
-        // attempt is left alone: a newer request owns the state by then.
-        if await reroute(from: location, reason: "fastest") == .failed {
+        // intent on the strength of a request that failed.
+        //
+        // A *superseded* attempt is the one case left alone, because a newer
+        // request owns the state by then and restoring would clobber it. That
+        // is why `ended` is a separate outcome rather than folded into it:
+        // arriving mid-flight abandons the attempt with nothing newer behind
+        // it, so leaving the state set stranded `followingFastest` and `pref`
+        // at 0 for the rest of the session on a switch that never happened.
+        switch await reroute(from: location, reason: "fastest") {
+        case .failed, .ended:
             followingFastest = false
             pref = previousPref
+        case .adopted, .superseded:
+            break
         }
     }
 
-    /// What became of one reroute attempt. `failed` and `superseded` are worth
-    /// telling apart: only the first means nothing else is coming.
+    /// What became of one reroute attempt. All four are worth telling apart:
+    /// `adopted` and `superseded` leave the caller's state alone (the route is
+    /// live, or a newer request owns it), while `failed` and `ended` mean
+    /// nothing else is coming and any state staked on this attempt has to be
+    /// unwound by whoever staked it.
     private enum RerouteOutcome {
-        case adopted, failed, superseded
+        case adopted, failed, superseded, ended
     }
 
     @discardableResult
@@ -509,7 +525,7 @@ final class NavigationModel {
         // never corrected: the map redraws a fresh multi-kilometre line under
         // "You've arrived", and `remainingMeters` goes from 0 back to a whole
         // new trip, with no fix left to undo either.
-        guard !arrived else { return .superseded }
+        guard !arrived else { return .ended }
 
         adopt(wantFastest ? response.fastest : response.scenic, reason: reason)
         // Count the driver as on the route even though they are not on it yet:
