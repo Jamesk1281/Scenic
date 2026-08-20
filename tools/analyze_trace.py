@@ -53,6 +53,7 @@ directory.
 
 import json
 import sys
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -72,9 +73,16 @@ REQUIRED_FIELDS = {
     "drive": {"t", "ts", "pref"},
     "route": {"t", "ts", "seq", "reason", "km", "minutes", "coords", "steps"},
     "fix": {"t", "ts", "lat", "lon", "acc", "alt", "off", "travelled", "joined", "route"},
+    "mark": {"t", "ts", "verdict", "route", "travelled", "joined", "spd"},
     "phase": {"t", "ts", "phase"},
     "end": {"t", "ts", "reason"},
 }
+
+# The vocabulary of `mark.verdict`, and the trace's contract with the app —
+# `SceneryVerdict` in ios/Sources/DriveTrace.swift asserts the same two strings
+# from its own side. Anything else in a trace is reported and dropped rather
+# than silently pooled into one of these.
+VERDICTS = ("nice", "dull")
 
 # --- what counts as noise ----------------------------------------------------
 # A pair of fixes is only usable if the phone was confident about both, they are
@@ -151,6 +159,52 @@ MAX_SNAP_M = 30.0
 # mirrors NavigationModel.offRouteMeters: past that the app itself calls the
 # driver off route and reroutes.
 MAX_OFF_ROUTE_M = 60.0
+
+# --- what a scenery mark refers to -------------------------------------------
+# A `mark` says the driver tapped at a moment. It does not say which road they
+# meant, and the two are not the same thing for three compounding reasons: the
+# tap is later than what prompted it, the position it carries is the last GPS fix
+# rather than that instant, and beauty is a property of a stretch rather than of
+# a point. Every constant below is one of those, made explicit so it can be
+# argued with — and `_mark_report` re-runs its own headline across a range of
+# them, because a conclusion that only holds at one window size is not one.
+
+# How long after seeing something a driver taps, in seconds.
+#
+# In seconds and not metres on purpose. Three seconds is 40 m through a village
+# and 110 m on a highway, so a fixed metre offset is necessarily wrong at one end
+# of the range; the mark carries `spd` precisely so this can be converted at the
+# speed the car was actually doing.
+MARK_REACTION_S = 3.0
+
+# How much road a mark is taken to be about, in metres, ending at the
+# reaction-corrected anchor.
+#
+# 400 m because that is the length of the chunks `score.py` scores, so this is
+# one scored chunk's worth of road — the granularity of the thing being judged.
+# Picking it to match the model rather than the driver is deliberate: a window
+# finer than the score cannot disagree with it about anything, and a much coarser
+# one averages a beautiful mile in with the strip mall at the end of it.
+MARK_WINDOW_M = 400.0
+
+# How far apart the window is sampled along the route line, in metres. Samples
+# are spaced by distance rather than taken per GPS fix so that a minute spent at
+# a red light does not weight that junction 60 times over.
+MARK_SAMPLE_M = 25.0
+
+# How stale the position behind a mark may be, in seconds.
+#
+# A mark carries the last GPS fix, not the instant of the tap, and `travelled` is
+# that same fix's match — so if the stream had stalled, the anchor is wherever the
+# car was when it stalled and the verdict gets charged to that road instead of the
+# one the driver was looking at. At 1 Hz the normal age is under a second; five is
+# already a stream that stopped, and at highway speed it is 140 m of error, which
+# is a third of the window.
+#
+# Found by driving the simulator, where a parked phone produced marks aged 32 s
+# and the analysis read them as verdicts on the route's first metre without a
+# murmur — the silent failure this file's other thresholds all exist to prevent.
+MARK_MAX_FIX_AGE_S = 5.0
 
 # How close a stop has to be to a mapped signal or stop sign to be blamed on it.
 # Generous, because the car stops at the back of a queue, not at the stop line.
@@ -404,6 +458,233 @@ def attach_road_class(steps_df, edges):
     return out
 
 
+def marks(records, window_m=MARK_WINDOW_M, reaction_s=MARK_REACTION_S):
+    """The driver's verdicts, each resolved to the stretch of road it is about.
+
+    Returns a frame of one row per usable mark with `verdict` and the window
+    `[lo_m, hi_m]` of metres along its route line that the verdict is taken to
+    refer to, plus `seq` so the caller knows *which* line — `travelled` restarts
+    at zero on every reroute, so a window without its sequence number points at
+    the wrong road as soon as a drive re-routes once.
+
+    The window ends short of where the tap happened, by the distance the car
+    covered while the driver was reacting, and extends `window_m` back from
+    there. Both ends move; a driver tapping at 100 km/h is describing road they
+    passed 80 m ago, and charging their verdict to the road under the tap would
+    credit the score for whatever came *next*.
+
+    Exclusions are counted in `.attrs`, not dropped quietly — the same rule the
+    rest of this file follows, and it matters more here than anywhere: marks are
+    scarce (tens per drive, against thousands of fixes), so losing a third of
+    them to something structural has to be visible rather than inferred from a
+    number that looks a bit thin.
+    """
+    rows, unjoined, unknown_verdict, no_anchor, stale = [], 0, 0, 0, 0
+    # Fixes, indexed by route, so a mark with no usable `spd` can fall back to
+    # what the car was doing around it.
+    fixes = pd.DataFrame([r for r in records if r["t"] == "fix"])
+
+    for m in (r for r in records if r["t"] == "mark"):
+        verdict = m.get("verdict")
+        if verdict not in VERDICTS:
+            unknown_verdict += 1
+            continue
+        # A tap before the driver reached the route line has no anchor: its
+        # `travelled` is a match onto wherever the line happened to pass
+        # nearest, which is not where they were. The app records these anyway
+        # and flags them, leaving the decision here — and the decision is to
+        # drop them, because there is no road to attribute them to.
+        if not m.get("joined", False):
+            unjoined += 1
+            continue
+        anchor = float(m.get("travelled", -1))
+        if not np.isfinite(anchor) or anchor < 0:
+            no_anchor += 1
+            continue
+        # The position, and therefore the anchor, is the last fix's. If that fix
+        # is old the stream had stalled, and the verdict would be charged to
+        # wherever the car was when it stopped reporting rather than to the road
+        # the driver was looking at. A missing `fix_age` is an older trace, not a
+        # stale one — those predate the field and are let through.
+        age = float(m.get("fix_age", 0.0) or 0.0)
+        if np.isfinite(age) and age > MARK_MAX_FIX_AGE_S:
+            stale += 1
+            continue
+
+        speed = float(m.get("spd", -1))
+        if not np.isfinite(speed) or speed < 0:
+            # CoreLocation had no opinion. Fall back to what the fixes around
+            # this moment were doing, and to a standstill if even that is
+            # unavailable — a reaction distance of zero is the conservative
+            # error here, since it attributes the verdict to road the driver
+            # had definitely reached rather than to road they may not have.
+            speed = _speed_near(fixes, m)
+
+        hi = max(0.0, anchor - speed * reaction_s)
+        rows.append({
+            "ts": m["ts"],
+            "verdict": verdict,
+            "seq": int(m.get("route", 0)),
+            "anchor_m": anchor,
+            "speed_ms": speed,
+            "lo_m": max(0.0, hi - window_m),
+            "hi_m": hi,
+            "lat": m.get("lat", np.nan),
+            "lon": m.get("lon", np.nan),
+            "fix_age": m.get("fix_age", np.nan),
+        })
+
+    out = pd.DataFrame(rows, columns=["ts", "verdict", "seq", "anchor_m", "speed_ms",
+                                      "lo_m", "hi_m", "lat", "lon", "fix_age"])
+    out.attrs["dropped_unjoined"] = unjoined
+    out.attrs["dropped_unknown_verdict"] = unknown_verdict
+    out.attrs["dropped_no_anchor"] = no_anchor
+    out.attrs["dropped_stale_fix"] = stale
+    return out
+
+
+def _speed_near(fixes, mark, within_s=5.0):
+    """Speed around a mark from the fixes either side of it, or 0 if there are none."""
+    if fixes.empty or "travelled" not in fixes or "ts" not in fixes:
+        return 0.0
+    near = fixes[(fixes["route"] == mark.get("route", 0))
+                 & (fixes["ts"] - mark["ts"]).abs().le(within_s)]
+    if len(near) < 2:
+        return 0.0
+    near = near.sort_values("ts")
+    span_s = float(near["ts"].iloc[-1] - near["ts"].iloc[0])
+    span_m = float(near["travelled"].iloc[-1] - near["travelled"].iloc[0])
+    if span_s <= 0 or span_m < 0:
+        return 0.0
+    return span_m / span_s
+
+
+def road_index(edges):
+    """The projected roads and a spatial index over them, ready to snap against.
+
+    Split out of `attach_scenery` so it can be built once and reused. It is the
+    expensive half by a wide margin — reprojecting 400k geometries and building an
+    STRtree over them — and `report` snaps the same marks four times, once for the
+    headline window and once per window in the sensitivity check. Rebuilding it
+    each time made the answer no better and the run four times longer.
+
+    Returns None when there is nothing to snap against, so callers can tell
+    "no graph" from "a graph with no scores in it" and say which.
+    """
+    from shapely import STRtree
+
+    if edges is None or "score" not in edges:
+        return None
+    roads = edges.to_crs(CRS_METERS)
+    return {
+        "geometry": roads.geometry.values,
+        "tree": STRtree(roads.geometry.values),
+        "score": roads["score"].to_numpy(),
+        "highway": roads["highway"].to_numpy(),
+        "name": (roads["name"].to_numpy() if "name" in roads
+                 else np.full(len(roads), None, dtype=object)),
+    }
+
+
+def attach_scenery(marks_df, parts, edges, index=None):
+    """What the model thought of each marked stretch: `model_score`, 0-10.
+
+    The window is sampled *along the route line the drive was following*, every
+    `MARK_SAMPLE_M`, and each sample snapped to the graph. Sampling the line
+    rather than the driver's own fixes is what makes this distance-weighted: fixes
+    arrive at 1 Hz, so a minute at a red light would otherwise weight that one
+    junction sixty times over and a marked stretch driven briskly would count for
+    less than the traffic light at the end of it.
+
+    `travelled` is measured by the phone (`progress()` in ios/Sources/Geo.swift,
+    in per-segment local frames) and re-measured here as distance along the same
+    line projected into `CRS_METERS`. They are not the same computation, but
+    `CRS_METERS` is conformal and its scale error across Massachusetts is a small
+    fraction of a percent — metres over a 400 m window, against a window whose
+    own length is a judgement call to within a factor of two.
+
+    Snapping to the graph rather than reading the route's own edge scores is
+    deliberate, and for the reason `attach_road_class` gives: the graph will not
+    be byte-identical after a rebuild, and a mark should stay readable against
+    whatever the score says *now* — that is the whole point of keeping it.
+    """
+    import geopandas as gpd
+    from shapely.geometry import LineString
+
+    blank = marks_df.assign(model_score=np.nan, highway=None, road=None,
+                            sampled=0)
+    if marks_df.empty:
+        return blank
+    # Why there is no score, when there is none. These three all used to return
+    # the same all-NaN frame, and the report then blamed the *road* — "didn't
+    # snap to a road" — for a graph that had simply been loaded without its
+    # `score` column. A diagnostic that accuses the data for a bug in the loader
+    # is worse than no diagnostic: it sends you out to re-drive a road that was
+    # never the problem.
+    if edges is None and index is None:
+        blank.attrs["no_graph"] = len(marks_df)
+        return blank
+    if index is None:
+        index = road_index(edges)
+    if index is None:
+        blank.attrs["no_score_column"] = len(marks_df)
+        return blank
+
+    lines = {}
+    for route, _ in parts:
+        coords = route.get("coords") or []
+        if len(coords) >= 2:
+            # The trace stores [lon, lat]; project to metres so distance along
+            # the line is metres.
+            lines[int(route["seq"])] = LineString(
+                gpd.points_from_xy([c[0] for c in coords], [c[1] for c in coords],
+                                   crs=4326).to_crs(CRS_METERS)
+            )
+    if not lines:
+        blank.attrs["no_route_line"] = len(marks_df)
+        return blank
+
+    geometry, tree = index["geometry"], index["tree"]
+    score, highway, name = index["score"], index["highway"], index["name"]
+
+    scores, classes, names, counts = [], [], [], []
+    for row in marks_df.itertuples():
+        line = lines.get(row.seq)
+        if line is None:
+            scores.append(np.nan); classes.append(None); names.append(None)
+            counts.append(0)
+            continue
+        lo = min(max(0.0, row.lo_m), line.length)
+        hi = min(max(lo, row.hi_m), line.length)
+        # At least one sample even where the window collapsed — a mark tapped in
+        # the first few metres of a route, or while stopped at its very end.
+        n = max(2, int(np.ceil((hi - lo) / MARK_SAMPLE_M)) + 1)
+        points = [line.interpolate(d) for d in np.linspace(lo, hi, n)]
+        near = tree.nearest(points)
+        distance = np.array([geometry[i].distance(p)
+                             for i, p in zip(near, points)])
+        on_road = distance <= MAX_SNAP_M
+        if not on_road.any():
+            scores.append(np.nan); classes.append(None); names.append(None)
+            counts.append(0)
+            continue
+        keep = near[on_road]
+        scores.append(float(np.nanmean(score[keep])))
+        counts.append(int(on_road.sum()))
+        # The road the driver would say they were on: the class and name that
+        # cover most of the samples, not the one under the tap.
+        classes.append(pd.Series(highway[keep]).mode().iat[0])
+        titles = pd.Series([n for n in name[keep] if n]).mode()
+        names.append(titles.iat[0] if not titles.empty else None)
+
+    out = marks_df.copy()
+    out["model_score"] = scores
+    out["highway"] = classes
+    out["road"] = names
+    out["sampled"] = counts
+    return out
+
+
 def traffic_control(pbf_path, cache_path):
     """Signal, stop-sign and give-way nodes from the OSM extract, cached.
 
@@ -647,6 +928,13 @@ def backgrounded(records, spans):
 
 def report(paths, edges, control=None):
     all_steps, all_stops = [], []
+    all_marks, mark_drops = [], Counter()
+    # The same marks re-attributed over other window sizes, so `_mark_report` can
+    # say whether its headline survives the one constant it had to invent.
+    alternates = {w: [] for w in (200.0, 400.0, 800.0)}
+    # Built once for all of them, and for every drive: reprojecting the graph and
+    # indexing it is the expensive part, and it is identical every time.
+    roads = road_index(edges)
 
     for path in paths:
         records = load(path)
@@ -715,6 +1003,22 @@ def report(paths, edges, control=None):
                       "stop numbers above are a floor, not a measurement.")
         print()
 
+        drive_marks = marks(records)
+        mark_drops.update(drive_marks.attrs)
+        if not drive_marks.empty:
+            scored_marks = attach_scenery(drive_marks, parts, edges, roads)
+            # `attach_scenery` reports its *own* reasons for having no score —
+            # a graph that was never loaded, one lacking the `score` column, a
+            # trace whose route record is missing. Without carrying them up, all
+            # three arrive at the report indistinguishable from a marked stretch
+            # that genuinely wasn't near a road.
+            mark_drops.update(scored_marks.attrs)
+            all_marks.append(scored_marks)
+            for width in alternates:
+                alternates[width].append(
+                    attach_scenery(marks(records, window_m=width), parts,
+                                   edges, roads))
+
         all_steps.append(drive_steps)
         all_stops.append(drive_stops)
 
@@ -722,6 +1026,19 @@ def report(paths, edges, control=None):
         return
     combined = pd.concat(all_steps, ignore_index=True)
     pooled_stops = pd.concat(all_stops, ignore_index=True)
+    # `concat` does not carry `.attrs`, so the exclusion counts are re-attached
+    # by hand. Losing them would turn "a third of your marks were unusable" into
+    # a sample that merely looks small.
+    pooled_marks = (pd.concat(all_marks, ignore_index=True) if all_marks
+                    else pd.DataFrame(columns=["verdict", "model_score"]))
+    pooled_marks.attrs.update(mark_drops)
+    pooled_marks.attrs["auc_by_window"] = [
+        (width, separation(
+            (m := pd.concat(frames, ignore_index=True))
+            .loc[m.verdict == "nice", "model_score"],
+            m.loc[m.verdict == "dull", "model_score"]))
+        for width, frames in sorted(alternates.items()) if frames
+    ]
 
     print("=" * 72)
     total = headline(combined)
@@ -733,6 +1050,11 @@ def report(paths, edges, control=None):
               f"{total['predicted_min']:.1f} min predicted for that ground "
               f"→ the router is {1 - total['predicted_min'] / total['matched_min']:.0%} optimistic")
     print()
+
+    # Before the timing chain, and never inside it: this is the only section that
+    # measures the product rather than the clock, and it must not be skippable by
+    # an early return further down when a graph is missing.
+    _mark_report(pooled_marks, len(all_steps))
 
     _stop_report(pooled_stops, total)
 
@@ -776,6 +1098,209 @@ def report(paths, edges, control=None):
         print("  a single 20 m step is nearly all noise. Even so: a hint about "
               "where to")
         print("  look, not a coefficient to put in the graph.")
+
+
+def separation(nice, dull):
+    """P(a stretch the driver liked outscores one they didn't), ties as half.
+
+    The rank statistic (Mann-Whitney / AUC) rather than a difference of means,
+    for two reasons that both matter at this sample size. It needs no assumption
+    about the score being linear in beauty — only that higher should mean nicer,
+    which is the entire claim the score makes — and it cannot be moved by one
+    outlier, where a difference of means can be carried by a single marked
+    stretch that happened to snap to a 9.6.
+
+    0.5 is a score that ranks roads no better than a coin. 1.0 is one that never
+    got a pair the wrong way round.
+    """
+    nice = np.asarray([s for s in nice if np.isfinite(s)], dtype=float)
+    dull = np.asarray([s for s in dull if np.isfinite(s)], dtype=float)
+    if len(nice) == 0 or len(dull) == 0:
+        return np.nan
+    wins = sum(float(np.sum(a > dull)) + 0.5 * float(np.sum(a == dull)) for a in nice)
+    return wins / (len(nice) * len(dull))
+
+
+# Below this many marks of *either* verdict, the report adds a note telling the
+# driver to tap more. It is advice, not the test — `null_ceiling` below is what
+# actually decides whether a separation number means anything, and it works at
+# every sample size. This is only here because "your sample is too small" is more
+# useful to read as a sentence than as a threshold the number quietly failed.
+MARKS_FOR_A_NUMBER = 12
+
+
+def null_ceiling(n_nice, n_dull, z=1.645):
+    """How high a score that knows nothing still reaches, one run in twenty.
+
+    The separation number needs this beside it or it cannot be read at all. Off
+    five marks each way a score that knows nothing reaches **0.82**; off thirty
+    each way, 0.62. A reader with no yardstick sees 0.75 from a first drive and
+    treats it as the premise confirmed — which is the single most likely way this
+    whole exercise talks itself into a wrong answer.
+
+    Standard error of the Mann-Whitney statistic under the null (Hanley-McNeil),
+    which needs only the two sample sizes: sqrt((n1+n2+1) / (12*n1*n2)).
+    """
+    if n_nice < 1 or n_dull < 1:
+        return np.nan
+    se = np.sqrt((n_nice + n_dull + 1) / (12.0 * n_nice * n_dull))
+    return 0.5 + z * se
+
+
+def _mark_report(pooled_marks, drives):
+    """Does the scenic score agree with the person who drove the road?
+
+    The one question in this project that no amount of open geodata answers, and
+    the reason `mark` records exist. Everything else `analyze_trace.py` prints is
+    a check of the clock, which a laptop can do against itself; the score has only
+    ever been calibrated against its own distribution and two byways named in
+    `score.py`, which establishes that it is self-consistent, not that it is right.
+    """
+    print("=" * 72)
+    # How many taps were thrown away before any of them could be scored. Printed
+    # even when nothing survived, because "no marks" and "every mark you made was
+    # unusable" call for completely different responses — the first says tap next
+    # drive, the second says the tapping was fine and something else is broken.
+    thrown = sum(n for key, n in pooled_marks.attrs.items()
+                 if key.startswith("dropped_"))
+
+    if pooled_marks.empty and not thrown:
+        print("SCENERY  no marks. Nothing in these traces says whether the roads")
+        print("  were actually nice, so the score is still only calibrated against")
+        print("  itself. The two buttons above the trip bar are what records that;")
+        print("  a drive that does not use them cannot test the premise.")
+        print()
+        return
+
+    scored = pooled_marks[pooled_marks["model_score"].notna()] if not pooled_marks.empty \
+        else pooled_marks
+    nice = scored[scored.verdict == "nice"]["model_score"] if not scored.empty \
+        else pd.Series(dtype=float)
+    dull = scored[scored.verdict == "dull"]["model_score"] if not scored.empty \
+        else pd.Series(dtype=float)
+
+    if pooled_marks.empty:
+        print(f"SCENERY  {thrown} marks over {drives} drive(s), none of them usable.")
+        print("  You did the tapping; something else lost it. The reason is below,")
+        print("  and every one of these marks is still in the trace — if the cause")
+        print("  turns out to be fixable here, they can be re-read without driving")
+        print("  anything again.")
+    else:
+        print(f"SCENERY  {len(pooled_marks)} marks over {drives} drive(s) — "
+              f"{int((pooled_marks.verdict == 'nice').sum())} nice, "
+              f"{int((pooled_marks.verdict == 'dull').sum())} dull")
+    for label, why in (
+        ("dropped_unjoined", "tapped before joining the route"),
+        ("dropped_no_anchor", "no position on the route line"),
+        ("dropped_stale_fix", f"the last GPS fix was over {MARK_MAX_FIX_AGE_S:.0f}s "
+                              "old, so there is no telling which road it was"),
+        ("dropped_unknown_verdict", "a verdict this tool doesn't know"),
+        ("no_graph", "no graph was loaded — pass a data directory"),
+        ("no_score_column", "the graph has no `score` column — rebuild it "
+                            "with score.py, then graph.py"),
+        ("no_route_line", "the trace has no route record to measure along"),
+    ):
+        n = pooled_marks.attrs.get(label, 0)
+        if n:
+            print(f"  ! {n} unusable: {why}")
+    # Only what is left after those: a stretch that had every chance to score and
+    # still didn't is a genuine "not near a road", and saying so has to mean that.
+    unexplained = pooled_marks.attrs.get("no_graph", 0) \
+        + pooled_marks.attrs.get("no_score_column", 0) \
+        + pooled_marks.attrs.get("no_route_line", 0)
+    unscored = len(pooled_marks) - len(scored) - unexplained
+    if unscored > 0:
+        print(f"  ! {unscored} marked stretches didn't snap to a road — "
+              "no score to compare against")
+
+    if scored.empty:
+        print("  Nothing could be scored, so there is nothing to compare. The")
+        print("  marks are still in the trace — fix the cause above and re-run;")
+        print("  none of this needs the drive taken again.")
+        print()
+        return
+
+    if nice.empty or dull.empty:
+        print("  Only one verdict was used, so there is nothing to separate. The")
+        print("  comparison needs both: marking only what you liked measures")
+        print("  where you drove, not what the score gets wrong.")
+        print()
+        return
+
+    print(f"  model score on the roads you liked   {nice.mean():.2f} "
+          f"(median {nice.median():.2f}, n={len(nice)})")
+    print(f"  model score on the roads you didn't  {dull.mean():.2f} "
+          f"(median {dull.median():.2f}, n={len(dull)})")
+
+    auc = separation(nice, dull)
+    ceiling = null_ceiling(len(nice), len(dull))
+    thin = min(len(nice), len(dull)) < MARKS_FOR_A_NUMBER
+    beats_chance = np.isfinite(ceiling) and auc > ceiling
+
+    print(f"\n  SEPARATION  {auc:.2f}    "
+          + ("above chance" if beats_chance else "NOT above chance"))
+    print("  The chance the score ranks a road you liked above one you didn't.")
+    print(f"  0.50 is a coin — but with {len(nice)} nice and {len(dull)} dull, a score")
+    print(f"  that knows nothing still reaches {ceiling:.2f} one run in twenty. That,")
+    print("  not 0.50, is the number this has to beat to mean anything.")
+    if not beats_chance:
+        print("  It doesn't. Either the score isn't measuring what you see out of")
+        print("  the window — in which case the weights in score.py are the thing")
+        print("  to change — or there are too few marks yet to tell. More marks")
+        print("  is much the cheaper of the two to rule out first.")
+
+    # The window is a judgement call, so show whether the answer depends on it.
+    # If it does, the marks are being charged to the wrong road and no amount of
+    # sample size fixes that.
+    if "auc_by_window" in pooled_marks.attrs:
+        spread = pooled_marks.attrs["auc_by_window"]
+        line = "   ".join(f"{int(w)} m: {a:.2f}" for w, a in spread)
+        print(f"\n  same number over other windows —  {line}")
+        values = [a for _, a in spread if np.isfinite(a)]
+        # 0.15 across a 4x change in window width. Some drift is expected and
+        # says nothing: a narrow window is a sharper instrument, so it *should*
+        # separate slightly better when the marks are well placed. What this is
+        # watching for is the answer being an artefact of the window rather than
+        # a property of the score, and that shows up as a swing this size.
+        if values and max(values) - min(values) > 0.15:
+            print("  It moves with the window, which means these marks are not")
+            print("  reliably landing on the road they were about. Trust the")
+            print("  direction, not the value, and tap sooner next drive.")
+
+    if thin:
+        print(f"\n  ! Fewer than {MARKS_FOR_A_NUMBER} of one verdict. At this size a")
+        print("  useless score still clears 0.70 about one run in six, so this is")
+        print("  an indication and not a measurement. More marks per drive is the")
+        print("  cheap fix — there is no cost to tapping often.")
+
+    # Where the model and the driver disagree most. These are the addresses worth
+    # driving back to: a specific road, a specific claim, and a score to check.
+    #
+    # Taken as the worst few in *each* direction rather than as one ranked list.
+    # A single list cannot do it: "dull but scored 9" and "nice but scored 1"
+    # are surprising by opposite comparisons, and any one number that mixes them
+    # is on a different scale for each — ranking by it filled the whole table
+    # with high-scoring dull roads and never showed the other kind at all.
+    print("\n  WHERE IT DISAGREES WITH YOU  (worth driving back to)")
+    print(f"  {'verdict':<9}{'score':>6}  {'class':<13}{'road':<24}where")
+    for group, ascending in (("dull", False), ("nice", True)):
+        rows = (scored[scored.verdict == group]
+                .sort_values("model_score", ascending=ascending).head(3))
+        for row in rows.itertuples():
+            where = (f"{row.lat:.5f},{row.lon:.5f}"
+                     if np.isfinite(row.lat) and np.isfinite(row.lon) else "—")
+            print(f"  {row.verdict:<9}{row.model_score:>6.1f}  "
+                  f"{str(row.highway or '?'):<13}{str(row.road or '?')[:23]:<24}{where}")
+    print("  The dull rows are the expensive direction: a high score you called")
+    print("  dull is scenery the model claims and the road does not have, and")
+    print("  that claim is what the router spends a driver's extra minutes on.")
+    print("  The nice rows cost nothing but are where the score is blind — a road")
+    print("  worth driving that it will route around.")
+
+    print("\n  One driver, on one day, in whatever weather it was. This measures")
+    print("  agreement with you, which is what the product promises, and not")
+    print("  beauty in general.")
+    print()
 
 
 def _stop_report(pooled_stops, total):
@@ -831,8 +1356,13 @@ def main(argv):
                   "(pass '-' to silence this)")
         else:
             import geopandas as gpd
+            # `score` and `name` are here for the scenery marks: the score is
+            # what a driver's verdict is compared against, and the name is what
+            # makes a disagreement worth driving back to — "Bay Road scored 7.1
+            # and you called it dull" is actionable, a lat/lon is homework.
             edges = gpd.read_parquet(edge_file, columns=["highway", "length_m",
-                                                         "minutes", "geometry"])
+                                                         "minutes", "score",
+                                                         "name", "geometry"])
         # Signals and stop signs, so a stop can be blamed on something the graph
         # could learn rather than on traffic it never can. Built from whichever
         # OSM extract is lying around and cached beside the processed data; the

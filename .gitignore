@@ -1,4 +1,10 @@
 data/
+# ...and `data` with no slash, which is what a git worktree needs: `data/` lives
+# only in the main checkout, so working in a worktree means symlinking it in, and
+# a symlink is not a directory as far as the pattern above is concerned. Without
+# this line a `git add -A` from a worktree commits an absolute path off someone's
+# desktop.
+/data
 out/
 .venv/
 

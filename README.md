@@ -63,9 +63,17 @@ travel time for beauty via a single preference knob, and a native iOS app
       street, but a median 99 m up it (p90 217 m), because graph nodes are
       junctions. Splitting the snapped edge into two virtual nodes per request
       would take that to zero
-- [ ] Drive the routes and judge them. Two drives (63 km, 2026-08-14) have now
-      met real GPS and fixed the clock, but route *quality* — is this actually a
-      nice road? — is still the one question a laptop cannot answer.
+- [x] An instrument for route quality. Two buttons on the nav screen record what
+      the driver thinks of the road they are on, and `analyze_trace.py` compares
+      each verdict against what the score claimed for that stretch — so "is this
+      actually a nice road?" produces a number instead of an impression. See
+      [Measuring whether the roads are nice](#measuring-whether-the-roads-are-nice)
+- [ ] **Drive the routes and judge them.** The instrument above has never been
+      pointed at a road. Nothing in the repo yet says the scenic score agrees
+      with a human, because scoring is calibrated against its own distribution
+      plus two byways named in `score.py` — self-consistency, not ground truth.
+      This is the one open item a laptop cannot close, and now the only thing
+      it needs is a drive.
 
 > The early MapLibre web demo was retired to focus on iOS; it lives in git
 > history (`git show 82044e2`) and is cheap to revive on the same API if needed.
@@ -205,6 +213,12 @@ Getting a drive worth analysing:
   traffic from the road. Nothing else can: one drive cannot tell a busy junction
   from a slow one.
 
+- **Tap the two buttons.** They are the only record of whether the route was any
+  good — see [Measuring whether the roads are
+  nice](#measuring-whether-the-roads-are-nice). A drive that measures the clock
+  perfectly and says nothing about the scenery has tested the part that was
+  already working.
+
 Then pull the traces off through Files.app (On My iPhone → Scenic) or Finder
 over a cable — do it before deleting the app, since that takes them with it:
 
@@ -266,10 +280,81 @@ rewards is motorway. Across 40–90 km trips the fastest route got 4% faster whi
 the max-scenic one got 15% slower, so the honest gap between them widened from
 44% to 71% rather than narrowing.
 
+## Measuring whether the roads are nice
+
+Everything above measures the car. None of it measures the product.
+
+The scenic score is calibrated against its own distribution and against two
+byways whose names are written into `score.py`. That establishes it is
+self-consistent and correctly scaled; it does not establish that it is right.
+No open geodata answers "is this road beautiful", and the person driving it is
+the only instrument that can — while they are there, because the answer does not
+survive the trip home.
+
+So the nav screen carries two buttons, above the trip bar: **lovely road** and
+**nothing to see**. One tap each, distinct haptics so you can feel which one you
+hit without looking, and a `mark` record in the trace. Two options rather than a
+five-point scale because this is answered at 45 mph — a scale needs aiming, and
+aiming needs looking at the phone. The calibration wants a rank statistic over
+many marks anyway, so precision on any single one buys nothing.
+
+`analyze_trace.py` then resolves each verdict to a stretch of road and compares
+it against what the score claimed there:
+
+    SEPARATION  0.83    above chance
+    0.50 is a coin — but with 24 nice and 19 dull, a score
+    that knows nothing still reaches 0.64 one run in twenty.
+
+That is the whole exercise in one number: the chance the score ranks a road you
+liked above one you didn't. Three things about it are load-bearing.
+
+**It is a rank statistic, not a difference of means.** It assumes only that
+higher should mean nicer, which is the entire claim the score makes, and one
+marked stretch that happened to snap to a 9.6 cannot carry it.
+
+**The noise floor is printed beside it, computed from your own sample sizes.**
+Off five marks each way a score that knows nothing reaches 0.82, so an
+impressive-looking 0.75 from a first drive is worth nothing — and read against
+0.50 it looks like the premise confirmed. That is much the likeliest way this
+exercise talks itself into a wrong answer, so the number it has to beat is
+always on screen next to it.
+
+**A mark is about a stretch, and a late one.** A driver taps *after* seeing
+something, so the tap is downstream of what prompted it; the anchor is walked
+back by the distance covered during `MARK_REACTION_S`, converted at the speed the
+car was doing rather than at a guessed number of metres — three seconds is 40 m
+through a village and 110 m on a highway. From there the verdict is charged to the
+preceding `MARK_WINDOW_M` (400 m, one `score.py` chunk's worth of road, sampled
+along the route line rather than per GPS fix so a minute at a red light doesn't
+weight that junction sixty times over). Because the window is a judgement call,
+the report re-runs its own headline at 200 m and 800 m and says so if the answer
+moves — a conclusion that only holds at one window size is not one.
+
+Two things worth knowing before reading a report:
+
+- **Every exclusion is counted, and "you didn't tap" is never confused with "your
+  taps were unusable."** They call for opposite responses. A mark carries the
+  *last* GPS fix, not the instant of the tap, so a stalled location stream
+  produces verdicts anchored wherever the car was when it stopped reporting —
+  dropped past 5 s of staleness, and reported as that rather than blamed on the
+  road. The marks stay in the trace either way: fix the cause and re-read, no
+  re-driving.
+- **The report ends with the disagreements, worst few in each direction**, with
+  road names and coordinates, because those are the addresses worth going back
+  to. The two directions cost different things. A road you called dull that
+  scored high is scenery the model claims and the road doesn't have — the
+  expensive kind, since that claim is what the router spends your extra minutes
+  buying. A road you liked that scored low costs nothing but is where the score
+  is blind, and it will route around it.
+
+Tap often; there is no cost to it, and the noise floor falls as the marks
+accumulate. Two drives at different hours are still worth more than one — but for
+this, unlike for the clock, a second driver would be worth more than either.
+
 ## Tests
 
 ```sh
-.venv/bin/python -m pytest tests/          # backend: 189 tests
+.venv/bin/python -m pytest tests/          # backend: 214 tests
 ```
 
 The geometry and scoring maths run anywhere; the calibration, routing and API
@@ -278,8 +363,9 @@ elsewhere with `SCENIC_DATA=/path/to/processed`.
 
 The iOS app has its own suite for the parts a simulator can't exercise and a
 drive only tests once — where the driver is on the route, when a maneuver has
-been passed, when the trip has actually ended, and which of two overlapping
-reroutes wins:
+been passed, when the trip has actually ended, which of two overlapping reroutes
+wins, and that a tapped scenery verdict reaches the disk with the position and
+staleness the analysis needs to place it:
 
 ```sh
 cd ios && xcodegen generate && xcodebuild test -project Scenic.xcodeproj -scheme Scenic -destination 'platform=iOS Simulator,name=iPhone 17 Pro'
@@ -306,6 +392,12 @@ carries them onto edges, and `router.py` re-blends them live per request. So:
   per *control node found in the way's node list*, so a split with no signal on
   it costs nothing. Do not replace that with a per-edge or a nearest-edge
   charge: 81.7% of MA's controls have more than one road within 15 m of them.
+- **Retuning the scenery blend against real verdicts** is `WEIGHTS` in
+  `score.py`, then a score + graph rebuild. Drive first: the marks are what say
+  which component is lying, and the disagreement table names the roads to check.
+  Read the separation number against the noise floor printed beside it, never
+  against 0.50 — and change one weight at a time, since `score.py`'s calibration
+  report is what catches a component pinned at its ceiling.
 - **A second region** is the same pipeline run on another Geofabrik extract.
   The MA-specific bits to generalize: the projection in `common.py`, the BBOX
   in `elevation.py`, the byway names in `score.py`, and the

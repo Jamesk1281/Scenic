@@ -123,6 +123,7 @@ final class DriveTraceTests: XCTestCase {
             "route": ["t", "ts", "seq", "reason", "km", "minutes", "coords", "steps"],
             "fix": ["t", "ts", "lat", "lon", "acc", "alt", "off", "travelled",
                     "joined", "route"],
+            "mark": ["t", "ts", "verdict", "route", "travelled", "joined", "spd"],
             "phase": ["t", "ts", "phase"],
             "end": ["t", "ts", "reason"],
         ]
@@ -130,6 +131,8 @@ final class DriveTraceTests: XCTestCase {
         let trace = self.trace()
         trace.route(Fixture.straightRoute(), reason: "start")
         trace.fix(Fixture.fixAt(10), progress: progress(travelled: 10), joined: true, step: 0)
+        trace.mark(SceneryVerdict.nice.rawValue, progress: progress(travelled: 10),
+                   location: Fixture.fixAt(10), joined: true, step: 0)
         trace.phase("background")
         trace.end(reason: "arrived")
 
@@ -176,6 +179,139 @@ final class DriveTraceTests: XCTestCase {
         XCTAssertEqual(fix["alt"] as? Double, 231.5)
         XCTAssertEqual(fix["valt"] as? Double, 8)
         XCTAssertEqual(fix["spd"] as? Double, 17)
+    }
+
+    // MARK: - What the driver thought of the road
+
+    func test_a_verdict_is_recorded_against_where_on_the_route_it_was_given() {
+        // `travelled` is the anchor, not the coordinate: metres along the route
+        // line, so the laptop can resolve which road this was without trusting
+        // the phone's position or the graph being byte-identical to the one that
+        // planned the drive.
+        let trace = self.trace()
+        trace.route(Fixture.straightRoute(), reason: "start")
+        trace.mark(SceneryVerdict.nice.rawValue, progress: progress(travelled: 2431),
+                   location: Fixture.fixAt(2431), joined: true, step: 4)
+        trace.end(reason: "ended")
+
+        let mark = records(of: trace).first { $0["t"] as? String == "mark" }
+        XCTAssertEqual(mark?["verdict"] as? String, "nice")
+        XCTAssertEqual(mark?["travelled"] as? Double, 2431)
+        XCTAssertEqual(mark?["route"] as? Int, 0)
+        XCTAssertEqual(mark?["step"] as? Int, 4)
+    }
+
+    func test_a_verdict_says_how_stale_its_position_was() {
+        // The position is the last GPS fix, not the instant of the tap, and at
+        // 60 mph a one-second-old fix already trails the car by 27 m. The
+        // analysis corrects for reaction time; it can only do that honestly if
+        // the staleness it is correcting on top of is recorded rather than
+        // assumed.
+        let trace = self.trace()
+        trace.route(Fixture.straightRoute(), reason: "start")
+        let tapped = Date().timeIntervalSince1970
+        let location = CLLocation(
+            coordinate: Fixture.north(500), altitude: 30,
+            horizontalAccuracy: 5, verticalAccuracy: 8, course: 0, speed: 24,
+            timestamp: Date(timeIntervalSince1970: tapped - 0.8))
+        trace.mark(SceneryVerdict.dull.rawValue, progress: progress(travelled: 500),
+                   location: location, joined: true, step: 0, clock: tapped)
+        trace.end(reason: "ended")
+
+        let mark = records(of: trace).first { $0["t"] as? String == "mark" }
+        XCTAssertEqual(mark?["fix_age"] as? Double ?? 0, 0.8, accuracy: 0.01)
+        // The speed is what turns a reaction *time* into a distance, so it has
+        // to survive the trip to disk.
+        XCTAssertEqual(mark?["spd"] as? Double, 24)
+    }
+
+    func test_a_verdict_tapped_before_joining_the_route_says_so() {
+        // Its `travelled` is a match onto wherever the line happens to pass
+        // nearest, which is not where the driver is. Recorded anyway and
+        // flagged: what to do with an unanchored verdict is the analysis's
+        // decision, not a phone's.
+        let trace = self.trace()
+        trace.route(Fixture.straightRoute(), reason: "start")
+        trace.mark(SceneryVerdict.nice.rawValue, progress: progress(travelled: 40),
+                   location: Fixture.fixAt(40), joined: false, step: 0)
+        trace.end(reason: "ended")
+
+        let mark = records(of: trace).first { $0["t"] as? String == "mark" }
+        XCTAssertEqual(mark?["joined"] as? Bool, false)
+    }
+
+    func test_a_verdict_does_not_wait_for_the_drive_to_end_to_be_written() {
+        // Marks are flushed rather than buffered. A fix can afford to sit in
+        // memory for twenty seconds — there are thousands of them and they
+        // interpolate — but there are a handful of marks in a whole drive and
+        // each one is a thing the driver deliberately said, so none of them
+        // should be waiting on an `end` that a dead battery may never write.
+        //
+        // "Flushed" means handed to the writer, not synchronously on disk: the
+        // I/O runs on a background queue so the drive never waits for it (only
+        // `end` blocks, once, deliberately). So this waits for the queue rather
+        // than asserting an ordering the code does not promise.
+        let trace = self.trace()
+        trace.route(Fixture.straightRoute(), reason: "start")
+        trace.mark(SceneryVerdict.nice.rawValue, progress: progress(travelled: 100),
+                   location: Fixture.fixAt(100), joined: true, step: 0)
+        // No `end` — the battery died here.
+
+        XCTAssertTrue(eventually { kinds(of: trace).contains("mark") },
+                      "a verdict should reach disk without the drive ending")
+    }
+
+    /// Spin the run loop until `condition` holds, up to `timeout`.
+    ///
+    /// For the writer's queue, which is deliberately asynchronous. A fixed sleep
+    /// would either be flaky on a loaded machine or slow on every run.
+    private func eventually(timeout: TimeInterval = 2.0,
+                           _ condition: () -> Bool) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.02))
+        }
+        return condition()
+    }
+
+    func test_the_verdict_vocabulary_is_the_one_the_analysis_knows() {
+        // The other half is VERDICTS in tools/analyze_trace.py. A verdict string
+        // renamed on this side would be dropped as unknown on that one — counted,
+        // at least, but the drive would still be wasted.
+        XCTAssertEqual(SceneryVerdict.allCases.map(\.rawValue), ["nice", "dull"])
+    }
+
+    func test_a_drive_with_no_recorder_does_not_pretend_to_take_verdicts() {
+        // A button that records nothing is worse than no button: the driver
+        // stops watching for the scenery they think they are logging.
+        let unrecorded = NavigationModel(route: Fixture.straightRoute(),
+                                         destination: Fixture.north(5000),
+                                         pref: 0.7, weights: [:])
+        XCTAssertFalse(unrecorded.canRecordMarks)
+
+        let recording = NavigationModel(route: Fixture.straightRoute(),
+                                        destination: Fixture.north(5000),
+                                        pref: 0.7, weights: [:], trace: self.trace())
+        XCTAssertTrue(recording.canRecordMarks)
+    }
+
+    func test_a_verdict_carries_the_position_of_the_last_fix_the_drive_saw() {
+        // NavigationModel is what holds the two together: the tap arrives
+        // between fixes, so the mark has to reach back for the most recent one
+        // rather than have nothing to say about where it happened.
+        let trace = self.trace()
+        let nav = NavigationModel(route: Fixture.straightRoute(),
+                                  destination: Fixture.north(5000),
+                                  pref: 0.7, weights: [:], trace: trace)
+        nav.update(Fixture.fixAt(1200))
+        nav.mark(.nice)
+        trace.end(reason: "ended")
+
+        let mark = records(of: trace).first { $0["t"] as? String == "mark" }
+        XCTAssertNotNil(mark?["lat"], "the mark should carry the last fix's position")
+        XCTAssertEqual(mark?["travelled"] as? Double ?? -1, 1200, accuracy: 30)
+        XCTAssertEqual(nav.marksRecorded, 1)
     }
 
     // MARK: - Knowing whether it worked

@@ -22,6 +22,10 @@ struct NavView: View {
     /// fits when the driver runs a larger system text size.
     @ScaledMetric(relativeTo: .body) private var controlSize: CGFloat = 30
 
+    /// Height of the scenery-verdict buttons. Well over the 44 pt minimum,
+    /// because these are meant to be hit by a driver who is not looking at them.
+    @ScaledMetric(relativeTo: .body) private var verdictHeight: CGFloat = 52
+
     /// Watched so the drive trace can mark where the app went away and came
     /// back, and flush on the way out — a hole in the fixes otherwise looks the
     /// same as a tunnel.
@@ -173,6 +177,8 @@ struct NavView: View {
                 .padding(.horizontal)
             }
 
+            sceneryVerdict
+
             VStack(spacing: 6) {
                 controlRow
                 // Under the controls, not in the banner: the banner is where
@@ -189,6 +195,69 @@ struct NavView: View {
             .padding(.vertical, 10)
             .background(.ultraThinMaterial)
         }
+    }
+
+    /// The two buttons that make a drive worth taking twice.
+    ///
+    /// Everything else on this screen measures the car. These measure the road,
+    /// and they are the only instrument in the project that can: the scenic score
+    /// has been calibrated against its own distribution and against two byways
+    /// named in `score.py`, which tests that it is self-consistent, not that it
+    /// is right. Whether these roads are actually beautiful is a question only
+    /// the person driving them can answer, and only while they are there.
+    ///
+    /// Sized and placed for a driver, which drove every choice here:
+    ///
+    /// - **Two targets, no scale.** A five-point rating needs aiming and aiming
+    ///   needs looking. The calibration wants a rank statistic over many marks
+    ///   anyway, so precision on any single one buys nothing.
+    /// - **Above the trip bar, hard against the edges.** `tripStats` sits in the
+    ///   middle because that is where a thumb rests — the same reasoning that
+    ///   keeps the numbers untappable puts these where a resting hand isn't. The
+    ///   `End` button is small, bordered and in the corner *below* them, so the
+    ///   destructive control and the frequent one never sit side by side.
+    /// - **Haptics that differ.** `success` for nice and `warning` for dull are
+    ///   distinct patterns, so the driver feels *which* one they hit and never
+    ///   has to look up to check. This is the whole confirmation; there is no
+    ///   toast to read and no count to watch.
+    ///
+    /// Only while there is something to judge: before joining the route the
+    /// driver is on some other road entirely, and after arriving they are parked.
+    @ViewBuilder private var sceneryVerdict: some View {
+        if nav.hasJoinedRoute && !nav.arrived && nav.canRecordMarks {
+            HStack(spacing: 12) {
+                verdictButton(.nice, symbol: "hand.thumbsup.fill",
+                              tint: Color.scenic, label: "Lovely road")
+                verdictButton(.dull, symbol: "hand.thumbsdown.fill",
+                              tint: .secondary, label: "Nothing to see")
+            }
+            .padding(.horizontal)
+        }
+    }
+
+    private func verdictButton(_ verdict: SceneryVerdict, symbol: String,
+                               tint: Color, label: String) -> some View {
+        Button {
+            nav.mark(verdict)
+            // Distinct patterns per verdict — the point is to be told apart by
+            // feel. Generated fresh rather than kept around: a driver taps a
+            // handful of times in an hour, so there is nothing to warm up for,
+            // and holding one costs a strong reference for the whole drive.
+            UINotificationFeedbackGenerator()
+                .notificationOccurred(verdict == .nice ? .success : .warning)
+        } label: {
+            Image(systemName: symbol)
+                .font(.title3)
+                .foregroundStyle(tint)
+                // Tall, and as wide as half the screen. The generous frame *is*
+                // the feature: this has to be hittable without aiming.
+                .frame(maxWidth: .infinity)
+                .frame(height: verdictHeight)
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(label)
+        .accessibilityHint("Records how this stretch of road looks, for calibrating the scenic score")
     }
 
     /// Puts the camera back on the driver, heading-up.
@@ -269,7 +338,22 @@ struct NavView: View {
                 Text(nav.eta, format: .dateTime.hour().minute())
                     .font(.title3.bold())
                     .monospacedDigit()
+                // How many verdicts have been logged. The haptic is the primary
+                // confirmation, but a driver who has haptics switched off system
+                // wide — or is in Low Power Mode — gets nothing back from a tap
+                // at all, and would have no way to tell a registered verdict
+                // from a missed button until they got home. Small, and outside
+                // the tap targets, because it is a receipt rather than a number
+                // anybody drives by.
+                if nav.marksRecorded > 0 {
+                    Text("\(nav.marksRecorded)")
+                        .font(.caption2.bold())
+                        .monospacedDigit()
+                        .foregroundStyle(Color.scenic)
+                        .contentTransition(.numericText())
+                }
             }
+            .animation(.snappy, value: nav.marksRecorded)
             Text("\(timeText(nav.remainingMinutes)) · \(milesText(nav.remainingMeters))")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -280,6 +364,7 @@ struct NavView: View {
             "Arriving at \(nav.eta.formatted(date: .omitted, time: .shortened)), "
             + "\(timeText(nav.remainingMinutes)) and \(milesText(nav.remainingMeters)) to go. "
             + (nav.recordingProblem ?? "Recording this drive.")
+            + (nav.marksRecorded > 0 ? " \(nav.marksRecorded) scenery marks logged." : "")
         )
     }
 

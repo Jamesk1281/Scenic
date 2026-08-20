@@ -263,6 +263,50 @@ final class NavigationModel {
         trace?.phase(name)
     }
 
+    /// The last fix and where it landed on the route, kept so a verdict tapped
+    /// between fixes has a position and an anchor to carry.
+    ///
+    /// `lastProgress` rather than the `travelled` property because that one is a
+    /// running maximum — a mark should carry the same quantity a `fix` does, so
+    /// the two are comparable in the trace without knowing which of them
+    /// smoothed anything.
+    private var lastFix: CLLocation?
+    private var lastProgress: RouteProgress?
+
+    /// What the driver has said about the road so far, so the screen can show
+    /// their taps registered. Counted rather than listed: the trace is the record,
+    /// this is only feedback.
+    private(set) var marksRecorded = 0
+
+    /// Whether a verdict tapped now would actually be written down.
+    ///
+    /// Deliberately not the same condition as `recordingProblem`. That one goes
+    /// orange when no GPS fixes have arrived for ten seconds, which is a real
+    /// problem for measuring speed and no problem at all for this: a mark still
+    /// carries its own timestamp and the last known position, and a driver in a
+    /// GPS hole under trees is quite likely looking at something worth marking.
+    /// What does make the button a lie is having nowhere to write — no trace
+    /// file, or a writer that has already failed.
+    var canRecordMarks: Bool {
+        guard let trace else { return false }
+        return trace.failure == nil
+    }
+
+    /// The driver's verdict on the road they're on right now.
+    ///
+    /// Deliberately unvalidated and unlimited. There is no "too many marks" — a
+    /// driver who taps twice through a long beautiful stretch has said something
+    /// true twice — and no attempt to reject a tap as a mistake, because this
+    /// cannot tell one from a genuine change of mind and the analysis pools
+    /// dozens of these anyway. What it must not do is fail: a tap that silently
+    /// records nothing is worse than no button, since the driver stops watching
+    /// for the scenery they think they are logging.
+    func mark(_ verdict: SceneryVerdict) {
+        marksRecorded += 1
+        trace?.mark(verdict.rawValue, progress: lastProgress, location: lastFix,
+                    joined: hasJoinedRoute, step: currentStep)
+    }
+
     /// When this session began, and when the last fix arrived. A recorder with
     /// nothing to record is the failure the indicator exists to catch, and
     /// `DriveTrace.failure` cannot see it: the writer is perfectly healthy, the
@@ -345,6 +389,11 @@ final class NavigationModel {
         // `recordingProblem` watches. An early return here is still evidence
         // the stream is alive.
         lastFixAt = Date()
+        // Kept here too, and not below with the match, so a verdict tapped
+        // before the driver has joined the route still carries a position. The
+        // anchor is worthless then and the record says so (`joined`), but the
+        // raw fix is the evidence that makes it recoverable.
+        lastFix = location
         guard !steps.isEmpty, !arrived, coordinates.count >= 2 else { return }
 
         // Match forwards from where the driver already is, with a little slack
@@ -352,6 +401,7 @@ final class NavigationModel {
         // nothing is known, so the whole line is fair game.
         let floor = hasJoinedRoute ? max(0, travelled - Self.backtrackToleranceMeters) : 0
         let here = progress(of: location.coordinate, along: coordinates, notBefore: floor)
+        lastProgress = here
 
         if !hasJoinedRoute {
             if here.offRoute <= Self.offRouteMeters {

@@ -14,12 +14,15 @@ import Observation
 /// *this* route. `(timestamp, travelled)` is the measurement; its slope is the
 /// real speed at a known place on a known road.
 ///
-/// So this writes one NDJSON file per drive, of five record types:
+/// So this writes one NDJSON file per drive, of six record types:
 ///
 ///   - `drive` — one header: when, from where to where, at what preference.
 ///   - `route` — the line being followed, written again on every reroute
 ///     (`travelled` restarts from zero, so the analysis has to know).
 ///   - `fix`   — one per GPS update: the raw fix and its match onto the route.
+///   - `mark`  — the driver's verdict on the road they're on. The one record
+///     here that measures the *scenery* rather than the clock, and the only one
+///     no laptop can reconstruct afterwards.
 ///   - `phase` — the app going to the background and coming back, so a hole in
 ///     the fixes can be told apart from a GPS dropout.
 ///   - `end`   — arrived, or the driver stopped.
@@ -33,6 +36,25 @@ import Observation
 /// fail *silently*: `failure` drives an indicator on the nav screen, because a
 /// recorder that quietly stopped an hour ago costs a whole drive, and the drive
 /// is the expensive part.
+/// What a driver can say about the road they're on, mid-drive.
+///
+/// Two options, not a five-point scale, because this is read and answered at 45
+/// mph: a scale needs aiming, and aiming needs looking. Two large targets and a
+/// haptic tick can be hit with a thumb without taking your eyes off the road,
+/// and the aggregate is what the calibration wants anyway — the question is
+/// whether the score *ranks* roads the way a person does, which is a rank
+/// statistic over many marks, not a precise reading of any one of them.
+///
+/// The raw values are the trace's vocabulary and part of its contract with
+/// `tools/analyze_trace.py` (see `VERDICTS` there, asserted from both sides).
+/// "dull" rather than "bad": the complaint about a road a scenic router picked
+/// is almost never that it was unpleasant, it is that there was nothing to look
+/// at, and naming it for what it is keeps the button honest about what it means.
+enum SceneryVerdict: String, CaseIterable {
+    case nice
+    case dull
+}
+
 @Observable
 @MainActor
 final class DriveTrace {
@@ -233,6 +255,70 @@ final class DriveTrace {
             "joined": joined,
             "step": step,
         ])
+    }
+
+    /// The driver said what they think of the road they are on.
+    ///
+    /// This is the only record in the file that is not a measurement of the car.
+    /// Everything else here exists to calibrate the *clock*, which a laptop can
+    /// already check against itself. Whether a road is actually beautiful is the
+    /// one question no amount of open geodata answers, and the scenic score has
+    /// only ever been calibrated against its own distribution and two byways
+    /// whose names are hard-coded in `score.py` — which is self-consistency, not
+    /// ground truth. A drive that records no judgment leaves the premise
+    /// untested and the driver's impression evaporates on the way home.
+    ///
+    /// `travelled` is the anchor, not the coordinate. It is metres along the
+    /// route line in the `route` record above, so the laptop can resolve which
+    /// road this was without trusting the phone's position *or* the graph being
+    /// byte-identical to the one that planned the drive — which it will not be
+    /// after any rebuild. The lat/lon rides along as the unprocessed evidence,
+    /// the same way `fix` carries both halves.
+    ///
+    /// Three fields exist because the anchor is *late*, and by how much has to
+    /// be recoverable rather than assumed:
+    ///
+    /// - `fix_age` — the position is the last GPS fix, not this instant.
+    ///   CoreLocation delivers ~1 Hz, so at 60 mph the anchor already trails the
+    ///   car by up to 27 m before anyone reacts to anything.
+    /// - `spd` — what the car was doing, so `tools/analyze_trace.py` can convert
+    ///   a reaction time into a distance instead of guessing one in metres. Three
+    ///   seconds is 40 m in a town and 110 m on a highway; a fixed metre offset
+    ///   would be wrong at one end or the other.
+    /// - `joined` — a tap taken before the driver reached the route line has no
+    ///   anchor at all: `travelled` is then a match onto wherever the line
+    ///   happens to pass nearest, which is not where they are. Recorded anyway
+    ///   and flagged, rather than dropped here, because the decision of what to
+    ///   do with it belongs to the analysis, not to a phone in a moving car.
+    ///
+    /// A driver taps *after* noticing something, so the anchor is the far end of
+    /// the stretch being judged and never its middle. Nothing here tries to
+    /// correct for that — the correction needs the speed history, which is on the
+    /// laptop. This records when the tap happened and how stale its position was,
+    /// and lets the analysis walk backwards.
+    func mark(_ verdict: String, progress: RouteProgress?, location: CLLocation?,
+              joined: Bool, step: Int, clock: TimeInterval = DriveTrace.now()) {
+        var record: [String: Any] = [
+            "t": "mark",
+            "ts": clock,
+            "verdict": verdict,
+            "route": routeSeq,
+            "travelled": progress?.travelled ?? -1,
+            "joined": joined,
+            "step": step,
+        ]
+        if let location {
+            record["lat"] = location.coordinate.latitude
+            record["lon"] = location.coordinate.longitude
+            record["acc"] = location.horizontalAccuracy
+            record["spd"] = location.speed
+            record["fix_age"] = clock - location.timestamp.timeIntervalSince1970
+        }
+        // Flushed, like every record that is not a fix. There are a handful of
+        // these in a drive rather than thousands, and each one is a thing the
+        // driver deliberately said — the cheapest record in the file to write
+        // immediately and the most annoying to lose to a dead battery.
+        append(record, flush: true)
     }
 
     /// The app went to the background, or came back.

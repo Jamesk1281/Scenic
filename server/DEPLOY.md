@@ -129,11 +129,11 @@ the first two are the usual Windows build headaches.
 .venv/bin/python -m pytest tests/
 ```
 
-With all three parquets copied over, expect **194 passed, 3 skipped**. The three
+With all three parquets copied over, expect **217 passed, 3 skipped**. The three
 skips are expected and permanent on a serving box: they need
 `scored_chunks.parquet`, a pipeline artifact the server never reads and the file
 list above deliberately does not copy. With none of the parquets — a fresh
-clone — expect **103 passed, 94 skipped**: everything that needs a built graph
+clone — expect **121 passed, 99 skipped**: everything that needs a built graph
 steps aside cleanly rather than erroring, so a skip here means "the data isn't
 here yet" and never "the data is wrong".
 
