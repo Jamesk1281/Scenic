@@ -213,6 +213,31 @@ Getting a drive worth analysing:
   traffic from the road. Nothing else can: one drive cannot tell a busy junction
   from a slow one.
 
+- **Follow the reroutes, or expect fewer of them.** A reroute now opens with the
+  maneuver you have to make — "Make a U-turn on Bedford Street" — rather than a
+  compass heading, because the destination is often behind you and "Head
+  southeast" reads as "carry on". If you decline several in a row the app waits
+  longer each time before asking again, and it stops re-planning inside the last
+  300 m. All three landed after 2026-08-22, where one drive rerouted ten times
+  in 160 seconds and the banner reset to its first instruction each time.
+
+- **Start on the road, not in the driveway.** The origin snapped 165 m from the
+  car on one 2026-08-22 drive, which put the route's first coordinates on a
+  different street: 3.5 minutes and 1.5 km of that drive are unmeasurable, and
+  nothing could re-route out of it. The app now gives up on a route you are
+  driving *away* from, but the cheap fix is to pull onto the street first. Only
+  the *origin* still has this problem — destinations go through the access layer
+  below.
+
+- **A destination in a car park is routed to the car park's entrance.**
+  `highway=service` is not in the routing graph and never will be (433,969 of
+  them against 227,251 drivable ways), but it *is* extracted into
+  `access_ways.parquet` / `access_entries.parquet` purely so
+  `Router.snap_destination` can turn a pin inside a lot into the road you can
+  get in from. Without it, three of the five 2026-08-22 destinations snapped to
+  the wrong side of the building and two to a road with no connection to the lot
+  at all. The layer is optional: absent, the router silently reverts to nearest.
+
 - **Tap the two buttons.** They are the only record of whether the route was any
   good — see [Measuring whether the roads are
   nice](#measuring-whether-the-roads-are-nice). A drive that measures the clock
@@ -243,7 +268,17 @@ which reports, per drive and pooled across drives:
 - **speed by grade band** — whether the back roads are slow because of the
   corners or because of the climb.
 
-Three things worth knowing before reading a report.
+Four things worth knowing before reading a report.
+
+*Parking is not junction cost.* A stationary run longer than `PARKED_S` (5 min)
+is held out of both the junction cost and the clock the router is judged
+against, and listed at the end of the report with its time and place so the
+threshold can be overruled. This is not fussiness: on the drives of 2026-08-22
+two runs, of 7 and 13 minutes, carried 57% of all measured stopped time, landed
+in the "unexplained" bucket, and moved one drive's headline error from +23% to
++59%. Fitted, they would have become a permanent per-junction penalty on every
+road in the state. If one of the listed runs was really the road stopping you —
+a freight crossing, a drawbridge — raise the constant and re-run.
 
 *Every exclusion is reported.* The analyzer drops fixes it can't trust, and the
 dangerous failure is the silent one: a phone that stops reporting while the car
