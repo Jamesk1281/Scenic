@@ -15,7 +15,9 @@ the pipeline scripts:
 
 - **Data** (build locally, copy over): `data/processed/graph_edges.parquet` +
   `graph_nodes.parquet` + `turn_restrictions.parquet` (~87 MB total; the third
-  is well under a megabyte and the server refuses to start without it).
+  is well under a megabyte and the server refuses to start without it), plus
+  `access_ways.parquet` + `access_entries.parquet` (~59 MB, and **optional** —
+  see the 2026-08-23 note below).
 - **Code**: `server/app.py`, and `pipeline/router.py` + `common.py` + `score.py`
   (router imports the latter two for shared constants and the scoring weights).
 
@@ -71,6 +73,23 @@ the scoring changes, then copy all three parquet files over.
 > new drive traces is a code change and a restart rather than another rebuild
 > and another 80 MB copy over the tunnel.
 
+> **2026-08-23 — destinations now snap to the road you can get in from.**
+> `highway=service` is extracted into `access_ways.parquet` and
+> `access_entries.parquet`, and `Router.snap_destination` uses them to turn a pin
+> inside a car park into that park's actual entrance. Measured on the drives of
+> 2026-08-22: three of five destinations sat inside mapped car parks and two
+> snapped to a road with no connection to the park at all — one to a cul-de-sac
+> 102 m away whose real entrance was a secondary road 226 m in the other
+> direction. Replaying that drive, the fix takes it from 13 off-route reroutes
+> to 3.
+>
+> Unlike every other parquet here these two are **optional**: absent, the router
+> logs nothing and behaves exactly as it did before, which is a worse answer but
+> not a silent one. That is deliberate — a graph built before this date must
+> still serve. They cost **+10 s startup, +0.5 GB RAM and 59 MB on disk**, and
+> they are built by `extract.py`, not `graph.py`, so refreshing them means a
+> pipeline run against the PBF rather than a graph rebuild.
+>
 > **The code and the parquets must come from the same commit.** `router.py`
 > re-blends every edge's score live per request using `WEIGHTS` from `score.py`,
 > so a server running different scoring constants than the ones that built the
@@ -98,9 +117,10 @@ interpreter path, so they break if the folder is moved or contains a space.
 git clone https://github.com/Jamesk1281/Scenic.git C:\Scenic
 ```
 
-Copy `graph_edges.parquet`, `graph_nodes.parquet` and
-`turn_restrictions.parquet` into `C:\Scenic\data\processed\` (USB stick or a
-cloud folder; they are gitignored).
+Copy `graph_edges.parquet`, `graph_nodes.parquet`,
+`turn_restrictions.parquet` and — unless you are deliberately skipping the
+access layer — `access_ways.parquet` and `access_entries.parquet` into
+`C:\Scenic\data\processed\` (USB stick or a cloud folder; they are gitignored).
 
 ### 2. Virtualenv — serve dependencies only
 
@@ -129,11 +149,13 @@ the first two are the usual Windows build headaches.
 .venv/bin/python -m pytest tests/
 ```
 
-With all three parquets copied over, expect **217 passed, 3 skipped**. The three
+With all five parquets copied over, expect **230 passed, 3 skipped**. The three
 skips are expected and permanent on a serving box: they need
 `scored_chunks.parquet`, a pipeline artifact the server never reads and the file
-list above deliberately does not copy. With none of the parquets — a fresh
-clone — expect **121 passed, 99 skipped**: everything that needs a built graph
+list above deliberately does not copy. With the three required ones but not the
+access layer, expect **226 passed, 7 skipped** — the four extra skips are the
+car-park destination tests, standing aside for the same reason. With none of the
+parquets — a fresh clone — expect **121 passed, 99 skipped**: everything that needs a built graph
 steps aside cleanly rather than erroring, so a skip here means "the data isn't
 here yet" and never "the data is wrong".
 

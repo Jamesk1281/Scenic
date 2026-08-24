@@ -795,6 +795,142 @@ class TestRoutingOverTheGraph:
         assert checked > 100, "too few usable samples to conclude anything"
         assert wrong == 0, f"{wrong}/{checked} snapped to the end behind the driver"
 
+    def test_a_reroute_that_must_double_back_says_so(self, router):
+        """The defect this guards, straight off the drive of 2026-08-22.
+
+        The driver was on Bedford Street doing 70 km/h north-west with the
+        destination behind them. Every reroute opened "Head southeast on Bedford
+        Street" — true, unactionable, and indistinguishable from "carry on". So
+        they carried on, left the new route within four seconds, and the reroute
+        fired again: ten times in 160 seconds, the banner resetting to the first
+        instruction each time.
+
+        The coordinates are the real ones, because the failure was a property of
+        this junction and this destination and a synthetic pair would not have
+        caught it.
+        """
+        here, course = (42.479463, -71.255401), 322.0
+        dest = (42.484894, -71.264336)
+        d, _ = router.snap(*dest)
+
+        moving, _ = router.snap(*here, heading=course)
+        opening = router.route(moving, d, 0.0, heading=course).steps()[0]
+        assert opening["type"] == "turn"
+        assert opening["modifier"] == "uturn"
+        assert "U-turn" in opening["instruction"]
+
+    def test_a_trip_planned_from_a_standstill_still_gets_a_compass_heading(self, router):
+        """No heading means a parked car, and "Make a U-turn" would be nonsense
+        to one. The compass form is what a driver about to set off can act on."""
+        here, dest = (42.479463, -71.255401), (42.484894, -71.264336)
+        s_idx, _ = router.snap(*here)
+        d, _ = router.snap(*dest)
+        opening = router.route(s_idx, d, 0.0).steps()[0]
+        assert opening["type"] == "depart"
+        assert opening["instruction"].startswith("Head ")
+
+    def test_a_route_that_opens_the_way_you_are_already_going_is_not_a_turn(self, router):
+        """The other half of the guard. A reroute onto the road the car is
+        already on must not manufacture an instruction — a driver who is told to
+        turn where there is no turn stops believing the next one."""
+        here, dest = (42.479463, -71.255401), (42.484894, -71.264336)
+        # The route's own opening bearing, so the "driver" is going its way.
+        s_idx, _ = router.snap(*here)
+        along = router.route(s_idx, router.snap(*dest)[0], 0.0)
+        import router as router_mod
+        course = router_mod._bearing_out(along.edge_coords[0])
+
+        moving, _ = router.snap(*here, heading=course)
+        opening = router.route(moving, router.snap(*dest)[0], 0.0,
+                               heading=course).steps()[0]
+        assert opening["type"] == "depart"
+        assert opening["instruction"].startswith("Head ")
+
+    # --- destinations you cannot reach from the nearest road ------------------
+
+    # The 2026-08-22 destinations, with what each pin is really in. Three of the
+    # five sat inside a mapped car park; two of those snapped to a road with no
+    # connection to the park at all.
+    BEDFORD_LOT = (42.484894, -71.264336)      # entrance is The Great Road, 226 m
+    AYER_LOT = (42.5455337, -71.5518133)       # entrance is Shaker Pond Road, 182 m
+    NEEDHAM_KERB = (42.27725230013152, -71.2417737300463)   # 1.4 m from Oak Street
+
+    @staticmethod
+    def _needs_access(router):
+        """Skip when the access layer isn't built.
+
+        Same contract as the `router` fixture itself: the layer is large and
+        gitignored, so a fresh clone or a serving box that has not copied it
+        must skip rather than fail. `Router` treats it as optional on purpose —
+        see `_read_access` — so absent, these assertions are about behaviour
+        that is correctly not there.
+        """
+        if getattr(router, "_access_tree", None) is None:
+            pytest.skip("access layer missing (access_ways/access_entries parquet)")
+
+    def test_a_destination_in_a_car_park_snaps_to_the_road_you_enter_from(self, router):
+        """The defect, measured: this pin is 102 m from Alfred Circle, a
+        cul-de-sac behind the building, and 226 m from The Great Road. The car
+        park is 30 service ways with exactly one connection to the public
+        network, and it is not Alfred Circle — so the router sent the driver on
+        a 3.2 km loop to a road they could not get in from, and re-planned it
+        ten times in 160 seconds when they carried on past the real entrance.
+
+        Nearest is the wrong question. The right one is which road you can get
+        in from.
+        """
+        self._needs_access(router)
+        nearest, _ = router.snap(*self.BEDFORD_LOT)
+        entrance, _ = router.snap_destination(*self.BEDFORD_LOT)
+        assert entrance != nearest
+        assert self._road_name(router, nearest) == "Alfred Circle"
+        assert self._road_name(router, entrance) == "The Great Road"
+
+    def test_the_same_holds_for_a_second_car_park(self, router):
+        """One case is an anecdote. This pin snapped to Bennetts Crossing, 122 m
+        away, whose only connection to the park is none at all."""
+        self._needs_access(router)
+        nearest, _ = router.snap(*self.AYER_LOT)
+        entrance, _ = router.snap_destination(*self.AYER_LOT)
+        assert entrance != nearest
+        assert self._road_name(router, entrance) == "Shaker Pond Road"
+
+    def test_a_kerbside_destination_is_left_exactly_where_it_was(self, router):
+        """Most destinations are beside a road and need no help. Moving one
+        would be a regression in the common case bought for the rare one."""
+        self._needs_access(router)
+        assert (router.snap_destination(*self.NEEDHAM_KERB)
+                == router.snap(*self.NEEDHAM_KERB))
+        assert router.access_point(*self.NEEDHAM_KERB) is None
+
+    def test_the_distance_reported_is_still_the_pin_to_the_road(self, router):
+        """`SNAP_MAX_M` in server/app.py rejects points off the network with it.
+        Returning the distance from the *entrance* instead would be ~0 for every
+        car park in the world and quietly retire the check."""
+        self._needs_access(router)
+        _, plain = router.snap(*self.BEDFORD_LOT)
+        _, reported = router.snap_destination(*self.BEDFORD_LOT)
+        assert reported == pytest.approx(plain)
+        assert reported > 100          # the pin really is that far from a road
+
+    def test_a_graph_built_before_the_access_layer_still_serves(self, router,
+                                                                monkeypatch):
+        """The layer is optional, unlike the restriction table. Missing, it must
+        degrade to exactly the old behaviour rather than refuse to start —
+        a worse answer, but not a silent one."""
+        monkeypatch.setattr(router, "_access_tree", None)
+        assert router.access_point(*self.BEDFORD_LOT) is None
+        assert (router.snap_destination(*self.BEDFORD_LOT)
+                == router.snap(*self.BEDFORD_LOT))
+
+    @staticmethod
+    def _road_name(router, node):
+        import numpy as np
+        touching = np.nonzero((router.edge_u_idx == node)
+                              | (router.edge_v_idx == node))[0]
+        names = {router.edges.iloc[int(i)]["name"] for i in touching}
+        return next((n for n in names if n), "")
+
     def test_an_unusable_heading_falls_back_to_the_nearer_end(self, router):
         """CoreLocation reports -1 when it has no opinion, and its course is
         noise at a crawl. A heading that cannot be trusted has to behave as

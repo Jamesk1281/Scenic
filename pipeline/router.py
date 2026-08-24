@@ -229,6 +229,98 @@ class Router:
         self._edge_tree = STRtree(self._edge_geom_m)
 
         self._build_directed()
+        self._read_access(d)
+
+    def _read_access(self, d: Path):
+        """The parking-lot and driveway layer, used only to place destinations.
+
+        Optional, unlike everything above, and for the opposite reason to the
+        restriction table. A missing restriction table produces *wrong* routes
+        that look right; a missing access layer produces exactly the behaviour
+        this router had before the layer existed — a destination in a car park
+        snapped to the nearest public road. That is a worse answer, not a silent
+        one, and it must not stop a graph built before 2026-08-23 from serving.
+        """
+        ways, entries = d / "access_ways.parquet", d / "access_entries.parquet"
+        if not (ways.exists() and entries.exists()):
+            self._access_geom_m = None
+            self._access_tree = None
+            self._access_component = None
+            self._access_entries = {}
+            return
+        access = gpd.read_parquet(ways)
+        self._access_geom_m = access.geometry.to_crs(CRS_METERS).values
+        self._access_tree = STRtree(self._access_geom_m)
+        self._access_component = access["component"].to_numpy()
+        table = pd.read_parquet(entries)
+        self._access_entries = {
+            int(c): list(zip(g["lat"].to_numpy(), g["lon"].to_numpy()))
+            for c, g in table.groupby("component")
+        }
+
+    def access_point(self, lat: float, lon: float):
+        """Where a driver actually enters the place at `lat, lon`, or None.
+
+        None means the point is beside a public road already and needs no help:
+        either there is no access layer loaded, or the nearest service way is
+        further off than the nearest road, which is what a roadside address
+        looks like.
+
+        Otherwise the point is inside something — a car park, a campus, a long
+        drive — and the answer is the nearest node its service network shares
+        with the drivable graph. That shared node is the entrance in the literal
+        sense: it is the one place the two geometries meet.
+
+        The defect this exists for, measured on 2026-08-22. Three of five
+        destinations were inside mapped car parks. Two snapped to a road with no
+        connection to the park at all — one to a cul-de-sac 102 m away whose
+        park's only entrance was a secondary road 226 m away in the other
+        direction, so the router sent the driver on a 3.2 km loop while they
+        drove straight past the entrance they wanted, and re-planned it ten
+        times in 160 seconds when they carried on. Snapping *nearest* is the
+        bug: what a driver needs is not the closest road but the road they can
+        get in from.
+        """
+        if self._access_tree is None:
+            return None
+        x, y = _TO_M.transform(lon, lat)
+        point = shapely.Point(x, y)
+        way = int(self._access_tree.nearest(point))
+        to_access = self._access_geom_m[way].distance(point)
+        edge = int(self._edge_tree.nearest(point))
+        if to_access >= self._edge_geom_m[edge].distance(point):
+            return None
+        entries = self._access_entries.get(int(self._access_component[way]))
+        if not entries:
+            # A car park mapped with no connection to any drivable way. There is
+            # nothing better to offer than the nearest road, which is what the
+            # caller already does.
+            return None
+        ex, ey = _TO_M.transform([e[1] for e in entries], [e[0] for e in entries])
+        best = int(np.argmin((np.asarray(ex) - x) ** 2 + (np.asarray(ey) - y) ** 2))
+        return entries[best]
+
+    def snap_destination(self, lat: float, lon: float) -> tuple[int, float]:
+        """Snap somewhere a driver is trying to *get to*, via its entrance.
+
+        Separate from `snap` rather than a flag on it, because the two answer
+        different questions and only one of them is about where the car is.
+        `snap` places a car that is on a road; this places a doorway that may
+        be nowhere near one.
+
+        No heading, deliberately: a destination is not travelling anywhere, and
+        the entrance is a junction of the drivable network either way.
+
+        The distance returned is still measured from the *pin*, not from the
+        entrance, so `SNAP_MAX_M` keeps meaning "is this anywhere near our road
+        network" rather than silently becoming "did we find an entrance".
+        """
+        _, offset = self.snap(lat, lon)
+        entry = self.access_point(lat, lon)
+        if entry is None:
+            return self.snap(lat, lon)
+        node, _ = self.snap(*entry)
+        return node, offset
 
     @staticmethod
     def _read_restrictions(d: Path):
@@ -862,7 +954,8 @@ class Router:
         tangent = math.degrees(math.atan2(dx, dy)) % 360.0
         return v if abs(_turn_delta(heading, tangent)) <= 90.0 else u
 
-    def route(self, src_idx: int, dst_idx: int, pref: float, weights: dict = None):
+    def route(self, src_idx: int, dst_idx: int, pref: float, weights: dict = None,
+              heading: float | None = None):
         # Scored once, then used for both jobs: choosing the route and reporting
         # it. They used to disagree — the router optimized the live re-blend
         # while RouteResult.mean_score read the stored neutral column, so a user
@@ -900,9 +993,9 @@ class Router:
             return None
         path.append(src_idx)
         path.reverse()
-        return self._collect(path, w, scores)
+        return self._collect(path, w, scores, heading)
 
-    def _collect(self, path, w, scores):
+    def _collect(self, path, w, scores, heading=None):
         """Turn a Dijkstra node path into the chosen edges, in travel order.
 
         Dijkstra hands back a sequence of node indices. For each hop (a -> b) we
@@ -961,7 +1054,8 @@ class Router:
         real = [int(self.real_node[p]) for p in path]
         return RouteResult(rows, stitch(coords), coords, scores[edge_rows],
                            nodes=real, context=self.maneuver_context,
-                           edge_minutes=self.d_minutes[chosen])
+                           edge_minutes=self.d_minutes[chosen],
+                           start_heading=heading)
 
 
 def stitch(coord_arrays):
@@ -1017,6 +1111,18 @@ def _turn_delta(bearing_in, bearing_out):
 # too small, and a real turn was announced as "Continue". A chord long enough
 # to clear the corner rounding, short enough not to swallow the turn itself.
 TURN_CHORD_M = 25.0
+
+# How far the first step may depart from the driver's own course before it is
+# described as a maneuver rather than as a compass heading, in degrees.
+#
+# 45 and not lower because `_bearing_out` takes its chord over the first 25 m of
+# the route, and on a curving road that chord is a few degrees off the tangent
+# the car is actually on. Announcing "Slight right onto Bedford Street" to a
+# driver already on Bedford Street would be a false instruction bought for
+# nothing — at 45 the modifier is a real turn (`_turn_modifier`'s "left",
+# "right", "sharp" and "uturn" bands all sit at or above it) and the compass
+# form covers everything gentler.
+DEPART_TURN_DEGREES = 45.0
 
 # How much road behind a junction is gathered before that chord is taken off it.
 #
@@ -1209,7 +1315,7 @@ class ManeuverContext:
 class RouteResult:
     def __init__(self, edge_rows: gpd.GeoDataFrame, line, edge_coords=None,
                  scores=None, nodes=None, context: "ManeuverContext" = None,
-                 edge_minutes=None):
+                 edge_minutes=None, start_heading=None):
         self.edges = edge_rows
         self.line = line
         # Per-edge travel time in travel order, as weighted. None falls back to
@@ -1229,6 +1335,11 @@ class RouteResult:
         # names an exit.
         self.nodes = list(nodes) if nodes is not None else []
         self.context = context
+        # The driver's course when this route was asked for, or None if it was
+        # planned from a standstill. Only the first step reads it — see
+        # `steps` — and only to say what the driver has to *do*, which a
+        # compass departure cannot express to a car already moving.
+        self.start_heading = start_heading
         self._steps = None      # memo for steps(); see there
 
     def _column(self, name):
@@ -1452,10 +1563,7 @@ class RouteResult:
                     "roundabout_exit": 0}
 
             if previous is None:
-                step["type"] = "depart"
-                step["modifier"] = "straight"
-                where = f" on {leg['label']}" if leg["label"] else ""
-                step["instruction"] = f"Head {_compass(_bearing_out(pts))}{where}"
+                self._describe_start(step, leg, pts)
             else:
                 # The arrival heading `_legs` gathered for this seam, not one
                 # taken over the previous leg alone — see `_legs`.
@@ -1617,6 +1725,57 @@ class RouteResult:
             step["instruction"] = f"Keep {side} onto {label}"
         else:
             step["instruction"] = f"Keep {side}"
+
+    def _describe_start(self, step, leg, pts):
+        """The first step: a compass departure, or a maneuver when we know
+        which way the car is already pointing.
+
+        "Head southeast on Bedford Street" is the right thing to say to a parked
+        driver and useless to a moving one. A reroute is computed from where the
+        car is *now*, and the road back to the destination is often the way it
+        came — so the opening instruction is routinely a turn, and phrasing it
+        as a compass heading leaves the driver no way to know they have to act.
+
+        Measured on the drives of 2026-08-22: across two drives, 15 of 27
+        reroutes opened against the driver's own course by more than 90 degrees
+        and 9 of them by more than 175 — a U-turn, announced as "Head southeast
+        on The Great Road" to a car doing 70 km/h northwest. The driver kept
+        going, went off the new route within four seconds, and the reroute fired
+        again. Ten times in 160 seconds on one drive.
+
+        `start_heading` is only ever set when the caller sent one, which the app
+        does only while actually moving (see `usableHeading` in
+        NavigationModel.swift), so a trip planned from a standstill still gets
+        the compass form. Below `DEPART_TURN_DEGREES` it gets it too: the route
+        opens along the road the car is on, and naming the compass direction
+        there is both true and less fussy than "Continue".
+
+        The wire vocabulary is unchanged — `turn` plus an existing modifier, as
+        OSRM would send it — so a client built before this renders it correctly
+        with no update.
+        """
+        heading = self.start_heading
+        delta = (None if heading is None
+                 else _turn_delta(heading, _bearing_out(pts)))
+        if delta is None or abs(delta) < DEPART_TURN_DEGREES:
+            step["type"] = "depart"
+            step["modifier"] = "straight"
+            where = f" on {leg['label']}" if leg["label"] else ""
+            step["instruction"] = f"Head {_compass(_bearing_out(pts))}{where}"
+            return
+
+        modifier = _turn_modifier(heading, _bearing_out(pts))
+        step["type"] = "turn"
+        step["modifier"] = modifier
+        phrase = _MODIFIER_PHRASE[modifier]
+        if not leg["label"]:
+            step["instruction"] = phrase
+        elif modifier == "uturn":
+            # You turn around *on* a road, not onto one: a U-turn leaves you on
+            # the same carriageway you were already driving.
+            step["instruction"] = f"{phrase} on {leg['label']}"
+        else:
+            step["instruction"] = f"{phrase} onto {leg['label']}"
 
     def _describe_turn(self, step, leg, previous, modifier):
         phrase = _MODIFIER_PHRASE[modifier]

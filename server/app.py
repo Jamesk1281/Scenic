@@ -124,7 +124,10 @@ def api_route():
     # Heading applies to the start only: it says which way the driver is
     # travelling, and a destination isn't travelling anywhere.
     s, s_off = ROUTER.snap(*a, heading=heading)
-    t, t_off = ROUTER.snap(*b)
+    # The destination goes through the access layer: a pin on a building inside
+    # a car park has to become the road you can get in from, not the nearest
+    # road as the crow flies, which is routinely the wrong side of the building.
+    t, t_off = ROUTER.snap_destination(*b)
     if max(s_off, t_off) > SNAP_MAX_M:
         return jsonify(error="point is outside the covered road network "
                              "(currently Massachusetts)"), 400
@@ -139,9 +142,14 @@ def api_route():
     # At pref 0 the scenic route collapses to the fastest one, so reuse that
     # result instead of running Dijkstra twice — this halves the latency of
     # mid-drive "switch to fastest" reroutes.
+    # `heading` reaches the route as well as the snap. It picks which end of the
+    # road to start from (above) and, in RouteResult._describe_start, whether
+    # the opening instruction is a compass heading or a turn — a route that has
+    # to begin by sending a moving car back the way it came must say so.
     pref = max(0.0, min(1.0, pref))
-    fastest = ROUTER.route(s, t, 0.0, weights)
-    scenic = fastest if pref == 0.0 else ROUTER.route(s, t, pref, weights)
+    fastest = ROUTER.route(s, t, 0.0, weights, heading=heading)
+    scenic = (fastest if pref == 0.0
+              else ROUTER.route(s, t, pref, weights, heading=heading))
     if fastest is None or scenic is None:
         return jsonify(error="no route found between those points"), 404
     return jsonify(fastest=fastest.geojson(), scenic=scenic.geojson())
