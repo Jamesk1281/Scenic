@@ -178,6 +178,64 @@ def test_several_stops_are_counted_separately():
     assert stops.seconds.sum() == pytest.approx(45.0, abs=3.0)
 
 
+def test_a_lunch_stop_is_not_junction_cost():
+    # Measured on the 2026-08-22 batch: two stationary runs of 416 s and 761 s
+    # carried 57% of all "stopped" time across six drives and landed in the
+    # unexplained bucket, which is the one that must never reach graph.py.
+    steps = at.steps(fixes([(20.0, 10), (0.0, at.PARKED_S + 60), (20.0, 10)]))
+    stops = at.stops(steps)
+    assert len(stops) == 1
+    assert stops.parked.all()
+
+
+def test_a_long_red_light_is_still_junction_cost():
+    # The threshold has to sit above every stop the road can impose, or the fit
+    # loses the very samples it is for.
+    steps = at.steps(fixes([(20.0, 10), (0.0, 120), (20.0, 10)]))
+    stops = at.stops(steps)
+    assert len(stops) == 1
+    assert not stops.parked.any()
+
+
+def test_parked_time_comes_off_the_clock_the_router_is_judged_against():
+    # The defect this exists for: a parked car makes the graph look optimistic
+    # by exactly as long as the driver sat there. Same driving either side of
+    # the stop, so the moving-only headline must be the one without it.
+    steps = at.steps(fixes([(20.0, 60), (0.0, at.PARKED_S + 60), (20.0, 60)]))
+    steps["highway"] = "primary"
+    steps["assumed_ms"] = 20.0
+    marked = at.mark_parked(steps, at.stops(steps))
+
+    whole = at.headline(marked)
+    driving = at.headline(marked[~marked.parked])
+    # Two minutes of driving at exactly the speed the graph assumed. Read whole,
+    # the six-minute stop makes the graph look 300% optimistic; read without it,
+    # the graph is right — which it is.
+    assert driving["actual_min"] == pytest.approx(2.0, abs=0.2)
+    assert driving["actual_min"] == pytest.approx(driving["predicted_min"], rel=0.05)
+    assert whole["actual_min"] > driving["actual_min"] + 5.0
+    # The distance is the driving either way: a parked car covers no ground, so
+    # holding the stop out must not cost the fit a single metre.
+    assert whole["km"] == pytest.approx(driving["km"], rel=0.01)
+
+
+def test_marking_parked_steps_survives_a_drive_with_no_stops_at_all():
+    steps = at.steps(fixes([(20.0, 30)]))
+    marked = at.mark_parked(steps, at.stops(steps))
+    assert not marked.parked.any()
+
+
+def test_the_parked_flag_stays_a_bool_when_drives_are_pooled():
+    # An empty drive's frame turned the column to object dtype, where `~` is
+    # arithmetic rather than negation — it raised here and would have indexed
+    # silently wrong anywhere else.
+    empty = at.stops(pd.DataFrame(columns=at.STEP_COLUMNS))
+    real = at.stops(at.steps(fixes([(20.0, 10), (0.0, 20), (20.0, 10)])))
+    pooled = pd.concat([empty, real], ignore_index=True)
+    assert pooled.parked.dtype == bool
+    assert (~pooled.parked).all()
+
+
 # --- the numbers that come out ------------------------------------------------
 
 def test_the_speed_factor_is_measured_distance_weighted():

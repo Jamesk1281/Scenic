@@ -59,6 +59,7 @@ or set SCENIC_PBF). Without either, the rest still works — pass `-` as the dat
 directory.
 """
 
+import datetime as dt
 import json
 import sys
 from collections import Counter
@@ -121,6 +122,31 @@ STOPPED_MS = 1.0
 # A stop has to last this long to be one, in seconds. Shorter is a rolling stop
 # or two jittery fixes, and counting those would inflate the junction cost.
 MIN_STOP_S = 3.0
+
+# Beyond this a stationary run is the driver parking, not the road stopping
+# them, and it is excluded from the junction cost, in seconds.
+#
+# The junction cost this tool exists to fit is time the *road* takes: a signal,
+# a stop sign, a queue. A driver who pulls over for lunch, for fuel, or to take
+# a photograph is not being delayed by the junction they happen to be standing
+# at, and `stops()` cannot tell the two apart from the speed trace alone —
+# both are a car at 0 m/s.
+#
+# Measured on the 2026-08-22 batch, which is why this exists: two stationary
+# runs, of 416 s and 761 s, carried 19.6 of the 34.2 minutes of "stopped" time
+# across six drives. Both landed in the unexplained bucket — the one the README
+# is emphatic must never reach graph.py — and between them they moved one
+# drive's headline error from +32% to +59%. Left in, they would have been
+# fitted as junction cost and baked into every route in the state.
+#
+# 300 s and not tighter because the cost of being wrong is asymmetric. Excluding
+# a real 4-minute queue loses one sample from a fit that pools hundreds;
+# including one 12-minute lunch stop poisons the fit outright. The longest
+# genuinely road-imposed stop worth expecting — a freight crossing, a drawbridge,
+# a lift bridge — runs to about five minutes, so this sits just past it. Every
+# excluded run is printed with its duration and position, because the threshold
+# is a judgement and the reader has to be able to overrule it.
+PARKED_S = 300.0
 
 # How many consecutive steps the stopped/moving decision is made over.
 #
@@ -790,7 +816,7 @@ def stops(steps_df):
     without making every route of a different shape wrong.
     """
     if steps_df.empty:
-        return pd.DataFrame(columns=["start_ts", "seconds", "lat", "lon"])
+        return _stop_frame([])
 
     stopped = steps_df.stopped.to_numpy()
     # Adjacent *rows* are not adjacent *time*. `steps` has already deleted every
@@ -803,8 +829,8 @@ def stops(steps_df):
     # wrong junction. A row continues the previous one only if no time is
     # missing between them.
     ts = steps_df.ts.to_numpy()
-    dt = steps_df.dt_s.to_numpy()
-    continues = np.r_[False, np.isclose(ts[1:], ts[:-1] + dt[:-1], atol=0.5)]
+    spans = steps_df.dt_s.to_numpy()
+    continues = np.r_[False, np.isclose(ts[1:], ts[:-1] + spans[:-1], atol=0.5)]
     runs, start = [], None
     for i, is_stopped in enumerate(stopped):
         if is_stopped:
@@ -823,8 +849,44 @@ def stops(steps_df):
         seconds = float(steps_df.dt_s.iloc[a:b].sum())
         if seconds >= MIN_STOP_S:
             rows.append({"start_ts": float(steps_df.ts.iloc[a]), "seconds": seconds,
-                         "lat": float(steps_df.lat.iloc[a]), "lon": float(steps_df.lon.iloc[a])})
-    return pd.DataFrame(rows, columns=["start_ts", "seconds", "lat", "lon"])
+                         "lat": float(steps_df.lat.iloc[a]), "lon": float(steps_df.lon.iloc[a]),
+                         # Flagged rather than dropped here. Every consumer wants
+                         # a different thing from a parked run — the junction fit
+                         # wants it gone, the unmeasured-time audit wants it
+                         # counted — and a row that never existed cannot be
+                         # reported as an exclusion. See PARKED_S.
+                         "parked": seconds >= PARKED_S})
+    return _stop_frame(rows)
+
+
+def _stop_frame(rows):
+    """A stops table with `parked` guaranteed to be a real bool column.
+
+    Worth a helper rather than a literal `DataFrame(...)` at each exit: `report`
+    concatenates one frame per drive, and an object-dtype column from an empty
+    frame makes `~stops.parked` arithmetic (-1, -2) instead of negation, which
+    fails loudly here and would fail silently anywhere it indexed.
+    """
+    frame = pd.DataFrame(rows, columns=["start_ts", "seconds", "lat", "lon",
+                                        "parked"])
+    return frame.astype({"parked": bool})
+
+
+def mark_parked(steps_df, stops_df):
+    """Flag every step that falls inside a parked run, so the clock can drop it.
+
+    By timestamp span rather than row index: `report` concatenates one frame per
+    route segment before this is called, so row positions no longer line up with
+    the runs `stops()` found, while `ts` is the same monotonic clock throughout.
+    """
+    parked = pd.Series(False, index=steps_df.index)
+    if steps_df.empty or stops_df.empty or "parked" not in stops_df:
+        return steps_df.assign(parked=parked)
+    for _, stop in stops_df[stops_df.parked].iterrows():
+        within = ((steps_df.ts >= stop.start_ts)
+                  & (steps_df.ts <= stop.start_ts + stop.seconds))
+        parked |= within
+    return steps_df.assign(parked=parked)
 
 
 def by_road_class(steps_df):
@@ -971,8 +1033,17 @@ def report(paths, edges, control=None):
         else:
             drive_steps = drive_steps.assign(highway=None, assumed_ms=np.nan)
 
+        # Stops before the headline, because a parked run has to be found
+        # before the clock it sits in can be quoted — see PARKED_S.
+        drive_stops = stops(drive_steps)
+        maneuvers = [s for route, _ in parts for s in route.get("steps", [])
+                     if is_maneuver(s)]
+        drive_stops = classify_stops(drive_stops, control, maneuvers)
+        drive_steps = mark_parked(drive_steps, drive_stops)
+
         planned = parts[0][0]     # the route as first planned, before any reroute
         h = headline(drive_steps)
+        driving = headline(drive_steps[~drive_steps.parked])
         print(f"{Path(path).name}  pref={header.get('pref', '?')}  "
               f"{ending.get('reason', 'unfinished')}  ({len(parts)} route(s))")
         print(f"  planned  {planned['minutes']:5.1f} min for {planned['km']:.1f} km")
@@ -984,14 +1055,27 @@ def report(paths, edges, control=None):
                   f"  (drove {h['matched_min']:.1f} min of it)"
                   f"  →  {h['matched_min'] / h['predicted_min'] - 1:+.0%}")
 
-        drive_stops = stops(drive_steps)
-        maneuvers = [s for route, _ in parts for s in route.get("steps", [])
-                     if is_maneuver(s)]
-        drive_stops = classify_stops(drive_stops, control, maneuvers)
-        stopped_min = drive_stops.seconds.sum() / 60.0
-        print(f"  stopped  {stopped_min:5.1f} min over {len(drive_stops)} stops"
+        parked = drive_stops[drive_stops.parked] if not drive_stops.empty \
+            else drive_stops
+        parked_min = parked.seconds.sum() / 60.0 if not parked.empty else 0.0
+        # The line above charges the router for time the driver spent parked, so
+        # when there is any, say what the number is without it. Not a correction
+        # applied silently: both are printed, and the parked runs are listed at
+        # the end of the report so the reader can disagree with the threshold.
+        if parked_min > 0 and driving["matched_km"] > 0 and driving["predicted_min"] > 0:
+            print(f"  ...without {parked_min:.1f} min parked over "
+                  f"{len(parked)} stop(s) of {PARKED_S / 60:.0f}+ min: "
+                  f"{driving['matched_min']:.1f} min actual vs "
+                  f"{driving['predicted_min']:.1f} predicted"
+                  f"  →  {driving['matched_min'] / driving['predicted_min'] - 1:+.0%}")
+
+        junction_stops = drive_stops[~drive_stops.parked] if not drive_stops.empty \
+            else drive_stops
+        stopped_min = junction_stops.seconds.sum() / 60.0
+        print(f"  stopped  {stopped_min:5.1f} min over {len(junction_stops)} stops"
               f"  ({stopped_min / max(h['km'], 0.01):.2f} min/km,"
-              f" {100 * stopped_min / max(h['actual_min'], 0.01):.0f}% of the drive)")
+              f" {100 * stopped_min / max(h['actual_min'], 0.01):.0f}% of the drive)"
+              + (f"  [+{parked_min:.1f} min parked, excluded]" if parked_min > 0 else ""))
         off = drive_steps.off_m if "off_m" in drive_steps else pd.Series(dtype=float)
         if not off.empty:
             print(f"  off-route p50 {off.median():.0f} m, p95 {off.quantile(0.95):.0f} m"
@@ -1034,6 +1118,8 @@ def report(paths, edges, control=None):
         return
     combined = pd.concat(all_steps, ignore_index=True)
     pooled_stops = pd.concat(all_stops, ignore_index=True)
+    if "parked" in pooled_stops:
+        pooled_stops["parked"] = pooled_stops.parked.fillna(False).astype(bool)
     # `concat` does not carry `.attrs`, so the exclusion counts are re-attached
     # by hand. Losing them would turn "a third of your marks were unusable" into
     # a sample that merely looks small.
@@ -1070,6 +1156,17 @@ def report(paths, edges, control=None):
               "router.py applies at load —")
         print("             run tools/fit_junction_cost.py for the corrected "
               "error, and to re-fit them)")
+        driving_total = headline(combined[~combined.parked]) \
+            if "parked" in combined else total
+        if driving_total["matched_min"] < total["matched_min"] - 0.05:
+            print(f"            {total['matched_min'] - driving_total['matched_min']:.1f} min "
+                  f"of that is the car parked. Without it: "
+                  f"{driving_total['matched_min']:.1f} vs "
+                  f"{driving_total['predicted_min']:.1f} min → "
+                  f"{1 - driving_total['predicted_min'] / driving_total['matched_min']:.0%} "
+                  "optimistic,")
+            print("            which is the figure to fit against. See PARKED_S "
+                  "and the parked runs listed below.")
     print()
 
     # Before the timing chain, and never inside it: this is the only section that
@@ -1332,6 +1429,19 @@ def _stop_report(pooled_stops, total):
         print("  stationary turns every stop into a gap.")
         return
 
+    # Parked runs are stopped time but not junction cost, and mixing them in
+    # here is what makes the per-km figure unusable: on the 2026-08-22 batch two
+    # of them carried 57% of all stopped time. Split first, report both.
+    parked = pooled_stops[pooled_stops.parked] if "parked" in pooled_stops \
+        else pooled_stops.iloc[:0]
+    pooled_stops = pooled_stops[~pooled_stops.parked] if "parked" in pooled_stops \
+        else pooled_stops
+    if pooled_stops.empty:
+        print("STOPS  every stationary run was longer than "
+              f"{PARKED_S / 60:.0f} min, so none of them is junction cost.")
+        _parked_report(parked)
+        return
+
     seconds = pooled_stops.seconds.sum()
     print(f"STOPS  {len(pooled_stops)} of them, {seconds / 60:.1f} min total, "
           f"median {pooled_stops.seconds.median():.0f} s")
@@ -1361,6 +1471,29 @@ def _stop_report(pooled_stops, total):
         print("  which is the part a per-junction penalty in graph.py can predict.")
         print("  The rest needs a traffic feed, or another drive at a different hour")
         print("  to see whether it moves.")
+    _parked_report(parked)
+
+
+def _parked_report(parked):
+    """The stationary runs held out of the junction cost, one line each.
+
+    Listed rather than summarised because the PARKED_S threshold is a judgement
+    about what the driver was doing, and only the driver can check it. A run
+    that was really a level crossing belongs back in the fit, and the way to
+    notice is to recognise the place and the time of day.
+    """
+    if parked.empty:
+        return
+    print(f"\n  HELD OUT AS PARKED  {len(parked)} run(s) over "
+          f"{PARKED_S / 60:.0f} min, {parked.seconds.sum() / 60:.1f} min in total,")
+    print("  excluded from the junction cost above and from the clock it is "
+          "fitted against.")
+    for _, row in parked.sort_values("seconds", ascending=False).iterrows():
+        when = dt.datetime.fromtimestamp(row.start_ts).strftime("%H:%M")
+        print(f"    {row.seconds / 60:5.1f} min from {when} at "
+              f"{row.lat:.5f},{row.lon:.5f}")
+    print("  If one of these was the road stopping you — a freight crossing, a")
+    print("  drawbridge — it belongs in the fit: raise PARKED_S and re-run.")
 
 
 def main(argv):
