@@ -154,6 +154,177 @@ final class RerouteTests: XCTestCase {
         await waitFor { backend.inFlight == 2 }
     }
 
+    // MARK: - The reroute storm the 2026-08-22 drives ran into
+
+    /// A point `east` metres off the line, at `northing` metres along it.
+    private func beside(_ east: Double, at northing: Double) -> CLLocation {
+        Fixture.fix(CLLocationCoordinate2D(
+            latitude: Fixture.north(northing).latitude,
+            longitude: Fixture.origin.longitude + east / 82_600))
+    }
+
+    func test_a_driver_who_keeps_ignoring_the_route_is_asked_less_often() async {
+        // The defect this guards, measured on 2026-08-22: a driver on a road
+        // the route wants to leave clears every existing guard. The cooldown is
+        // for a *failed* attempt, the movement bar for a *parked* one, and
+        // `awaitingJoin` is cleared by the few seconds the replacement line
+        // spends running along the road the driver is already on. Off-route,
+        // reroute, briefly on the new line, off-route again — ten times in 160
+        // seconds, the banner resetting to its first instruction each time.
+        //
+        // Asking again cannot help: the server returns the same route, because
+        // it is the right one. So the interval has to grow.
+        let backend = Backend()
+        let (model, advance) = await afterAReroute(backend)
+
+        // Touch the line just long enough to clear `awaitingJoin` — the overlap
+        // that defeated it — and nowhere near long enough to count as having
+        // taken the route.
+        advance(5)
+        model.update(Fixture.fixAt(900))
+
+        // Eleven seconds after the reroute: past the flat 8 s cooldown that let
+        // every one of those ten attempts through, inside the doubled one.
+        advance(6)
+        model.update(beside(300, at: 1000))
+        try? await Task.sleep(for: .milliseconds(30))
+        XCTAssertEqual(backend.inFlight, 1,
+                       "8 s was enough to ask again before; 11 s must not be")
+
+        // Past the doubled interval it is allowed through, so this is a delay
+        // and not a latch.
+        advance(20)
+        model.update(beside(300, at: 1200))
+        await waitFor { backend.inFlight == 2 }
+    }
+
+    func test_the_interval_keeps_growing_while_the_driver_keeps_declining() async {
+        // One doubling is not enough: the storm ran for 160 seconds. Each
+        // reroute the driver does not take has to cost more than the last.
+        let backend = Backend()
+        let (model, advance) = await afterAReroute(backend)
+
+        advance(5)
+        model.update(Fixture.fixAt(900))
+        advance(20)                                  // clears 16 s, so it fires
+        model.update(beside(300, at: 1000))
+        await waitFor { backend.inFlight == 2 }
+        backend.reply(1, with: namedRoute("Continue on New Road"))
+        await waitFor { !model.isRerouting }
+
+        advance(5)
+        model.update(Fixture.fixAt(1100))
+        advance(20)                                  // 25 s: cleared 16, not 32
+        model.update(beside(300, at: 1200))
+        try? await Task.sleep(for: .milliseconds(30))
+        XCTAssertEqual(backend.inFlight, 2,
+                       "the second refusal should cost more than the first")
+    }
+
+    func test_taking_the_route_it_gave_you_forgives_the_backoff() async {
+        // The backoff must not punish a driver who was simply lost once. Stay on
+        // the replacement line and the next wrong turn gets the base interval.
+        let backend = Backend()
+        let (model, advance) = await afterAReroute(backend)
+
+        // Actually drive the new route for longer than rerouteSettledSeconds.
+        for northing in stride(from: 600.0, through: 1400.0, by: 100) {
+            advance(5)
+            model.update(Fixture.fixAt(northing))
+        }
+        advance(9)                                   // only just past the base 8 s
+        model.update(beside(300, at: 1600))
+
+        await waitFor { backend.inFlight == 2 }
+    }
+
+    func test_switching_to_fastest_is_never_held_back_by_the_backoff() async {
+        // The driver asked for this one. Making them wait out an interval
+        // earned by routes they declined is the opposite of what the escape
+        // hatch is for.
+        let backend = Backend()
+        let (model, _) = await afterAReroute(backend)
+
+        // No time advanced at all: the doubled interval is still running, and
+        // an off-route reroute here would be refused.
+        Task { await model.switchToFastest(from: Fixture.fixAt(700)) }
+        await waitFor { backend.inFlight == 2 }
+        XCTAssertEqual(backend.prefsRequested.last, 0.0)
+        backend.reply(1, with: namedRoute("Continue on Fast Road"))
+        await waitFor { !model.isRerouting }
+    }
+
+    // MARK: - A route the driver never joined
+
+    func test_a_plan_the_driver_drives_away_from_is_eventually_replaced() async {
+        // `hasJoinedRoute` disarms off-route recovery until the driver first
+        // reaches the line — which is what stops a trip planned from the sofa
+        // being thrown away on the first fix. It had no way out. On 2026-08-22
+        // one drive spent its first three and a half minutes and 1.5 km never
+        // touching the line, ending 593 m off it, and no reroute could fire the
+        // whole time: the banner showed the first instruction throughout.
+        let backend = Backend()
+        let model = NavigationModel(route: Fixture.straightRoute(),
+                                    destination: Fixture.north(5000),
+                                    pref: 0.8, weights: [:])
+        model.fetchRoute = backend.fetch
+
+        model.update(beside(100, at: 0))             // starts 100 m off the line
+        XCTAssertFalse(model.hasJoinedRoute)
+        try? await Task.sleep(for: .milliseconds(30))
+        XCTAssertEqual(backend.inFlight, 0, "still plausibly on the way to it")
+
+        model.update(beside(200, at: 0))             // drifting, but not yet far
+        try? await Task.sleep(for: .milliseconds(30))
+        XCTAssertEqual(backend.inFlight, 0)
+
+        model.update(beside(500, at: 0))             // 400 m further out than ever
+        await waitFor { backend.inFlight == 1 }
+    }
+
+    func test_driving_towards_a_route_you_have_not_joined_yet_is_left_alone() async {
+        // The whole point of the join gate: closing on the start of a planned
+        // route must never look like straying off it, however far out you begin.
+        let backend = Backend()
+        let model = NavigationModel(route: Fixture.straightRoute(),
+                                    destination: Fixture.north(5000),
+                                    pref: 0.8, weights: [:])
+        model.fetchRoute = backend.fetch
+
+        for east in stride(from: 2000.0, through: 200.0, by: -200) {
+            model.update(beside(east, at: 0))
+        }
+        try? await Task.sleep(for: .milliseconds(30))
+        XCTAssertEqual(backend.inFlight, 0)
+        XCTAssertFalse(model.hasJoinedRoute)
+    }
+
+    // MARK: - Arriving
+
+    func test_the_last_few_hundred_metres_are_not_re_planned() async {
+        // Inside a few hundred metres a reroute cannot help: the remaining line
+        // is one or two residential streets, GPS error is a large fraction of
+        // their length, and each replacement is a few hundred metres the driver
+        // leaves again at once. The Needham drive of 2026-08-22 rerouted five
+        // times in its last three minutes, within sight of the pin.
+        let backend = Backend()
+        let model = joined(backend)
+
+        model.update(beside(300, at: 4900))          // 100 m of route left
+        try? await Task.sleep(for: .milliseconds(30))
+        XCTAssertEqual(backend.inFlight, 0)
+    }
+
+    func test_straying_with_the_trip_still_ahead_of_you_does_reroute() async {
+        // The other side of the guard: it is about the last few hundred metres,
+        // not about being off route at all.
+        let backend = Backend()
+        let model = joined(backend)
+
+        model.update(beside(300, at: 2000))
+        await waitFor { backend.inFlight == 1 }
+    }
+
     // MARK: - Which way the driver is pointing
 
     func test_a_reroute_while_moving_sends_the_heading() async {

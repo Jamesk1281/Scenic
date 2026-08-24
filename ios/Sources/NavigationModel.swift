@@ -83,6 +83,47 @@ final class NavigationModel {
     /// "arrived" rather than "passing nearby" — see `update`.
     private static let arrivalTailMeters: Double = 250
 
+    /// Below this the car is parked rather than crawling, in m/s.
+    /// Deliberately the same 1.0 m/s as `STOPPED_MS` in `tools/analyze_trace.py`,
+    /// so "stopped" means one thing on the phone and in the analysis.
+    private static let parkedSpeed: CLLocationSpeed = 1.0
+
+    /// How long parked, with the trip nearly spent, counts as having arrived.
+    ///
+    /// Neither existing test fires when the driver stops a little short, and
+    /// they stop short constantly: the route ends at a graph junction, and the
+    /// space they park in is the other side of a kerb. On 2026-08-22 one drive
+    /// finished 118 m from the end of its route and sat there for four minutes;
+    /// `drivenTheLine` wants 40 m and `stoppedAtThePin` wants 40 m from a pin
+    /// that was 102 m from any road. The drive was recorded as abandoned.
+    ///
+    /// 90 seconds and not less because the failure mode is latching early: a
+    /// driver held at a long light 200 m out would have the last of their drive
+    /// thrown away, and `arrived` never un-latches. Ninety seconds stationary is
+    /// longer than all but the worst signal cycle and far shorter than parking.
+    private static let arrivalStopSeconds: TimeInterval = 90
+
+    /// When the car last stopped moving, or nil while it is moving.
+    private var stoppedSince: Date?
+
+    /// Watch for the car being parked, for `arrivalStopSeconds`.
+    ///
+    /// A negative `speed` is CoreLocation declining to say, which is not
+    /// evidence of stopping — treated as movement so an unwilling speedometer
+    /// can never latch arrival on its own.
+    private func trackStopping(_ location: CLLocation) {
+        guard location.speed >= 0, location.speed < Self.parkedSpeed else {
+            stoppedSince = nil
+            return
+        }
+        stoppedSince = stoppedSince ?? now()
+    }
+
+    private var parkedLongEnough: Bool {
+        guard let since = stoppedSince else { return false }
+        return now().timeIntervalSince(since) >= Self.arrivalStopSeconds
+    }
+
     /// How far the match may slide backwards along the route between fixes.
     /// Enough for GPS jitter and a car rocking at a light; not enough to
     /// re-match an out-and-back route onto the leg it drove twenty minutes ago.
@@ -138,6 +179,110 @@ final class NavigationModel {
     /// `switchToFastest` bypasses this deliberately.
     private var lastRerouteOrigin: CLLocationCoordinate2D?
     private static let rerouteMinMovementMeters: Double = 50
+
+    /// How long to wait between off-route reroutes, and how far that stretches
+    /// when they keep coming.
+    ///
+    /// The three guards above each stop a *different* runaway, and the drives of
+    /// 2026-08-22 found a fourth they all pass. A driver on a road the route
+    /// wants to leave — because the destination is behind them, or reachable
+    /// only the long way round — clears the cooldown, clears the 50 m movement
+    /// bar at every attempt, and clears `awaitingJoin` too, because the
+    /// replacement route runs along the road they are on for a few seconds
+    /// before it peels off. Off-route, reroute, briefly on the new line,
+    /// off-route again: measured at ten reroutes in 160 seconds, each resetting
+    /// the banner to its first instruction, and twenty statewide Dijkstras.
+    ///
+    /// Nothing about that is recoverable by asking the server again — it will
+    /// return the same route, because it is the right one. So the answer is to
+    /// ask less often, not to ask differently: the interval doubles for each
+    /// reroute that fails to settle the driver, and resets the moment one does.
+    /// A driver who simply missed a turn sees the base interval, reroutes once,
+    /// rejoins, and never meets the backoff at all.
+    private static let rerouteCooldownSeconds: TimeInterval = 8
+    private static let rerouteCooldownCapSeconds: TimeInterval = 120
+
+    /// How long the driver has to stay on the route for it to count as settled,
+    /// which is what clears the backoff. Long enough that the few seconds of
+    /// overlap between the old road and the new line — the thing that defeated
+    /// `awaitingJoin` — cannot be mistaken for having taken it.
+    private static let rerouteSettledSeconds: TimeInterval = 30
+
+    private var consecutiveReroutes = 0
+    private var onRouteSince: Date?
+
+    /// The interval the off-route check has to clear right now.
+    private var rerouteCooldown: TimeInterval {
+        min(Self.rerouteCooldownSeconds * pow(2, Double(consecutiveReroutes)),
+            Self.rerouteCooldownCapSeconds)
+    }
+
+    /// Watch whether the driver has actually taken the route, and forgive the
+    /// backoff once they have.
+    ///
+    /// Deliberately `joinConfirmMeters` and not `offRouteMeters`: the same
+    /// deadband, and for the same reason. A route running 60 m off — a frontage
+    /// road, the far carriageway — would otherwise read as "settled" while the
+    /// driver was nowhere near it.
+    private func trackSettling(_ here: RouteProgress) {
+        guard here.offRoute <= Self.joinConfirmMeters else {
+            onRouteSince = nil
+            return
+        }
+        let since = onRouteSince ?? now()
+        onRouteSince = since
+        if now().timeIntervalSince(since) >= Self.rerouteSettledSeconds {
+            consecutiveReroutes = 0
+        }
+    }
+
+    /// How much route has to be left for an off-route reroute to be worth
+    /// running at all.
+    ///
+    /// Inside this, a reroute cannot help. The remaining line is one or two
+    /// residential streets, GPS error is a large fraction of their length, and
+    /// every replacement is a few hundred metres the driver leaves again
+    /// immediately. The 2026-08-22 Needham drive rerouted five times in its last
+    /// three minutes, inside 1.3 km of the pin, and ended having never announced
+    /// arrival; this stops the closest-in of those outright and the backoff
+    /// above thins the rest. A driver this close does not need re-planning —
+    /// they need to be left alone to park.
+    ///
+    /// Deliberately measured on `remaining` along the route rather than on the
+    /// straight line to the pin, because the two disagree exactly where it
+    /// matters: a destination on a cul-de-sac can be 100 m away across a fence
+    /// and 3 km away by road.
+    private static let noRerouteWithinMeters: Double = 300
+
+    /// How far the driver may drift *away* from a route they have never joined
+    /// before the plan is treated as stale.
+    ///
+    /// `hasJoinedRoute` disarms off-route recovery until the driver first
+    /// reaches the line, which is what stops a trip planned from the sofa being
+    /// thrown away on the first fix. But it had no way out: a driver who never
+    /// touches the line never re-routes, so the app navigates a route they are
+    /// not on for as long as they keep driving. On 2026-08-22 that was three and
+    /// a half minutes and 1.5 km, ending 593 m off the line, with the banner
+    /// showing the first instruction throughout.
+    ///
+    /// Measured against the *closest* the driver has come to the route start,
+    /// not against where they began. Driving two miles to the start of a planned
+    /// route is legitimate and shortens that distance the whole way; only
+    /// growing it back again says the plan is no longer the one being driven.
+    private static let preJoinAbandonMeters: Double = 250
+    private var closestToRouteStart: Double = .infinity
+
+    /// Whether off-route recovery is live.
+    ///
+    /// Normally that means the driver has reached the route at least once —
+    /// see `hasJoinedRoute` for why. The second clause is the way out of that
+    /// latch: a driver who has never joined and is now further from the route
+    /// start than they have ever been is not on their way to it, and holding
+    /// the plan for them navigates a route nobody is driving.
+    private var armedForReroute: Bool {
+        if hasJoinedRoute { return true }
+        return distanceToRouteStart > closestToRouteStart + Self.preJoinAbandonMeters
+    }
 
     private func hasMovedSinceLastReroute(_ location: CLLocation) -> Bool {
         guard let origin = lastRerouteOrigin else { return true }
@@ -408,6 +553,7 @@ final class NavigationModel {
                 hasJoinedRoute = true
             } else if let lineStart = coordinates.first {
                 distanceToRouteStart = location.distance(to: lineStart)
+                closestToRouteStart = min(closestToRouteStart, distanceToRouteStart)
             }
         }
         if hasJoinedRoute {
@@ -421,11 +567,19 @@ final class NavigationModel {
         // `arrived` never un-latches, and a scenic route that loops out and back
         // passes its own destination, and its own final coordinate, long before
         // the drive is over.
+        trackStopping(location)
         let drivenTheLine = hasJoinedRoute && here.remaining < Self.arrivalMeters
         let stoppedAtThePin = hasJoinedRoute
             && location.distance(to: destination) < Self.arrivalMeters
             && here.remaining < Self.arrivalTailMeters
-        if drivenTheLine || stoppedAtThePin {
+        // Parked, with the trip all but done. The two tests above both measure
+        // distance to a point the driver may have no way of reaching — the end
+        // of the route is a junction and the pin is often not on a road at all
+        // — so neither fires for a car that has simply arrived and switched off.
+        let parkedAtTheEnd = hasJoinedRoute
+            && here.remaining < Self.arrivalTailMeters
+            && parkedLongEnough
+        if drivenTheLine || stoppedAtThePin || parkedAtTheEnd {
             arrived = true
             remainingMeters = 0
             remainingMinutes = 0
@@ -443,19 +597,22 @@ final class NavigationModel {
         // A route adopted a moment ago starts at a junction the driver has yet
         // to reach, so they are legitimately off it until they get there.
         settleAwaitingJoin(here)
+        trackSettling(here)
 
         // Strayed well off the line — re-route from here, keeping the same
         // scenic intent (or fastest, if that's what we're already following).
-        // Four separate things have to be true, because each guards a different
-        // way this loop has actually run away: the cooldown stops a *failed*
-        // attempt retrying on every GPS tick, `hasMoved` stops a *successful*
-        // one retrying forever from a parked car, and `awaitingJoin` stops a
-        // successful one retrying while the driver is still on their way to the
-        // line it put them on.
-        if hasJoinedRoute,
+        // Every clause guards a different way this loop has actually run away:
+        // the cooldown stops a *failed* attempt retrying on every GPS tick,
+        // `hasMoved` stops a *successful* one retrying forever from a parked
+        // car, `awaitingJoin` stops a successful one retrying while the driver
+        // is still on their way to the line it put them on, and the backoff
+        // inside `rerouteCooldown` stops a *correct* one being asked for over
+        // and over by a driver who is not going to take it.
+        if armedForReroute,
            !isRerouting,
            !awaitingJoin,
-           now().timeIntervalSince(lastRerouteAttempt) > 8,
+           here.remaining > Self.noRerouteWithinMeters,
+           now().timeIntervalSince(lastRerouteAttempt) > rerouteCooldown,
            hasMovedSinceLastReroute(location),
            here.offRoute > Self.offRouteMeters {
             Task { await reroute(from: location, reason: "offroute") }
@@ -517,6 +674,10 @@ final class NavigationModel {
         let previousPref = pref
         followingFastest = true
         pref = 0
+        // The driver has changed their mind about where they are going, so the
+        // history of routes they declined says nothing about this one.
+        consecutiveReroutes = 0
+        onRouteSince = nil
         // Both are restored if the request never lands. Left set, the screen
         // would draw the gray "fastest" line and hide the button — with no
         // fastest route ever adopted, so no way to retry — while every later
@@ -578,6 +739,13 @@ final class NavigationModel {
         guard !arrived else { return .ended }
 
         adopt(wantFastest ? response.fastest : response.scenic, reason: reason)
+        // Only off-route reroutes back off. A user tapping "fastest" has asked
+        // for this one and is owed it immediately, and counting it would then
+        // slow down the recovery they asked for.
+        if reason == "offroute" {
+            consecutiveReroutes += 1
+            onRouteSince = nil
+        }
         // Count the driver as on the route even though they are not on it yet:
         // the new line starts at a junction up ahead, not under the car. This
         // is what keeps the banner showing instructions rather than "head to

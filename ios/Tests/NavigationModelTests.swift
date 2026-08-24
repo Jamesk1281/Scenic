@@ -126,6 +126,70 @@ final class NavigationModelTests: XCTestCase {
         XCTAssertTrue(model.arrived)
     }
 
+    func test_parking_short_of_the_end_of_the_route_arrives() {
+        // The defect, measured on 2026-08-22: the driver stopped 118 m from the
+        // end of the route and sat there four minutes. `drivenTheLine` wants
+        // 40 m of route left and `stoppedAtThePin` wants to be 40 m from a pin
+        // that was 102 m from any road, so neither could fire and the drive was
+        // recorded as abandoned. The route ends at a junction; the space you
+        // park in is the other side of a kerb.
+        let model = nav()
+        var clock = Date()
+        model.now = { clock }
+        model.update(Fixture.fixAt(500))
+        // 118 m short, as they really stopped, and stationary past the 90 s bar.
+        for _ in 0..<4 {
+            model.update(Fixture.movingFix(Fixture.north(4880), course: 0, speed: 0))
+            clock = clock.addingTimeInterval(40)
+        }
+        XCTAssertTrue(model.arrived)
+        XCTAssertEqual(model.remainingMeters, 0)
+    }
+
+    func test_a_long_light_short_of_the_destination_is_not_an_arrival() {
+        // The risk this buys: `arrived` never un-latches, so latching at a red
+        // light throws away the rest of the recording. Half a minute stopped is
+        // a signal, not a parking space.
+        let model = nav()
+        var clock = Date()
+        model.now = { clock }
+        model.update(Fixture.fixAt(500))
+        for _ in 0..<3 {
+            model.update(Fixture.movingFix(Fixture.north(4880), course: 0, speed: 0))
+            clock = clock.addingTimeInterval(10)
+        }
+        XCTAssertFalse(model.arrived)
+    }
+
+    func test_parking_with_the_trip_still_ahead_of_you_is_not_an_arrival() {
+        // Lunch, fuel, a photograph. Being stationary is only arrival when
+        // there is essentially no route left.
+        let model = nav()
+        var clock = Date()
+        model.now = { clock }
+        model.update(Fixture.fixAt(500))
+        for _ in 0..<10 {
+            model.update(Fixture.movingFix(Fixture.north(2000), course: 0, speed: 0))
+            clock = clock.addingTimeInterval(60)
+        }
+        XCTAssertFalse(model.arrived)
+    }
+
+    func test_a_phone_with_no_opinion_on_speed_cannot_latch_arrival() {
+        // CoreLocation reports -1 when it will not say. Reading that as "not
+        // moving" would arrive on the first fix within 250 m of the end, on
+        // exactly the phones whose data is least trustworthy.
+        let model = nav()
+        var clock = Date()
+        model.now = { clock }
+        model.update(Fixture.fixAt(500))
+        for _ in 0..<5 {
+            model.update(Fixture.fixAt(4880))          // speed -1
+            clock = clock.addingTimeInterval(60)
+        }
+        XCTAssertFalse(model.arrived)
+    }
+
     func test_passing_near_the_destination_early_is_not_an_arrival() {
         // `arrived` never un-latches, so a route that merely runs past the
         // destination pin on its way out used to end the drive on the spot — and
