@@ -149,13 +149,13 @@ the first two are the usual Windows build headaches.
 .venv/bin/python -m pytest tests/
 ```
 
-With all five parquets copied over, expect **230 passed, 3 skipped**. The three
+With all five parquets copied over, expect **237 passed, 3 skipped**. The three
 skips are expected and permanent on a serving box: they need
 `scored_chunks.parquet`, a pipeline artifact the server never reads and the file
 list above deliberately does not copy. With the three required ones but not the
-access layer, expect **226 passed, 7 skipped** — the four extra skips are the
+access layer, expect **233 passed, 7 skipped** — the four extra skips are the
 car-park destination tests, standing aside for the same reason. With none of the
-parquets — a fresh clone — expect **121 passed, 99 skipped**: everything that needs a built graph
+parquets — a fresh clone — expect **133 passed, 107 skipped**: everything that needs a built graph
 steps aside cleanly rather than erroring, so a skip here means "the data isn't
 here yet" and never "the data is wrong".
 

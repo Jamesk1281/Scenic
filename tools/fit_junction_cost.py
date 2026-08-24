@@ -49,8 +49,8 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 from common import CONTROL_COLUMNS, CRS_METERS  # noqa: E402
 from router import CONTROL_SECONDS, SPEED_FACTOR, SURFACE_SPEED_FACTOR  # noqa: E402
-from analyze_trace import (attach_road_class, load, segments,  # noqa: E402
-                           steps, stops)
+from analyze_trace import (PARKED_S, attach_road_class, load,  # noqa: E402
+                           mark_parked, segments, steps, stops)
 
 # How close a route vertex has to be to a node to *be* that node, in metres.
 # The two come from the same coordinates via the API's GeoJSON, so this is a
@@ -270,6 +270,17 @@ def main(argv):
                  else pd.DataFrame())
         frame = attach_road_class(frame, edges)
         drive_stops = stops(frame) if not frame.empty else pd.DataFrame()
+        # Parked runs are held out of *both* halves of this fit, the same way
+        # `analyze_trace.report` holds them out of its headline. `stops` only
+        # flags them — every consumer decides for itself — and this consumer is
+        # the one that must not keep them: a stationary run that happens to end
+        # within STOP_REACH_M of a signal is otherwise charged to that signal,
+        # and its minutes also stay in the clock the model is scored against.
+        # Measured on drive-2026-08-22-202700, whose 7.1-minute parked run sits
+        # beside one: leaving it in reads 7 signal stops and 11.7 min where the
+        # drive had 4 and 4.1, and takes the fitted signal cost from 10.3 s to
+        # 18.7 s — a lunch break, charged to every signal in Massachusetts.
+        frame, drive_stops, parked_min = hold_out_parked(frame, drive_stops)
         xy, kinds = controls_on_line(drive_driven, edges, control)
         drive_stops = attribute(drive_stops, xy, kinds)
 
@@ -283,6 +294,12 @@ def main(argv):
         for cause, row in by.iterrows():
             print(f"    stopped at {cause:<12}{int(row['size']):>3} times, "
                   f"{row['sum'] / 60:>5.1f} min")
+        # Printed rather than silently dropped, because the threshold is a
+        # judgement: a drawbridge belongs in the fit and a lunch break does not,
+        # and only the reader can tell them apart. See PARKED_S.
+        if parked_min > 0:
+            print(f"    held out {parked_min:>5.1f} min parked "
+                  f"({PARKED_S / 60:.0f}+ min stationary)")
         print()
         drives.append({"name": Path(path).name, "driven": drive_driven,
                        "steps": frame, "met": met_here,
@@ -354,6 +371,26 @@ def report_cost(drives):
           f"{stopped['unexplained'] / 60:.1f} min — left out of the graph on "
           "purpose (§7)")
     return cost
+
+
+def hold_out_parked(frame, stops_df):
+    """Drop the parked runs from both halves of the fit; say how long they were.
+
+    Returns (steps without parked ones, stops without parked ones, minutes held
+    out). Both halves, because the two are the numerator and the denominator of
+    the same claim: a run left in the stops table becomes junction cost, and the
+    same run left in the steps stays in the clock the fitted model is scored
+    against, so keeping one and dropping the other is worse than keeping both.
+
+    `analyze_trace.stops` only flags these runs — `b9951d1` made that deliberate,
+    on the grounds that every consumer wants something different from them — and
+    this consumer is the one that must not keep them.
+    """
+    if frame.empty:
+        return frame, stops_df, 0.0
+    marked = mark_parked(frame, stops_df)
+    parked_min = float(stops_df[stops_df.parked].seconds.sum()) / 60.0
+    return marked[~marked.parked], stops_df[~stops_df.parked], parked_min
 
 
 def evaluate(drive, edges, cost):

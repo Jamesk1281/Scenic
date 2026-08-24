@@ -110,21 +110,31 @@ SURFACE_SPEED_FACTOR = 0.95
 
 # Seconds lost per traffic control *met* — P(stop) and the delay when you do
 # stop, folded into the one number a static graph can charge. Fitted by
-# `tools/fit_junction_cost.py`: signals were met 53 times for 16 stops averaging
-# 31.7 s, stop signs 9 times for 6 stops averaging 14.0 s.
+# `tools/fit_junction_cost.py` over all eight recorded drives: signals were met
+# 127 times for 47 stops averaging 31.3 s, stop signs 18 times for 11 stops
+# averaging 13.3 s.
 #
 # These are an average over a quiet hour and a busy one, and that is the most a
-# static graph can be. The two drives met almost the same number of signals — 26
-# and 27 — and stopped at 4 and 12 of them, so fitting either drive alone gives
-# 2.7 s or 16.1 s per signal. The location of a signal is structural; the wait
-# at it is not. See docs/junction-timing-plan.md §10.
+# static graph can be. The spread is real and it is the reason to pool: fitting
+# a single drive alone gives anywhere from 2.7 s to 16.1 s per signal. The
+# location of a signal is structural; the wait at it is not. Left one drive out
+# at a time, the pooled figure moves only between 10.0 s and 13.8 s, and the
+# fitted model predicts a held-out drive to 15% where free-flow manages 25%.
+# See docs/junction-timing-plan.md §10.
+#
+# Was 9.5 s / 9.3 s, fitted on 2026-08-15 from the first two drives alone. Six
+# more drives moved the signal up and the stop sign down. Note that the interim
+# figure the fit reported on 2026-08-24 — 18.7 s per signal — was an artifact:
+# `fit_junction_cost.py` was not applying the `parked` flag, so one drive's
+# 7.1-minute lunch stop was charged to the signal it parked beside. Held out
+# properly, the same six drives say 13.0 s and all eight say 11.5 s.
 #
 # Give-ways are the one number here that is a judgement rather than a
-# measurement — the two drives met none. Half a stop sign, on the grounds that
-# yielding is cheaper than stopping and that charging zero is a known error in a
-# known direction. Massachusetts has 839 of them against 17,567 stop signs, so
-# the choice moves an ETA by well under a tenth of a percent either way.
-CONTROL_SECONDS = {"signal": 9.5, "stop": 9.3, "giveway": 4.7}
+# measurement — eight drives have met none. Half a stop sign, on the grounds
+# that yielding is cheaper than stopping and that charging zero is a known error
+# in a known direction. Massachusetts has 839 of them against 17,567 stop signs,
+# so the choice moves an ETA by well under a tenth of a percent either way.
+CONTROL_SECONDS = {"signal": 11.5, "stop": 8.1, "giveway": 4.7}
 
 # The scenery penalty saturates — past a few minutes-per-km the router has taken
 # every detour worth taking — which used to leave the slider's top half handing
@@ -315,12 +325,12 @@ class Router:
         entrance, so `SNAP_MAX_M` keeps meaning "is this anywhere near our road
         network" rather than silently becoming "did we find an entrance".
         """
-        _, offset = self.snap(lat, lon)
+        pin = self.snap(lat, lon)
         entry = self.access_point(lat, lon)
         if entry is None:
-            return self.snap(lat, lon)
+            return pin
         node, _ = self.snap(*entry)
-        return node, offset
+        return node, pin[1]
 
     @staticmethod
     def _read_restrictions(d: Path):
