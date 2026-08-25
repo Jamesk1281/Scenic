@@ -11,8 +11,19 @@ import numpy as np
 import pytest
 import shapely
 
-from common import CONTROL_COLUMNS, CRS_METERS
-from graph import (SAMPLE_STEP_M, attach_scores, count_controls,
+# `graph.py` imports osmium at module scope — it subclasses `SimpleHandler`, so
+# the import cannot be deferred into the one function that reads a PBF. The
+# serving box is told not to install `pipeline/requirements.txt` (osmium and
+# rasterio are the Windows build headaches, and neither is needed to serve), so
+# without this the whole file fails to *collect* and pytest aborts the run
+# before a single test executes — no skips, no passes, no verification, on the
+# one box `server/DEPLOY.md` says to run the suite on. Skipped rather than
+# guarded per-test because every test here builds a graph, which is exactly the
+# job a serving box never does.
+pytest.importorskip("osmium", reason="graph build tests need the pipeline deps")
+
+from common import CONTROL_COLUMNS, CRS_METERS  # noqa: E402
+from graph import (SAMPLE_STEP_M, attach_scores, count_controls,  # noqa: E402
                    sample_offsets, parse_maxspeed)
 from score import WEIGHTS, blend, components, composite
 

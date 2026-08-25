@@ -149,15 +149,27 @@ the first two are the usual Windows build headaches.
 .venv/bin/python -m pytest tests/
 ```
 
-With all five parquets copied over, expect **237 passed, 3 skipped**. The three
-skips are expected and permanent on a serving box: they need
+With all five parquets copied over, expect **207 passed, 4 skipped**. All four
+skips are expected and permanent on a serving box. Three of them need
 `scored_chunks.parquet`, a pipeline artifact the server never reads and the file
-list above deliberately does not copy. With the three required ones but not the
-access layer, expect **233 passed, 7 skipped** — the four extra skips are the
-car-park destination tests, standing aside for the same reason. With none of the
-parquets — a fresh clone — expect **133 passed, 107 skipped**: everything that needs a built graph
-steps aside cleanly rather than erroring, so a skip here means "the data isn't
-here yet" and never "the data is wrong".
+list above deliberately does not copy. The fourth is the whole of
+`tests/test_graph.py`, which tests the graph *build*: `graph.py` subclasses
+`osmium.SimpleHandler`, so it imports osmium at module scope, and step 2 above
+tells you not to install it here. Before 2026-08-24 that was not a skip but a
+**collection error that aborted the entire run** — no passes, no skips, no
+verification at all, on the one box this file tells you to verify on.
+
+With the three required parquets but not the access layer, expect **203 passed,
+8 skipped** — the four extra skips are the car-park destination tests, standing
+aside for the same reason. **The skip count is the check, not the pass count:
+4 means the access layer is loaded, 8 means it never made it across.**
+
+On a development box, with the pipeline dependencies and every parquet
+including `scored_chunks.parquet`, the same suite is **240 passed, 0 skipped**;
+on a fresh clone with the pipeline deps but no data at all, **133 passed, 107
+skipped**. Everything that needs a built graph steps aside cleanly rather than
+erroring, so a skip means "the data isn't here yet" and never "the data is
+wrong".
 
 What matters is that nothing *fails*: a failure means the data and the code
 disagree. (Count the skips, not the passes — the pass count moves whenever a
