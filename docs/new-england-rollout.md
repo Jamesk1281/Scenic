@@ -78,7 +78,7 @@ relief for Massachusetts by 13% before a single new state is considered, which
 is exactly the region-dependence the `RELIEF_WINDOW_M` comment predicts. Any
 attempt to re-fit `RELIEF_FULL` without fixing this is fitting to an artifact.
 
-**Recommendation: band the filter by latitude.** Split the mosaic into latitude
+**Decided 2026-08-26: band the filter by latitude.** Split the mosaic into latitude
 bands, use the correct pixel window per band, and overlap the bands by a halo of
 `win // 2 + 1` rows so the `maximum_filter`/`minimum_filter` results are
 identical to a whole-array run. Then 750 m means 750 m everywhere.
@@ -222,36 +222,83 @@ component moving where no border is near — is a region-dependence bug, and thi
 is the phase that catches it while it is still cheap. Quantify the border band:
 if more than a few percent of MA chunks change, understand why before Phase 4.
 
-## Phase 4 — Re-fit the scoring constants
+## Phase 4 — Re-fit the scoring constants (full, region-wide)
 
-Only now is there a distribution to fit against. Three items, in order:
+**Decided 2026-08-26: full re-fit**, so a 7/10 means the same thing in Stowe as
+in Sudbury. That is the right call for the app, and it is a bigger job than
+"change two numbers" — because of a coupling chain that is worth laying out
+before anyone starts.
 
-**`RELIEF_FULL = 100.0`.** Fit it on **road-sampled relief, not area.** The
-expansion note's headline — "already saturates 7.2% of Massachusetts" — is an
-*area* figure (measured: 7.16%). Road-weighted, `c_relief` pins on **1.64% of MA
-chunks**, four times lower, because roads follow valleys and notches rather than
-summits. Fitting to the area number would over-correct. The method: take the
-road-km-weighted relief distribution over the whole region and set `RELIEF_FULL`
-so the saturated share is comparable to what Massachusetts had, then check what
-the White Mountains actually do rather than assuming they pin.
+### `RAW_BASE` and `STRETCH` are live routing parameters, not display scaling
 
-**`BYWAY_NAMES`** — deleted in Phase 0; confirm the byway coverage looks sane
-per state here.
+`router.py:45` imports `composite` from `score.py` and calls it on **every
+request** (`router.py:866`) to re-blend each edge under the user's beauty
+weights. So the composite is not a presentation layer over a stored number — it
+is inside the cost function:
 
-**`RAW_BASE = 0.143` / `STRETCH = 1.20`.** These were fitted so MA lands p50
-≈ 4.5 and p99 ≈ 9.5. Rural Maine and Vermont systematically forfeit `c_urban`
-(0.14) and `c_coast` (0.13) while gaining relief, curves and green, and the net
-is not predictable from component counts. Re-check the percentiles region-wide.
-**This is the decision with the widest blast radius:** re-fitting them changes
-every Massachusetts score, and Massachusetts is the only place the model has
-ever been validated. See "Decisions needed".
+```
+score   = 10 * clip((raw + RAW_BASE) * STRETCH + score_adj, 0, 1)
+penalty = km * (1 - score/10)                      # router.py:_weights
+weight  = minutes + pref^PREF_CURVE * BETA * penalty
+```
 
-The gate for all of it is the same and it is not negotiable:
-`tools/analyze_trace.py` on the 76 marks, separation at or above 0.71 against
-the 0.63 null ceiling. A constant that improves New England and regresses that
-number is not an improvement. `tests/test_calibration.py` is the second rail —
-it exists precisely because "a scoring constant is a single number that silently
-reshapes 66,000 km of road", and now it is 239,000 km.
+Changing `RAW_BASE` or `STRETCH` therefore changes **which route comes back**,
+not just the number printed on it. Two consequences:
+
+- The `DEPLOY.md` rule that the code and the parquets must come from the same
+  commit is not a formality here. A server on old parquets with new constants
+  returns different routes with no error anywhere.
+- **`BETA = 8.0` and `PREF_CURVE = 2.0` were co-fitted against the current
+  scale, and the code says so.** `router.py:141` records that the slider's dead
+  top half "was really the compressed score scale (see `RAW_BASE` in
+  `score.py`)", and that BETA and PREF_CURVE "trade against each other exactly
+  that way, and the sweep above BETA settles both at once". Re-fitting the
+  composite invalidates that sweep. **Phase 4 must end with the BETA /
+  PREF_CURVE sweep re-run**, or the router's willingness to detour shifts
+  silently — the exact defect that sweep was built to fix.
+
+### What the 76 marks can and cannot see
+
+This matters because it is tempting to treat the marks as the gate for
+everything, and for two of these constants they are blind:
+
+| constant | do the marks see it? |
+|---|---|
+| `RELIEF_FULL` | **yes** — changes component values, so it reorders roads |
+| byway relations | **yes** — reorders roads |
+| `STRETCH` | **yes, indirectly** — `score_adj` is added *outside* the stretch, so raising it amplifies scenery against the road-class penalty and reorders |
+| `RAW_BASE` | **essentially no** — a pure additive shift inside the clip. Separation is a rank statistic, so it cancels, except where it pushes chunks into the 0 or 10 clip |
+
+So separation on the marks governs relief and byways, and only weakly constrains
+the composite. The gates for `RAW_BASE`/`STRETCH` are instead:
+
+- `tests/test_calibration.py`'s distribution guards — p50 near 4.5, p99 near
+  9.5, nothing pinned at a ceiling, byways above the Mass Pike. It exists
+  because "a scoring constant is a single number that silently reshapes 66,000
+  km of road", and it is now 239,000 km;
+- `score.py`'s own `calibration_report`, which already prints the pinned and
+  floored road-km shares — watch those, since `RAW_BASE` acts through clipping;
+- the BETA / PREF_CURVE sweep, which is the only thing that tests the *routing*
+  consequence rather than the score distribution.
+
+### Order of work
+
+1. **`RELIEF_FULL`** — fit on **road-km-weighted** relief, not area. The
+   expansion note's headline "already saturates 7.2% of Massachusetts" is an
+   area figure (measured: 7.16%). Road-weighted, `c_relief` pins on **1.64% of
+   MA chunks** — four times lower, because roads follow valleys and notches
+   rather than summits. Fitting to the area number over-corrects. Set it so the
+   region-wide saturated road-km share is comparable to Massachusetts', then
+   look at what the White Mountains actually do rather than assuming they pin.
+2. **Byway coverage** — sanity-check per state now that relations are wired in.
+3. **`RAW_BASE` / `STRETCH`** — re-fit so p50/p99 land right across all six
+   states, watching the pinned/floored shares.
+4. **Re-run the marks** — separation at or above the live build's 0.71 against a
+   0.63 null ceiling. A constant that improves New England and regresses that
+   number is not an improvement.
+5. **Re-run the BETA / PREF_CURVE sweep** on the new scale. Do not skip this
+   because the scores "look right"; it is a routing constant, and the score
+   distribution cannot tell you about it.
 
 **Curvature needs nothing.** Measured with `score.py`'s own function on 400 m
 chunks: `CURVE_FULL` pins 19.0% of MA road-km and only 22.6% of New Hampshire's,
@@ -311,20 +358,22 @@ question the traces can answer. Do not build the compiled router on spec.
 `SCENIC_DATA` makes the switch a one-line change and the rollback identical, so
 the deploy risk is not the switch. It is two numbers.
 
-**RAM on the serving box.** The router peaks at **1.82 GB on Massachusetts**,
-with the optional access layers loaded. Scaling the arrays by 3.53x puts New
-England near **6–6.5 GB resident**, or ~4.5 GB without the access layers.
-`server/DEPLOY.md` prices those layers at "+10 s startup, +0.5 GB RAM and 59 MB
-on disk" and marks them optional; at region scale that is more like +1.8 GB, and
-dropping them reinstates the parking-lot snap defect that took one drive from 13
-off-route reroutes to 3. **I do not know how much RAM the Windows laptop has,
-and this is the one fact that could invalidate serving the region from it.**
-Establish it before Phase 2, not after.
+**RAM on the serving box — settled.** The router peaks at **1.82 GB on
+Massachusetts** with the optional access layers loaded; scaling the arrays by
+3.53x puts New England near **6–6.5 GB resident**. The serving laptop has 16 GB
+or more (confirmed 2026-08-26), so **the access layers ship** and the
+parking-lot arrival fix is kept — the one that took a replayed drive from 13
+off-route reroutes to 3. Still worth watching the first startup on the box
+rather than trusting the projection: it is a linear extrapolation from one
+measurement, and 6.5 GB of 16 leaves room but not a lot of slack alongside a
+browser and a tunnel.
 
-**Upload.** The serving payload goes from 77 MB (`graph_edges` 70 + `graph_nodes`
-6.8 + `turn_restrictions` 0.1) to **~271 MB**, plus ~154 MB if the access layers
-ship. Over a home upload link, behind a tunnel. `DEPLOY.md` already treats an
-80 MB copy as a cost worth noting; this is five times that.
+**Upload.** The serving payload goes from 77 MB (`graph_edges` 70 +
+`graph_nodes` 6.8 + `turn_restrictions` 0.1) to **~271 MB**, and with the access
+layers shipping, **~425 MB** total. Over a home upload link, behind a tunnel.
+`DEPLOY.md` already treats an 80 MB copy as a cost worth noting; this is five
+times that. Worth staging as a copy that can resume rather than one long
+transfer.
 
 Also: load time scales with it — 14.8 s becomes ~52 s of restart downtime.
 
@@ -358,30 +407,32 @@ back to a regional box only when there is nothing better. That is a real (small)
 UX change rather than a constant edit — and because the wire protocol does not
 change, it ships on its own schedule, before or after the server switch.
 
-## Decisions needed
+## Decisions taken, 2026-08-26
 
-1. **Relief window** — band the filter (recommended: correct, unlocks the next
-   expansion, cuts the peak), pin `win = 13` (preserves MA continuity, keeps a
-   ±6% latitude bias), or accept 15 px and re-fit around it.
-2. **How far to re-fit.** Minimal — fix relief and byways, leave `RAW_BASE`/
-   `STRETCH` alone, accept that northern scores skew — or full, re-fitting the
-   composite region-wide and re-validating Massachusetts against the 76 marks.
-   Minimal is safer; full is the only way a 7/10 means the same thing in Stowe
-   as in Sudbury.
-3. **How much RAM the serving laptop has.** Gates Phase 6 and possibly the whole
-   approach of serving the region from it.
-4. **Whether the access layers ship.** ~154 MB more upload and ~1.8 GB more RAM,
-   against reinstating a measured arrival defect.
+1. **Relief window: band the filter by latitude.** Correct rather than
+   re-centred, cuts the filter peak, and is the machinery the next expansion
+   needs anyway.
+2. **Scoring re-fit: full, region-wide** — `RELIEF_FULL`, the byway relations,
+   and `RAW_BASE`/`STRETCH`, **plus the BETA / PREF_CURVE re-sweep** that
+   re-fitting the composite forces. See Phase 4 for why that last item is not
+   optional.
+3. **Serving box: 16 GB or more**, so the access layers ship and the
+   parking-lot arrival fix is kept.
+
+Still open, and answerable later: whether to keep the Massachusetts build on the
+serving box alongside New England for a hot rollback (needs ~271 MB more disk
+there, no extra RAM unless both are loaded).
 
 ## Risks, and what each one costs
 
 | risk | cost if it bites | mitigation |
 |---|---|---|
-| Serving laptop cannot hold ~6 GB | region unservable from it; VPS or a slimmer router needed | measure RAM before Phase 2 |
+| Composite re-fit lands without a BETA re-sweep | router's detour appetite shifts silently; the slider's dead-top defect returns | Phase 4 step 5 is a gate, not a nicety |
 | Disk fills mid-build (98% today, ~1.5 GB needed) | a partial build in a scratch dir | build into `data/processed-ne`, never over `data/processed`; delete the `.tif`s after scoring |
 | Re-fitting the composite regresses Massachusetts | the only validated region gets worse | the 76 marks are the gate; keep the live build serving until it passes |
 | Latency lands worse than 1.3 s | poor planning UX | Phase 5 says defer, not ignore — measure on a real drive |
 | Byway relation allowlist admits a walking route | footpaths flagged as scenic road | vet all 13 networks; `nwn`/`lwn`/`lcn` are known-bad |
+| Serving box runs at ~6.5 GB of 16 | swapping would dominate every latency number here | watch the first real startup rather than trusting the extrapolation |
 
 Throughout: **`data/processed/` is not written to by any phase.** The live
 Massachusetts build keeps serving until Phase 6 chooses to switch, and switching
