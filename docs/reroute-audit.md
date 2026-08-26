@@ -1,10 +1,9 @@
 # Audit the reroute path for what the first two fixes did not catch
 
-**Status: AUDITED 2026-08-26. Lead 1 confirmed, lead 2 killed as stated, one
-new and more severe defect found underneath both. Nothing fixed — no source
-file was changed.** This is a review-and-measurement brief, not a change brief.
-The original brief is preserved below unaltered; findings begin at
-"# Findings".
+**Status: AUDITED AND FIXED 2026-08-26. Lead 1 confirmed, lead 2 killed as
+stated, one new and more severe defect found underneath both — and all of them
+now fixed.** The original brief is preserved below unaltered. Findings begin at
+"# Findings"; what was changed, and how it was verified, at "# What was fixed".
 
 ## Context: what is already fixed, so do not re-find it
 
@@ -513,3 +512,137 @@ Findings 1 and 3 want a test each. Per the brief, **not** in
 would hold both — one asserting that adopting a route equal to the current one
 preserves `currentStep`/`travelled`, one driving the fix sequence above and
 asserting `offRoute` does not climb while the car holds station near the line.
+
+---
+
+# What was fixed
+
+**2026-08-26, after the audit above and on the same branch.** The brief's "change
+no source file" was lifted explicitly. Before touching anything I re-checked that
+no other branch had landed reroute work — `main` was still at `e6109d9` and every
+branch touching this path was at or behind it.
+
+Four changes in `ios/Sources/NavigationModel.swift`, plus one new test file.
+Findings 1, 3, 4 and 5 are all fixed. Finding 2 needed no fix: it was killed as a
+defect, and the replay below re-confirms every gap was legal.
+
+## Finding 3 — `reseatIfPinned`
+
+The root cause, so it went first. `update` now runs the floored projection
+through `reseatIfPinned`: only when the constrained match claims off-route does
+it ask the unconstrained one, and only if *that* puts the driver within
+`joinConfirmMeters` — and no further back than `reseatWindowMeters` (500 m) — is
+the match re-seated. `travelled`, `matchAtAdoption` and `currentStep` are
+re-derived from the corrected match.
+
+Two bounds make this safe, and both matter:
+
+- The free match can only ever be *earlier* than the floor, because anything
+  later is available to the constrained search too. This can never skip a driver
+  forwards.
+- The 500 m window stops a scenic loop's outbound leg standing in for its
+  return. Without it the measured 282 m correction and a 35 km one look alike.
+
+The audit warned that a `!runningBackwards` gate clause would trade the storm for
+a frozen banner. That is why the fix is in the match and not in the gate; the
+gate is untouched and still has its seven clauses.
+
+## Finding 1 — `sameLine` / `merge`
+
+`reroute` now compares the incoming geometry against the line being driven. On a
+match it calls `merge` instead of `adopt`: the steps and `stepRemaining` are
+replaced, `currentStep` is re-derived, and `travelled`, `matchAtAdoption` and
+`remainingMeters` are left alone.
+
+Two things the audit called for, and one it did not:
+
+- **Merge, not discard.** `seq 6 → 7` returned the same polyline with a corrected
+  departure instruction, so the words are still taken.
+- **The step index is re-derived, not kept.** An index into the old step list
+  names a different maneuver in the new one. `firstStepAhead` was split out of
+  `advanceSteps` so both can use the same walk.
+- **`awaitingJoin` is still armed.** This the audit missed, and the existing
+  suite caught it: the driver was sent a replacement *because they had left the
+  route*, and nothing about the line being unchanged puts them back on it.
+  Without the join gate a driver drifting beside their route asks again on every
+  cooldown — the exact storm this path exists to stop.
+
+Merged routes are recorded in the trace with `-same` appended to the reason, so a
+drive handed the same line six times still says so.
+
+## Findings 4 and 5 — the two small ones
+
+`switchToFastest` now saves `consecutiveReroutes`/`onRouteSince` alongside `pref`
+and restores all four when the request fails. And a reroute that never lands now
+counts toward the backoff, so a dead server is retried on a widening interval
+rather than every 8 s forever.
+
+**Finding 5 is the one judgement call in here rather than a proven defect** — the
+audit rated it medium-low and said so. It is in its own commit, so it can be
+dropped without disturbing the rest. The reasoning for keeping it: reaching the
+120 s cap takes four consecutive failures, by which point the network is gone,
+and `trackSettling` clears the counter as soon as the driver holds the line for
+30 s.
+
+## Verification
+
+**The tests have teeth.** Each fix was reverted in turn and the suite re-run.
+Every mutation was caught, by exactly one test and no others:
+
+| mutation | test that failed |
+|---|---|
+| projection no longer re-seated | `test_a_match_pinned_behind_the_car_does_not_read_as_off_route` |
+| adopt unconditionally again | `..._keeps_the_drive_where_it_is`, `..._still_takes_the_better_words` |
+| `merge` drops the join guard | `test_the_same_line_back_again_still_holds_off_the_next_reroute` |
+| failed `fastest` tap not restored | `test_a_fastest_switch_that_never_lands_leaves_the_backoff_alone` |
+| failed reroute costs nothing | `test_a_reroute_that_never_lands_still_costs_an_interval` |
+
+**Replayed against all twelve recorded drives.** The matcher was re-implemented
+in numpy and first validated against the phone's own numbers: **max
+|simulated − logged| = 0.0000 m across 29,736 fixes**, so the counts below are
+the app's arithmetic, not an approximation of it.
+
+| | before | after |
+|---|---:|---:|
+| fixes reading off-route (> 60 m) | 2069 | 2053 |
+| re-seats performed | – | 7 |
+| off-route reroutes that would fire | 51 | 43 |
+
+**8 of the 51 off-route reroutes stop firing at all** — the phantom ones. Of the
+8 byte-identical adoptions, 3 disappear entirely and the other 5 still fire,
+correctly, and are now merged rather than adopted. `202122` seq 5, the 17 s gap
+that started this, is one of the 3: by the trigger fix the match has already been
+re-seated and reads 11.8 m instead of 168.2 m.
+
+Both suites green: **240 backend, 118 iOS** (110 before, plus the 8 new).
+
+## Test files that were edited, and why
+
+The brief said not to touch `ios/Tests/RerouteTests.swift`. Two files needed a
+fixture change anyway, and it is worth being explicit about what changed:
+
+- `RerouteTests.namedRoute` and two `DriveTraceTests` fixtures built their
+  "replacement" route with `Fixture.straightRoute()` at `start: 0` — the
+  **byte-identical line** the model was already following. So tests written for
+  the adopt path silently exercised the merge path once merging existed. They now
+  pass `start: 150`, which is what `Fixture.straightRoute`'s own documentation
+  says a replacement looks like ("it begins at the graph junction `snap` chose").
+  Collinear with the original, so every geometric assumption in those tests is
+  unchanged.
+- **No assertion was weakened.** One of the two DriveTrace fixtures was
+  contradicting its own comment, which opens "`travelled` restarts at zero on a
+  new line" over a fixture whose line was not new.
+
+Everything about the same-line path is tested in the new
+`ios/Tests/RerouteIdentityTests.swift`, as the audit proposed.
+
+## What is still open
+
+- The arrival-gate defect at `NavigationModel.swift:571-582` — out of scope
+  throughout, still open, still someone else's.
+- **The request is still not recorded in the trace**, so "was the server right to
+  return the same route?" remains unanswerable from a drive. Unchanged by this
+  work and still the cheapest addition to the instrument.
+- The 500 m re-seat window is bounded by argument and by one measured case
+  (282 m), not by a fitted distribution. A drive deliberately routed over a road
+  the route uses twice would be the way to calibrate it.
