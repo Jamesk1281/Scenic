@@ -558,6 +558,9 @@ final class NavigationModel {
         }
         if hasJoinedRoute {
             travelled = max(travelled, here.travelled)
+            // The first trustworthy look at where this line puts the driver.
+            // `runningBackwards` measures against it; `adopt` clears it.
+            if matchAtAdoption == nil { matchAtAdoption = here.travelled }
         }
 
         // Arrival is having driven the line, not being near a particular point.
@@ -633,7 +636,7 @@ final class NavigationModel {
     /// drive, with no reroute to rescue it because the driver was still on
     /// route. Progress only ever increases, so nothing can be skipped.
     private func advanceSteps(_ here: RouteProgress, from location: CLLocation) {
-        guard hasJoinedRoute, !awaitingJoin else {
+        guard hasJoinedRoute, !awaitingJoin, !runningBackwards(here) else {
             // Before the driver reaches the line the projection onto it is
             // meaningless (it can land anywhere), so leave the step where it is.
             //
@@ -661,6 +664,50 @@ final class NavigationModel {
         }
         distanceToNext = max(0, here.remaining - stepRemaining[currentStep])
     }
+
+    /// Whether the driver is running *against* the route they were just handed.
+    ///
+    /// A replacement route can begin ahead of the car and double back over the
+    /// road it is already on — it opens with a U-turn, or the line the driver
+    /// is standing on is the leg that comes *back*. The match then lands
+    /// legitimately, on tarmac the route really does cover, but hundreds of
+    /// metres along it; every maneuver before that point reads as driven
+    /// through, and the banner hands out an instruction from the far side of a
+    /// turn the driver has not made. Measured on 2026-08-25: the 16:23:26
+    /// reroute opened 229.6 m along and 0.0 m off, and skipped the U-turn that
+    /// was the entire point of the route.
+    ///
+    /// Neither the join gate nor `passedMargin` can see this — the driver is
+    /// genuinely *on* the line, so every "have they reached it?" test passes.
+    /// What gives it away is the direction: their position along the line runs
+    /// backwards, fix after fix, while they drive forwards. Across five drives
+    /// 12 of 53 reroutes did this, sliding as much as 154 m.
+    ///
+    /// Deliberately measured against where the fresh line first put them rather
+    /// than against the previous fix, so one dropped or noisy fix cannot arm it,
+    /// and deliberately not a latch: it is re-decided every fix, so the moment
+    /// the driver turns around and the match starts climbing again the banner
+    /// picks up where they now are. It also cannot bind late in a drive —
+    /// `update`'s own backtrack floor keeps the match within
+    /// `backtrackToleranceMeters` of a running maximum that has long since
+    /// passed the anchor.
+    private func runningBackwards(_ here: RouteProgress) -> Bool {
+        guard let anchor = matchAtAdoption else { return false }
+        return here.travelled < anchor - Self.reverseMatchMeters
+    }
+
+    /// Where the match first put the driver on the route now being followed, or
+    /// nil until they have reached it. Reset by `adopt`.
+    private var matchAtAdoption: Double?
+
+    /// How far the match may slide backwards along a freshly adopted line
+    /// before it means the driver is going the wrong way down it.
+    ///
+    /// Measured rather than picked: on a stopped car sitting on its route, the
+    /// match wobbles a median 0.09 m between fixes and never more than 2.9 m
+    /// over the 1,028 such fixes recorded. One second of driving is 15 m. Five
+    /// metres is clear of the first and inside the second.
+    private static let reverseMatchMeters: Double = 5
 
     /// How far past maneuver `index` the driver has to be before it counts as
     /// driven through.
@@ -820,6 +867,7 @@ final class NavigationModel {
         stepRemaining = Self.remainingAtEachStep(of: steps, along: coordinates)
         currentStep = 0
         travelled = 0
+        matchAtAdoption = nil
         remainingMeters = feature.properties.km * 1000
         remainingMinutes = feature.properties.minutes
         // The driver has not reached this line yet — it begins at a junction

@@ -52,6 +52,34 @@ enum Fixture {
                               }))
     }
 
+    /// A replacement route that turns the driver around: the line begins
+    /// `start` metres north of the fixture origin and runs back *south* from
+    /// there, so a driver heading north is matched some way along it and their
+    /// position along it falls as they keep going.
+    ///
+    /// This is the shape the 2026-08-25 16:23:26 reroute really had. The line
+    /// began up the road, opened with "Make a U-turn on Millbury Street", and
+    /// came back over the road the car was already on — so the match landed
+    /// 229.6 m along at 0.0 m off, which is both perfectly legitimate and
+    /// exactly wrong for deciding which maneuvers have been driven.
+    ///
+    /// `steps` are (metres along the route, instruction), as in `straightRoute`.
+    static func uTurnRoute(start: Double, lengthMeters: Double = 530,
+                           vertexSpacing: Double = 50,
+                           steps: [(Double, String)],
+                           minutes: Double = 2) -> RouteFeature {
+        let count = Int(lengthMeters / vertexSpacing)
+        let coordinates = (0...count).map { i -> [Double] in
+            let c = north(start - Double(i) * vertexSpacing)
+            return [c.longitude, c.latitude]
+        }
+        return decode(feature(coordinates: coordinates,
+                              km: lengthMeters / 1000, minutes: minutes,
+                              steps: steps.map { along, text in
+                                  (north(start - along), text)
+                              }))
+    }
+
     /// A route that runs 3 km north, turns around, and comes back to 500 m —
     /// so it passes close to a destination pin placed near the start long
     /// before the drive is over.

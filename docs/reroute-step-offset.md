@@ -6,6 +6,9 @@ against that day's three traces. **Fixed 2026-08-25** — see "What was changed"
 below. The diagnosis is kept above the fix because two of its three conclusions
 survived contact with the code and one did not.
 
+All four rows of the table below are now closed. Getting the last one took a
+fourth fault, and killing a fifth idea that measured worse than the bug.
+
 ## The symptom, measured
 
 Across the four traces of 2026-08-25 there were 13 route adoptions. **On 11 of
@@ -25,7 +28,7 @@ Widening to all five recorded drive days gives 51 reroute adoptions, and their
 first fix lands a median 8.2 m along the new line — but **21 of the 51 land at
 exactly 0.0 m**, which is the case the arithmetic below turns on.
 
-## Three faults, not two
+## Four faults, not two
 
 **1. The guard that exists for this is bypassed.** `adopt()` resets
 `currentStep = 0` and sets `awaitingJoin = true`, but `reroute()` then sets
@@ -74,7 +77,18 @@ a maneuver they had not yet reached. `>` versus `>=` cannot see the difference
 between 9.9 m and 0 m. Passing a maneuver needs a deadband, not a strict
 comparison.
 
-That leaves a genuine fourth fault, **not fixed here** — see "Still open".
+**4. The route that turns you around.** A replacement route can begin ahead of
+the car and double back over the road it is already on — it opens with a U-turn,
+or the driver is standing on the leg that comes *back*. The match then lands
+**legitimately**, on tarmac the route really does cover, but hundreds of metres
+along it. Every maneuver before that point reads as driven through.
+
+The 16:23:26 reroute opened 229.6 m along at **0.0 m off the line** and skipped
+the U-turn that was the entire point of the route. Neither the join gate nor the
+deadband can see this: the driver is genuinely *on* the line, so every "have they
+reached it?" test passes. What gives it away is the direction — their position
+along the line runs backwards, fix after fix, while they drive forwards. 12 of 53
+reroutes across five drives did this, sliding as much as 154 m.
 
 ## What was changed
 
@@ -89,6 +103,13 @@ gate, the off-route recovery guards and `hasJoinedRoute` itself are untouched.
    deadband (`passedMargin`): 30 m, the same `joinConfirmMeters` and for the
    same geometry, capped at half the opening leg so saving the first maneuver
    cannot cost the second.
+3. The step also holds while the driver is `runningBackwards` — while their
+   position along the freshly adopted line is more than 5 m below where that
+   line first put them. Deliberately not a latch: it is re-decided every fix, so
+   the moment they turn around and the match climbs again the banner picks up
+   where they now are. The 5 m comes from the traces — on a stopped car sitting
+   on its route the match wobbles a median 0.09 m between fixes and never more
+   than 2.9 m over 1,028 such fixes, while one second of driving is 15 m.
 
 Tests, expressed as values rather than trace fixtures (`traces/` is gitignored):
 
@@ -99,6 +120,7 @@ Tests, expressed as values rather than trace fixtures (`traces/` is gitignored):
 | `test_rounding_the_corner_onto_a_reroute_does_not_count_as_taking_it` | 18:21:25 Great Plain Avenue |
 | `test_a_short_first_leg_is_not_swallowed_by_the_deadband` | guards the deadband against becoming its own way to skip a turn |
 | `test_stopping_at_a_maneuver_does_not_drop_it_from_the_banner` | fault 2 mid-route: standing at the turn is when you need telling |
+| `test_a_reroute_that_turns_you_around_keeps_giving_you_the_u_turn` | 16:23:26 Millbury Street — and that turning around releases the hold |
 
 Each was checked against the unfixed code and fails there, reproducing the trace
 values — the frozen countdown comes out at 216.0 m, the same number the driver
@@ -144,29 +166,47 @@ What does not hold.
   reroute for that gap but does not make the driver on-route. That is the
   separate destination/snap defect, and it is untouched by this change.
 
-So: expect this fix to break most of these loops and not all of them. Of the
-four withheld-turn rows in the table at the top it corrects three — 16:22:53,
-16:39:10 and 18:21:25 — and leaves 16:23:26, for the reason below.
+So: expect this fix to break most of these loops and not all of them. All four
+withheld-turn rows in the table at the top are corrected, but the 16:23:59 link
+had a different cause and the snap offset is untouched.
+
+## The idea that measured worse than the bug
+
+The obvious fix for fault 4 is to anchor the *match* rather than the banner: put
+a ceiling on how far along a fresh line the driver can plausibly be, the mirror
+of the `notBefore` floor, seeded at 0 because a replacement route is planned from
+where the car is standing. **Do not do this.** It was built and measured before
+the guard above was written, and it is worse than the defect.
+
+The method is worth keeping: `Geo.progress` and the whole banner state machine
+were ported to Python and replayed over all twelve recorded drives. The port
+reproduces the phone's own recorded `off` and `travelled` to **0.0000 m** across
+7,245 fixes, and its step index matches on **3,394 of 3,394**, so any difference
+under an A/B is the change and nothing else.
+
+Under the ceiling, wrong-pass openings fall from 12 of 52 to 3 — and two real
+drives break:
+
+- `drive-2026-08-25-222344`: the driver was **116 m from the line's end and
+  38 km from its start**. The ceiling clamps them to 28.7 m along and reports
+  them **38,197 m off route**. The premise is simply false — an initial route
+  need not begin where the driver is standing. That is the case
+  `hasJoinedRoute` exists for.
+- `drive-2026-08-22-171905`: the snap put the line start 314 m *behind* the
+  driver, who was 2.6 m off it at 320 m along — legitimately. The ceiling drags
+  them to 52 m along and 262 m off.
+
+The banner symptom and the distance symptom are separable, and only the banner
+one is worth fixing. `runningBackwards` fixes it in nine lines without touching
+`progress`, arrival, or off-route recovery.
 
 ## Still open
 
-**The projection onto a line that runs back over the road you are on.** A
-replacement route that opens with a U-turn, or doubles back, covers the same
-tarmac twice. `progress` picks the geometrically closest segment, `adopt()`
-resets `travelled` to 0 so `notBefore` cannot disambiguate, and the two passes
-are equally close — so the match can land on the wrong one. Signature in the
-trace: `travelled` opens large and then *decreases* fix by fix.
-
-- 16:23:26: opens at 229.6 m along, 0.0 m off, then 229.6 → 75.2 m. Skips the
-  U-turn that was the whole point of the route.
-- 16:25:25: opens at 566.8 m along and step **3**, then 567 → 550 → 532 → 513 m.
-
-Neither the join gate nor the deadband can touch this: the driver is genuinely
-*on* the line, so every "have they reached it?" test passes. It needs the match
-anchored — a ceiling on how far along a fresh line the driver can plausibly be,
-the mirror of the `notBefore` floor — which is a change to `progress` and its
-own piece of work. Across five drives, 9 of 51 reroutes open more than 200 m
-along the new line.
+**Remaining distance and ETA still credit undriven route.** Fault 4 is fixed for
+the banner, not for the odometer: a driver matched 229.6 m along a line they
+have not started still has 229.6 m knocked off `remainingMeters`. On a 42 km trip
+that is 0.5%, and it corrects itself as soon as they are on the route properly.
+Fixing it means constraining the match, which is the section above.
 
 **The arrival gate.** Unrelated and still open: a drive that never joins its
 route can never end (`hasJoinedRoute` gates all three arrival tests). Left alone

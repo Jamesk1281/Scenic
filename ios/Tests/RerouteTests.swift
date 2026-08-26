@@ -587,6 +587,43 @@ final class RerouteTests: XCTestCase {
         XCTAssertEqual(model.currentInstruction, "Turn left onto Linden Street")
     }
 
+    func test_a_reroute_that_turns_you_around_keeps_giving_you_the_u_turn() async {
+        // 2026-08-25 16:23:26, `drive-2026-08-25-202122`, the one row of the
+        // four that the join gate and the deadband cannot reach. The
+        // replacement line began up the road, opened with "Make a U-turn on
+        // Millbury Street", and ran back over the road the car was on — so the
+        // match landed 229.6 m along it at 0.0 m off. Legitimate tarmac, and
+        // every maneuver before that point read as driven through: the banner
+        // showed "Turn right onto Cliff Street", the driver carried straight
+        // on, and was rerouted again 33 seconds later.
+        //
+        // The driver is *on* the line, so no "have they reached it?" test can
+        // help. What gives it away is that their position along the line falls
+        // while they drive forwards.
+        let backend = Backend()
+        let millbury = Fixture.uTurnRoute(
+            start: 1130,
+            steps: [(0, "Make a U-turn on Millbury Street"),
+                    (311, "Turn right onto Cliff Street"),
+                    (530, "Arrive at your destination")])
+        let (model, _) = await rerouted(backend, onto: millbury, from: 900)
+
+        // 230 m along a line that runs the other way, and still driving north.
+        model.update(Fixture.fixAt(900))
+        for northing in stride(from: 917.0, through: 985.0, by: 17) {
+            model.update(Fixture.fixAt(northing))
+            XCTAssertEqual(model.currentInstruction, "Make a U-turn on Millbury Street",
+                           "the U-turn was dropped while the driver drove away from it")
+        }
+
+        // Not a latch: turn around, and the banner picks up where they now are.
+        for northing in stride(from: 880.0, through: 820.0, by: -20) {
+            model.update(Fixture.fixAt(northing))
+        }
+        XCTAssertEqual(model.currentInstruction, "Turn right onto Cliff Street",
+                       "having taken the U-turn, the driver is owed the next turn")
+    }
+
     func test_a_short_first_leg_is_not_swallowed_by_the_deadband() async {
         // The deadband must not become its own way of skipping a turn. The
         // shortest opening leg served across five drives was 20 m — shorter
