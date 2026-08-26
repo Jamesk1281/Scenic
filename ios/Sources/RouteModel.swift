@@ -220,6 +220,23 @@ final class RouteModel {
         locationManager.onFix = nil
         nav?.finish()
         nav = nil
+
+        // Drop the plan the drive departed from. `RoutePanel` renders the start
+        // button whenever a `response` exists, and `startNavigation` leaves from
+        // `self.start` without consulting the current fix — so a finished drive
+        // left armed can simply be tapped again. On 2026-08-25 it was: 86 seconds
+        // after arriving in Needham a fourth drive began carrying Harvard, the
+        // previous drive's origin 38 km away, replayed that route verbatim, and
+        // recorded a parked car for nine minutes with no way to stop it.
+        //
+        // `end` and `endQuery` deliberately survive, which is why this isn't
+        // `clear()` — that would take the destination with it. A destination is
+        // a place, not a route computed from an origin the driver has since
+        // left, and heading back from where you just arrived is a real trip.
+        // Keeping the pin is safe because it isn't what arms the start button.
+        start = nil
+        startQuery = ""
+        response = nil
     }
 
     /// Ask the backend for the fastest and scenic routes at the current preference.
