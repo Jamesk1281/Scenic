@@ -472,6 +472,7 @@ final class DriveTraceTests: XCTestCase {
         // teleporting 3 km backwards — and would price the whole drive wrong.
         let trace = self.trace()
         let replacement = Fixture.straightRoute(
+            start: 150,
             steps: [(0, "Head north on Detour Road"), (5000, "Arrive at your destination")])
         let model = NavigationModel(route: Fixture.straightRoute(),
                                     destination: Fixture.north(5000),
@@ -513,7 +514,10 @@ final class DriveTraceTests: XCTestCase {
                                     destination: Fixture.north(5000),
                                     pref: 0.8, weights: [:], trace: trace)
         model.fetchRoute = { _, _, _, _, _ in
-            let feature = Fixture.straightRoute()
+            // A distinct line: the fastest route is a different road from the
+            // scenic one, and an identical one would be merged rather than
+            // adopted, which is a different test.
+            let feature = Fixture.straightRoute(start: 150)
             return Fixture.response(fastest: feature, scenic: feature)
         }
         model.update(Fixture.fixAt(500))
