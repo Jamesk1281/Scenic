@@ -907,9 +907,13 @@ final class NavigationModel {
         // road that lies *ahead*. Without it the nearest graph node is as often
         // as not the junction just passed, and the replacement route opens by
         // turning the driver around — which the first test drive did.
+        //
+        // Both held in locals because the trace records them beside the reply:
+        // what was asked is what makes the answer checkable afterwards.
+        let askedHeading = Self.usableHeading(origin)
+        let askedPref = pref
         guard let response = try? await fetchRoute(origin.coordinate, destination,
-                                                   pref, weights,
-                                                   Self.usableHeading(origin))
+                                                   askedPref, weights, askedHeading)
         else {
             guard generation == rerouteGeneration else { return .superseded }
             // A request that never lands is the plainest case of asking not
@@ -938,9 +942,11 @@ final class NavigationModel {
         // fault — it restarts the banner, discards `travelled` and re-arms the
         // join gate against a line the car never left.
         if sameLine(as: replacement) {
-            merge(replacement, reason: reason)
+            merge(replacement, reason: reason, from: origin.coordinate,
+                  heading: askedHeading, pref: askedPref)
         } else {
-            adopt(replacement, reason: reason)
+            adopt(replacement, reason: reason, from: origin.coordinate,
+                  heading: askedHeading, pref: askedPref)
         }
         // Only off-route reroutes back off. A user tapping "fastest" has asked
         // for this one and is owed it immediately, and counting it would then
@@ -986,8 +992,12 @@ final class NavigationModel {
     ///
     /// Recorded in the trace like any other route, with the reason marked, so a
     /// drive that was handed the same line six times still says so.
-    private func merge(_ feature: RouteFeature, reason: String) {
-        trace?.route(feature, reason: reason + "-same")
+    private func merge(_ feature: RouteFeature, reason: String,
+                       from origin: CLLocationCoordinate2D? = nil,
+                       heading: CLLocationDirection? = nil,
+                       pref: Double? = nil) {
+        trace?.route(feature, reason: reason + "-same",
+                     from: origin, heading: heading, pref: pref)
         route = feature
         steps = feature.properties.steps
         // Against `coordinates`, which by definition are the feature's own.
@@ -1013,11 +1023,15 @@ final class NavigationModel {
     }
 
     /// Follow a different route from here on.
-    private func adopt(_ feature: RouteFeature, reason: String) {
+    private func adopt(_ feature: RouteFeature, reason: String,
+                       from origin: CLLocationCoordinate2D? = nil,
+                       heading: CLLocationDirection? = nil,
+                       pref: Double? = nil) {
         // Recorded before the state changes under it. `travelled` restarts at
         // zero on the new line, so a trace that didn't know the line had been
         // replaced would read the reset as the car teleporting backwards.
-        trace?.route(feature, reason: reason)
+        trace?.route(feature, reason: reason,
+                     from: origin, heading: heading, pref: pref)
         route = feature
         steps = feature.properties.steps
         coordinates = feature.coordinates

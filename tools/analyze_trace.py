@@ -87,6 +87,13 @@ REQUIRED_FIELDS = {
     "end": {"t", "ts", "reason"},
 }
 
+# A `route` record may also carry the request it answered — `req_lat`, `req_lon`,
+# `req_heading`, `req_pref` — which is what makes "was the server right to send
+# this?" answerable from a drive rather than a matter of opinion. Optional, and
+# so deliberately not in REQUIRED_FIELDS: the opening route answers no request,
+# `usableHeading` withholds a heading from a car too slow to have a trustworthy
+# course, and every trace recorded before 2026-08-26 has none of them.
+
 # The vocabulary of `mark.verdict`, and the trace's contract with the app —
 # `SceneryVerdict` in ios/Sources/DriveTrace.swift asserts the same two strings
 # from its own side. Anything else in a trace is reported and dropped rather

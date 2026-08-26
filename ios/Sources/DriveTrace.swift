@@ -179,9 +179,23 @@ final class DriveTrace {
     /// number of meters along nothing — there is no way to recover which road a
     /// fix was on, and the whole trace is unreadable. A 70 km route is a few
     /// hundred KB of coordinates, once per reroute.
-    func route(_ feature: RouteFeature, reason: String) {
+    /// `origin`, `heading` and `pref` are the request this route came back
+    /// from, and they are the difference between a trace that shows what
+    /// happened and one that shows whether it should have.
+    ///
+    /// Without them "the server returned the route the driver was already on"
+    /// cannot be told apart from "the server was wrong": given a car 168 m from
+    /// its line, returning that line again is either correct or a fault
+    /// depending entirely on where the request was made from and which way it
+    /// said the car was pointing. The 2026-08-26 audit could not settle that
+    /// for a single one of the 51 reroutes on disk. Absent on the opening
+    /// route, which answers no request — the `drive` record carries its origin.
+    func route(_ feature: RouteFeature, reason: String,
+               from origin: CLLocationCoordinate2D? = nil,
+               heading: CLLocationDirection? = nil,
+               pref: Double? = nil) {
         routeSeq += 1
-        append([
+        var record: [String: Any] = [
             "t": "route",
             "ts": Self.now(),
             "seq": routeSeq,
@@ -207,7 +221,17 @@ final class DriveTrace {
                  "type": $0.type?.rawValue ?? "",
                  "modifier": $0.modifier ?? ""] as [String: Any]
             },
-        ], flush: true)
+        ]
+        if let origin {
+            record["req_lat"] = origin.latitude
+            record["req_lon"] = origin.longitude
+        }
+        // Only when one was sent. `usableHeading` withholds it from a car too
+        // slow to have a trustworthy course, and "no heading was sent" is
+        // itself the thing worth knowing when a route opens the wrong way.
+        if let heading { record["req_heading"] = heading }
+        if let pref { record["req_pref"] = pref }
+        append(record, flush: true)
     }
 
     /// One GPS update and where it landed on the route.
