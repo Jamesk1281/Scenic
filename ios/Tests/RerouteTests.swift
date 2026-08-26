@@ -474,6 +474,139 @@ final class RerouteTests: XCTestCase {
                        "the 8 s cooldown should have suppressed the retries")
     }
 
+    // MARK: - The first turn of a reroute, withheld (2026-08-25)
+
+    /// A reroute answered with `feature`, on a clock the test controls.
+    ///
+    /// The clock matters twice over: `joinGraceSeconds` would otherwise expire
+    /// on a slow machine and arm the very reroute these tests are watching for
+    /// the absence of, and a frozen clock keeps the cooldown shut so nothing
+    /// asks the backend again while the driver is being walked to the new line.
+    private func rerouted(_ backend: Backend, onto feature: RouteFeature,
+                          from offRouteAt: Double)
+        async -> (NavigationModel, (TimeInterval) -> Void) {
+        let model = joined(backend)
+        var clock = Date()
+        model.now = { clock }
+        model.update(offRoute(offRouteAt))
+        await waitFor { backend.inFlight == 1 }
+        backend.reply(0, with: Fixture.response(fastest: feature, scenic: feature))
+        await waitFor { !model.isRerouting }
+        return (model, { clock = clock.addingTimeInterval($0) })
+    }
+
+    func test_a_reroute_does_not_withhold_the_turn_that_gets_you_onto_it() async {
+        // 2026-08-25 16:22:53, `drive-2026-08-25-202122`. The replacement line
+        // began 481 m up the road and opened with "Turn left onto Cliff
+        // Street". The banner skipped it for the maneuver after it — "Turn
+        // right onto Granite Street" — and, because the projection stayed
+        // pinned to the start of a line the driver had not reached, froze the
+        // countdown at 216 m for the 28 seconds it took to drive those 481 m.
+        // The driver arrived at the junction never having been told to turn,
+        // carried straight on, and was rerouted again 33 seconds later.
+        let backend = Backend()
+        let cliffStreet = Fixture.straightRoute(
+            start: 1000,
+            steps: [(0, "Turn left onto Cliff Street"),
+                    (216, "Turn right onto Granite Street"),
+                    (5000, "Arrive at your destination")])
+        let (model, _) = await rerouted(backend, onto: cliffStreet, from: 519)
+
+        // The 481 m drive to the start of the new line.
+        var countdown: [Double] = []
+        for metres in stride(from: 519.0, through: 999.0, by: 60) {
+            model.update(Fixture.fixAt(metres))
+            XCTAssertEqual(model.currentInstruction, "Turn left onto Cliff Street",
+                           "the turn onto the new route was withheld at \(metres) m")
+            countdown.append(model.distanceToNext)
+        }
+        XCTAssertEqual(countdown.first ?? 0, 481, accuracy: 20)
+        XCTAssertEqual(countdown.last ?? 0, 1, accuracy: 20,
+                       "the countdown to the first turn froze instead of running down")
+
+        // ...and once they are genuinely past it, the banner does move on. The
+        // guard above must hold the step, not strand it.
+        model.update(Fixture.fixAt(1040))
+        XCTAssertEqual(model.currentInstruction, "Turn right onto Granite Street")
+    }
+
+    func test_a_reroute_that_begins_under_the_car_still_gives_its_first_turn() async {
+        // The plainest form of the same defect, and the commonest: on 21 of the
+        // 51 reroutes recorded across five drives the first fix landed at
+        // exactly 0 m along the new line. There the distance from the first
+        // maneuver to the end of the route and the distance the driver has left
+        // are the same number — the whole route — and the advance condition
+        // consumed the instruction on that equality.
+        let backend = Backend()
+        let lakeAvenue = Fixture.straightRoute(
+            start: 800,
+            steps: [(0, "Turn right onto Lake Avenue"),
+                    (3868, "Continue onto Lake Avenue North"),
+                    (5000, "Arrive at your destination")])
+        let (model, _) = await rerouted(backend, onto: lakeAvenue, from: 800)
+
+        // Sitting exactly on the first point of the new line, twice: the first
+        // fix is held by the join guard, the second by the comparison.
+        model.update(Fixture.fixAt(800))
+        XCTAssertEqual(model.currentInstruction, "Turn right onto Lake Avenue")
+        model.update(Fixture.fixAt(800))
+        XCTAssertEqual(model.currentInstruction, "Turn right onto Lake Avenue",
+                       "standing at the turn is when you most need to be told about it")
+    }
+
+    func test_rounding_the_corner_onto_a_reroute_does_not_count_as_taking_it() async {
+        // 2026-08-25 18:21:25, `drive-2026-08-25-211808` — 53 seconds from the
+        // driver's own driveway, on the last 500 m of a 49 km drive. The
+        // replacement line ran 53.8 m off, close enough that the join guard
+        // above lets go almost at once, and the driver's perpendicular foot
+        // landed 18.2 m *along* it while they were still short of the corner.
+        // That was enough to read "Turn right onto Great Plain Avenue" as
+        // already driven. They were shown the turn after it instead, stopped,
+        // and worked it out for themselves.
+        let backend = Backend()
+        let greatPlain = Fixture.straightRoute(
+            start: 1000, lengthMeters: 5000,
+            steps: [(0, "Turn right onto Great Plain Avenue"),
+                    (56, "Turn left onto Linden Street"),
+                    (392, "Turn right onto Oak Street"),
+                    (5000, "Arrive at your destination")])
+        let (model, _) = await rerouted(backend, onto: greatPlain, from: 900)
+
+        // 20 m off the line and 15 m along it: joined, by the 30 m deadband
+        // `awaitingJoin` uses, and short of the turn all the same. Twice, so
+        // the second one is past the join guard and rests on the deadband.
+        for _ in 0..<2 {
+            model.update(beside(20, at: 1015))
+            XCTAssertEqual(model.currentInstruction, "Turn right onto Great Plain Avenue",
+                           "the turn was withheld while the driver was still short of it")
+        }
+
+        // Taken. 40 m along the new line is past the corner and short of the
+        // next one, so the banner owes them Linden Street.
+        model.update(Fixture.fixAt(1040))
+        XCTAssertEqual(model.currentInstruction, "Turn left onto Linden Street")
+    }
+
+    func test_a_short_first_leg_is_not_swallowed_by_the_deadband() async {
+        // The deadband must not become its own way of skipping a turn. The
+        // shortest opening leg served across five drives was 20 m — shorter
+        // than the 30 m it holds for — so it is capped at half the leg, which
+        // leaves a window between the two maneuvers for a fix to land in.
+        let backend = Backend()
+        let tight = Fixture.straightRoute(
+            start: 1000,
+            steps: [(0, "Turn left onto Heywood Street"),
+                    (20, "Turn right onto Vale Street"),
+                    (5000, "Arrive at your destination")])
+        let (model, _) = await rerouted(backend, onto: tight, from: 900)
+
+        model.update(Fixture.fixAt(1000))
+        XCTAssertEqual(model.currentInstruction, "Turn left onto Heywood Street")
+        model.update(Fixture.fixAt(1015))
+        XCTAssertEqual(model.currentInstruction, "Turn right onto Vale Street",
+                       "the deadband held past a 20 m leg and swallowed its turn")
+    }
+
     func test_a_new_route_is_joined_by_construction() async {
         // The replacement starts from where the driver is standing, so
         // off-route recovery stays armed for the rest of the drive.

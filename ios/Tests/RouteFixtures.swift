@@ -23,7 +23,14 @@ enum Fixture {
     /// maneuvers at 0 m, 1 km, 3 km and the end.
     ///
     /// `steps` are (metres along the route, instruction).
+    ///
+    /// `start` moves the whole line that many metres north of the fixture
+    /// origin, which is how a replacement route really arrives: it begins at
+    /// the graph junction `snap` chose — a median 99 m from the car, p90 217 m
+    /// — rather than under it. A route built with `start` therefore has its
+    /// first maneuver somewhere the driver still has to reach.
     static func straightRoute(
+        start: Double = 0,
         lengthMeters: Double = 5000,
         vertexSpacing: Double = 250,
         steps: [(Double, String)] = [(0, "Head north on Test Road"),
@@ -34,13 +41,13 @@ enum Fixture {
     ) -> RouteFeature {
         let count = Int(lengthMeters / vertexSpacing)
         let coordinates = (0...count).map { i -> [Double] in
-            let c = north(Double(i) * vertexSpacing)
+            let c = north(start + Double(i) * vertexSpacing)
             return [c.longitude, c.latitude]
         }
         return decode(feature(coordinates: coordinates,
                               km: lengthMeters / 1000, minutes: minutes,
                               steps: steps.map { along, text in
-                                  let c = north(along)
+                                  let c = north(start + along)
                                   return (c, text)
                               }))
     }

@@ -81,6 +81,22 @@ final class NavigationModelTests: XCTestCase {
         XCTAssertEqual(model.currentInstruction, "Arrive at your destination")
     }
 
+    func test_stopping_at_a_maneuver_does_not_drop_it_from_the_banner() {
+        // The advance condition used to fire on equality — `stepRemaining >=
+        // remaining` — so the instant the driver's progress drew level with a
+        // maneuver the banner moved past it. Standing at the turn is when you
+        // most need to be told about it, and at a light that is where you sit.
+        //
+        // Level is also exactly where a freshly adopted route puts you: its
+        // first maneuver is at the line's origin, so the distance from it to
+        // the end and the distance you have left are the same number. That is
+        // how "one step ahead of where it should place me" reached a car.
+        let model = nav()
+        model.update(Fixture.fixAt(1000))          // dead level with the maneuver
+        XCTAssertEqual(model.currentInstruction, "Turn right onto Elm Street")
+        XCTAssertEqual(model.distanceToNext, 0, accuracy: 15)
+    }
+
     func test_steps_never_go_backwards() {
         let model = nav()
         model.update(Fixture.fixAt(1500))

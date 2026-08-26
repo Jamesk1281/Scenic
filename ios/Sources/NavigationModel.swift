@@ -633,18 +633,69 @@ final class NavigationModel {
     /// drive, with no reroute to rescue it because the driver was still on
     /// route. Progress only ever increases, so nothing can be skipped.
     private func advanceSteps(_ here: RouteProgress, from location: CLLocation) {
-        guard hasJoinedRoute else {
-            // Before joining, the projection onto the line is meaningless (it
-            // can land anywhere), so leave the step where it is.
+        guard hasJoinedRoute, !awaitingJoin else {
+            // Before the driver reaches the line the projection onto it is
+            // meaningless (it can land anywhere), so leave the step where it is.
+            //
+            // `awaitingJoin` and not `hasJoinedRoute` alone, because a reroute
+            // sets `hasJoinedRoute` true by hand — the new line starts at a
+            // junction ahead of the car, and the banner has to keep giving
+            // instructions over that gap rather than fall back to "head to the
+            // start of your route". That left this guard unable to fire on the
+            // one case it was written for. On 2026-08-25 the 16:22:53 reroute
+            // handed back a line whose first maneuver was 481 m away; the
+            // banner skipped it, showed the maneuver *after* it, and froze the
+            // countdown at 216 m for the 28 seconds it took to drive there.
             distanceToNext = location.distance(to: steps[currentStep].coordinate)
             return
         }
+        // Strictly past, not level with. Standing *at* a maneuver is when the
+        // driver most needs to be told about it, and at the instant a route is
+        // adopted "level with the first maneuver" is exactly where they are:
+        // both distances are the whole route, and `>=` consumed the
+        // instruction on equality. That happened on 21 of the 51 reroutes
+        // recorded across five drives.
         while currentStep < steps.count - 1,
-              stepRemaining[currentStep] >= here.remaining {
+              here.remaining < stepRemaining[currentStep] - passedMargin(currentStep) {
             currentStep += 1
         }
         distanceToNext = max(0, here.remaining - stepRemaining[currentStep])
     }
+
+    /// How far past maneuver `index` the driver has to be before it counts as
+    /// driven through.
+    ///
+    /// Nothing, for a maneuver in the middle of a route: it sits somewhere
+    /// along the line, so being past it at all took real driving. The first
+    /// maneuver is the exception, and it is the whole reason this exists — it
+    /// sits at the line's *origin*, so `stepRemaining[0]` is the entire route
+    /// and any projection whatsoever reads as past it.
+    ///
+    /// That is not a rounding problem to be fixed by comparing strictly. A
+    /// driver approaching the corner the new route turns at projects onto the
+    /// leg *after* the corner, by roughly their distance from it — and
+    /// `joinConfirmMeters` from the line already counts as having reached it.
+    /// Measured on 2026-08-25: 9.9 m along at the moment the Needham reroute
+    /// counted as joined, which was enough to withhold "Turn right onto Great
+    /// Plain Avenue" 53 seconds from the driver's own driveway.
+    ///
+    /// Capped at half the opening leg, so saving the first maneuver cannot cost
+    /// the second. The shortest opening leg served across five drives was 20 m
+    /// — shorter than the deadband — and holding the first instruction for the
+    /// whole of it would release both maneuvers at the same instant, skipping
+    /// the second outright. Half leaves a window for a fix to land in.
+    private func passedMargin(_ index: Int) -> Double {
+        guard index == 0, steps.count > 1 else { return 0 }
+        let firstLeg = stepRemaining[0] - stepRemaining[1]
+        return min(Self.firstStepPassedMeters, firstLeg / 2)
+    }
+
+    /// How far past the first maneuver of a route the driver must be for it to
+    /// count as driven — see `passedMargin`. The same 30 m as
+    /// `joinConfirmMeters` and for the same geometry: a driver that far off the
+    /// line still counts as on it, and that far off a corner projects that far
+    /// past it.
+    private static let firstStepPassedMeters: Double = joinConfirmMeters
 
     /// Distance and time still to drive.
     ///
