@@ -1,7 +1,8 @@
 # Plan: time-of-day travel times
 
 **Scope: one coarse peak/off-peak factor on motorway, applied at load. Roughly a
-day's work, gated on one lookup that may say don't bother.**
+day's work — gated on one lookup that, on the evidence so far, will probably say
+not to bother (§3.1).**
 
 An earlier draft of this file planned a 168-cell hour-of-week profile fitted
 from probe data, with agency data requests, an eight-week polling archive and a
@@ -60,33 +61,78 @@ factor that collapses and recovers within two hours is an incident signature,
 and one day cannot tell it from recurrence. **Any number used here must be an
 average over many days**, which is precisely what §3 is.
 
-## 3. The gate: one lookup, about an hour
+## 3. The gate: read one number, then decide
 
-Get the recurrent peak factor from the Boston Region MPO (CTPS) Express-Highway
-Performance Dashboard, which publishes a **"speed index" — observed speed over
-posted speed limit** per expressway segment, with downloadable tables.
+**Every source below was retrieved and checked on 2026-08-26, not taken from a
+search summary.** Three of the four candidates failed that check in ways a
+summary would have hidden, so the status column is the point of this section.
 
-Three reasons this is the right source and the only one needed:
+| source | what it gives | currency | cadence | **verified?** |
+|---|---|---|---|---|
+| **MassDOT, *Congestion in the Commonwealth* 2025 Data Update** | Hourly travel-time index per NHS corridor, CY2024 INRIX, averaged over every weekday of the year | 2024 | irregular (2019, then 2025) | **✗ URL 404s.** Search engines still index its text; the file is not retrievable |
+| **FHWA Urban Congestion Report** | Travel Time Index per urbanized area, incl. Boston | **Apr–Jun 2026** | **quarterly since 2008** | **✓ downloads** — but the numbers are *images*; the text layer is invisible-mode spaces, so it is **not machine-readable** |
+| **FHWA TPM per-UZA page** (`uacc=9271`) | Peak-hour excessive delay per capita, non-SOV share | 2022 | biennial | ✓ machine-readable, but **no travel-time index and no speed** |
+| **CTPS Express-Highway dashboard** | Speed index = observed speed / posted limit, per segment | **2019** | ~4-yearly; 2019 is the newest | ✓ exists, but pre-pandemic |
 
-1. It is *literally* `SPEED_FACTOR`. Same definition, no conversion.
-2. It is an **annual aggregate**, so it measures recurrent congestion and
-   averages incidents out — the exact distinction the crash drive taught.
-3. It is free, agency-published and carries no access request. (It is derived
-   from INRIX data, which is licence-restricted at source; CTPS publishing a
-   summary is expressly permitted, which is what makes reading it clean.)
+**The previous draft recommended the CTPS dashboard. That was the stalest of the
+four**, and it was chosen from a page description rather than from the data.
 
-Limits, stated up front: 2019, peak-period only, Boston region, expressways. All
-acceptable — a two-band model needs exactly a peak-period number, and the Boston
-expressways are where the app's fastest routes run.
+### 3.1 What to actually do
 
-**Then decide, against §1's table:**
+**Read the Boston row of the Travel Time Index column in the latest UCR PDF, by
+eye.** `ops.fhwa.dot.gov/perf_measurement/ucr/` → newest quarter. It is a table
+in a picture; there is no way around looking at it, and it takes a minute.
 
-* peak factor **≥ 0.9** → stop. Note the number in this file, ship nothing, and
-  optionally add the §6 disclaimer. This is a real possible outcome.
-* peak factor **< 0.9** → build §4. Half a day.
+Convert. MassDOT and FHWA both define the index against *observed free-flow*
+travel time, and this project measured motorway free-flow at 1.16 × the posted
+limit, so:
 
-Worth one email to `ctps.org/data-resources` asking whether anything post-2019
-exists, since 2019 is pre-pandemic. Not a blocker — send it and proceed.
+```
+motorway peak factor  =  1.16 / TravelTimeIndex
+```
+
+Then decide against §1's table: **≥ 0.9 → ship nothing. < 0.9 → build §4.**
+
+**Expect the answer to be "ship nothing."** The one indicative figure found —
+Boston TTI 1.26, from a search snippet of the Q3 2024 UCR — gives 1.16/1.26 =
+**0.92**, just the wrong side of the threshold. It is unverified and it is
+area-wide, which understates the corridors a fastest route actually uses, so the
+true number for motorway at peak is somewhat lower. But nothing found in this
+survey supports a factor low enough to make the delta badly wrong, and **the
+honest prior is now that this feature is not worth building.**
+
+If the UCR number lands near 0.9, get the corridor-level answer before writing
+any code: email `planning@dot.state.ma.us` for the 2025 Data Update, which has
+hourly TTI per NHS corridor and is the right instrument. That email is free and
+it is the only remaining route to the number, since the file is not on the web.
+
+### 3.2 Rules for not shipping bad data
+
+The failure being guarded against is a stale or wrong constant sitting in the
+router for years while every ETA quietly leans on it.
+
+* **Provenance in the constant, not in a commit message.** Each band carries
+  source, the *data year* (not the publication year), the retrieval date, and
+  the TTI it was derived from. A number whose origin cannot be read off the
+  line above it cannot be audited later.
+* **A staleness tripwire.** A test fails when the recorded data year is more
+  than three years behind the current date. It cannot check the *value*
+  automatically — the UCR is images — so it checks the only thing it can, the
+  age, and forces a human to go look.
+* **Bias toward under-correction.** The two errors are not symmetric. Too little
+  correction leaves today's behaviour, which is a known quantity. Too much
+  invents congestion that is not there and makes the app claim the scenic route
+  is faster when it is not — actively misleading, in the direction the product
+  is already motivated to exaggerate. **When the number is uncertain, round
+  toward 1.16.**
+* **Floor the band.** Clamp the peak factor at no lower than 0.6 regardless of
+  what any source says, so a misread decimal point cannot triple an ETA.
+* **The blast radius is already small, and should stay small.** A wrong peak
+  factor moves the fastest-route ETA and the displayed delta. It does not move
+  the scenic route's geometry, and it barely moves the scenic ETA, because
+  scenic routes hold almost no motorway. Keep it that way: the band applies to
+  motorway only, so the number the driver watches for two hours stays anchored
+  to the 5.7%-error measurement rather than to a borrowed index.
 
 ## 4. The model
 
@@ -94,8 +140,11 @@ Three bands, motorway only:
 
 ```python
 # router.py, beside SPEED_FACTOR — same load-time application, no rebuild
+# Source: FHWA Urban Congestion Report <quarter>, Boston UZA, TTI <x.xx>.
+# Data year: <YYYY>.  Retrieved: <YYYY-MM-DD>.  factor = 1.16 / TTI, floored 0.6.
 MOTORWAY_BY_BAND = {"am_peak": ..., "pm_peak": ..., "off": 1.16}
 PEAK_HOURS = {"am_peak": (6, 9), "pm_peak": (15, 19)}   # weekdays only
+SPEED_PROFILE_DATA_YEAR = 20XX      # §3.2 staleness tripwire reads this
 ```
 
 * **Weekdays only.** Weekends and holidays take `off`. Recurrent congestion is a
@@ -177,7 +226,13 @@ weekdays.** That is the only thing that would turn the peak band from a borrowed
 number into a measured one, it costs an afternoon, and it should be scheduled at
 the same time the constant lands rather than left implicit.
 
-Tripwires, in `tests/test_calibration.py`'s style: every band within `[0.4, 1.4]`;
+* **The data ages, and nothing will tell you.** The UCR publishes numbers as
+  images, so no automated check can compare the constant against the current
+  quarter. The staleness tripwire (§3.2) checks the recorded data year instead
+  and fails at three years, which is the most an automated test can do here.
+
+Tripwires, in `tests/test_calibration.py`'s style: every band within `[0.4, 1.4]`
+and never below the 0.6 floor;
 the `off` band exactly reproduces today's ETAs; band edges continuous within a
 bounded step; `CONTROL_SECONDS` invariant to `depart`; a long trip priced by
 integration differs from the flat departure-band price, so §5 is provably wired
