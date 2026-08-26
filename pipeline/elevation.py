@@ -27,8 +27,11 @@ from PIL import Image
 from rasterio.transform import from_bounds
 from scipy.ndimage import maximum_filter, minimum_filter
 
-# MA bounding box (lon/lat) with a small margin
-BBOX = (-73.55, 41.18, -69.85, 42.92)
+# New England bounding box (lon/lat) with a small margin: the envelope of the
+# six merged Geofabrik extracts (MA, CT, RI, VT, NH, ME). At zoom 11 this is
+# 40x53 = 2120 tiles, a 1.11 GB float64 mosaic peaking near 5.6 GB through the
+# relief filters. The MA-only box was (-73.55, 41.18, -69.85, 42.92).
+BBOX = (-73.76, 40.93, -66.87, 47.47)
 TILE_URL = "https://elevation-tiles-prod.s3.amazonaws.com/terrarium/{z}/{x}/{y}.png"
 
 # Neighborhood for local relief, in *ground* meters. Web Mercator stretches
