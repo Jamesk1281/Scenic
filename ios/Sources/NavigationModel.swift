@@ -919,6 +919,7 @@ final class NavigationModel {
             // battery to no end. `trackSettling` clears the counter as soon as
             // the driver holds the line for 30 s, so one dropped request costs
             // a single doubling rather than the drive.
+            if reason == "offroute" { consecutiveReroutes += 1 }
             return .failed
         }
         guard generation == rerouteGeneration else { return .superseded }

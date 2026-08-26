@@ -228,4 +228,24 @@ final class RerouteIdentityTests: XCTestCase {
                        "a fastest tap that failed handed back the base interval")
     }
 
+    func test_a_reroute_that_never_lands_still_costs_an_interval() async {
+        // The backoff counted only reroutes that *succeeded*, so against a
+        // server that was down the interval stayed at the 8 s base for as long
+        // as the driver kept driving. A request that never lands is the plainest
+        // case of asking not helping.
+        let backend = RerouteTests.Backend()
+        let (model, advance) = joined(backend)
+
+        model.update(beside(300, at: 800))
+        await waitFor { backend.inFlight == 1 }
+        backend.fail(0)
+        await waitFor { !model.isRerouting }
+
+        advance(9)                                         // clears 8 s, not 16 s
+        model.update(beside(300, at: 1000))
+        try? await Task.sleep(for: .milliseconds(50))
+
+        XCTAssertEqual(backend.inFlight, 1,
+                       "a reroute that failed cost nothing and asked straight back")
+    }
 }
