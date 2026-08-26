@@ -482,7 +482,8 @@ Stated plainly, as asked:
    alone. For the six phantom cases it is very likely yes — the car was on the
    route — but that is inference. **Recording the request alongside the response
    in `DriveTrace.route` would close this**, and is the single cheapest addition
-   to the instrument.
+   to the instrument. *(Done in `db52645`, after this was written — but only for
+   drives recorded from now on; it changes nothing about the traces above.)*
 2. **Why the match landed 567 m into a freshly adopted route** at `202122`
    seq 4. That it *did* is certain, and the doubling-back explanation fits
    every column. But proving the route doubles back over that road needs the
@@ -640,9 +641,12 @@ Everything about the same-line path is tested in the new
 
 - The arrival-gate defect at `NavigationModel.swift:571-582` — out of scope
   throughout, still open, still someone else's.
-- **The request is still not recorded in the trace**, so "was the server right to
-  return the same route?" remains unanswerable from a drive. Unchanged by this
-  work and still the cheapest addition to the instrument.
+- **The request is now recorded** — `req_lat`, `req_lon`, `req_heading` and
+  `req_pref` on every `route` record, added in `db52645`. That closes the gap
+  for drives from here on, but **it cannot be applied backwards**: all twelve
+  traces on disk were recorded without it, so "was the server right to return
+  the same route?" stays unanswerable for every reroute analysed above. The next
+  drive is what settles it.
 - The 500 m re-seat window is bounded by argument and by one measured case
   (282 m), not by a fitted distribution. A drive deliberately routed over a road
   the route uses twice would be the way to calibrate it.
