@@ -1,35 +1,56 @@
 # Plan: schedule-based travel times
 
-**Status: a plan, ready to build. Nothing has been implemented and no source
-file has been touched by this document.** Survey current as of 2026-08-26.
-**Constraint: nothing here costs money.** Every paid product was surveyed, and
-every paid product is recorded in §3.5 as eliminated rather than deleted, so the
-next person does not re-price them.
+**Status: a plan, ready to build, gated on four emails.** Nothing implemented,
+no source file touched. Survey current as of 2026-08-26. **Constraint: nothing
+here costs money**, so every paid product is recorded in §5.6 as eliminated
+rather than deleted.
+
+**Read §2 before building anything.** The earlier draft of this plan recommended
+scraping MassDOT's public count portal. That is expressly forbidden by the
+portal's terms of service, in a clause that names "scrape" and "traffic data" in
+the same sentence. The data is still obtainable and still free — but by asking
+for it, not by taking it.
 
 ---
 
-## 1. The recommendation, up front
+## 1. The recommendation
 
-**Fit the profile from MassDOT's public traffic-count portal (MS2 TCDS). It is
-free, needs no account, and already holds roughly seven years of 15-minute speed
-data from 214 permanent stations on Massachusetts Interstates.** Fit an
-hour-of-week × road-class speed-factor table from it, ship that table as a
-constant in `router.py` applied at load — beside `SPEED_FACTOR`, where the
-existing constants already live.
+**Two free, sanctioned sources, requested in parallel in week one, feeding one
+constant table.**
 
-* **Fallback, if scraping TCDS proves impractical or its terms forbid it:**
-  MassDOT's GoTime/RTTM API — free to authorized developers, but real-time only,
-  so the archive must be self-polled for eight weeks before it can be fitted.
+1. **Primary — MassDOT GoTime API.** The only source found with an explicit,
+   free, written licence that fits this use: "provided free-of-charge to
+   authorized developers", the signup form offers **Individual** as an
+   organisation type, and the only stated restriction is that data "should only
+   be used for transportation purposes" — which a routing app is. It reports
+   **travel time between Bluetooth sensor pairs**, i.e. real segment travel
+   time, which is better shaped than any detector's point speed. Cost: free.
+   Catch: real-time only, so the archive must be self-polled for ~8 weeks.
+2. **Depth — MassDOT's own continuous-count speed archive, by request.** The
+   MS2 portal holds roughly seven years of 15-minute speed data from 214
+   permanent Interstate stations (§5.1). MS2's terms forbid scraping it, but
+   MS2's terms also say **the customer owns the data** — so ask MassDOT, who
+   own it and can export it, with a public records request as the formal
+   fallback. This is what gives day-of-week and seasonal depth that eight weeks
+   of GoTime cannot.
+
+Fit an **hour-of-week × road-class × urban/rural** speed-factor table from
+whichever arrives, ship it as a constant in `router.py` applied at load.
+
 * **No graph rebuild.** `graph_edges.parquet` untouched. The profile multiplies
   the same `minutes` column `SPEED_FACTOR` divides today.
 * **`CONTROL_SECONDS` is not touched, and a test asserts it.**
+* **Massachusetts is not blocked on New England.** §6 shows the other five
+  states are three different vendors and six different access stories. The table
+  is designed so adding a state is adding rows.
 
-### 1.1 It works — measured, not asserted
+### 1.1 The data exists and has the right shape — demonstrated
 
-Station 10 on I-495 south of I-95 (Mansfield), **Monday 2026-08-24**, 2-way loop
-detector, 105,183 vehicles, binned by speed each hour. Converting each hour's
-speed distribution to a space-mean speed (harmonic mean over bin midpoints) and
-dividing by the 65 mph posted limit:
+Viewing one page of the MassDOT portal as any visitor may: station 10 on I-495
+south of I-95 (Mansfield), **Monday 2026-08-24**, 2-way loop detector, 105,183
+vehicles, hourly counts across fifteen speed bins. Converting each hour's
+distribution to a space-mean speed (harmonic mean over bin midpoints) against
+the 65 mph posted limit:
 
 ```
  hour   vehicles   space-mean mph   factor    share < 35 mph
@@ -41,26 +62,97 @@ dividing by the 65 mph posted limit:
   7 PM     3,773            71.4     1.10              0.4%
 ```
 
-**A 57% peak-to-midday drop, from a free public web page, on the first station
-opened.** The 6 PM factor of **0.45** sits beside the project's own independently
-measured **0.39** on a congested afternoon (§2) — two unrelated instruments, one
-a loop detector and one a phone in a car, landing in the same place. Off-peak
-lands at 1.05–1.11 against the 1.16 the router currently believes, which is the
-right ballpark and mildly lower, as a 2-way count including trucks should be.
+A 57% peak-to-midday drop. The 6 PM factor of **0.45** sits beside the project's
+own independently measured **0.39** (§4) — a loop detector and a phone in a car,
+landing in the same place. `router.py:108` believes **1.16, every hour of every
+day**.
 
-`router.py:108` believes **1.16, every hour of every day**.
-
-Note the shape: 5 PM 0.69 → 6 PM 0.45 → 7 PM 1.10. A single day cannot tell
-recurrent congestion from one evening's incident. That is what the seven years
-of history are for — the profile is a **median over same-weekday observations**,
-never one day (§5.2).
+**Treat these numbers as a feasibility demonstration, not as shippable
+constants.** §2's clause bars *using* portal contents without authorization, and
+the conservative reading covers figures derived from a page one has merely
+viewed. They prove the data exists, is current, and has the right shape — which
+is what justifies sending the emails. They are not the fit.
 
 ---
 
-### 1.2 How much of a downgrade is free? — the honest answer
+## 2. Access and licensing — what may actually be used
 
-**On the defect that actually exists: none.** On future refinement: real but
-narrow. The arithmetic that settles it, from §2's per-class table:
+This section is the gate. Every conclusion here was read at its own source.
+
+### 2.1 The MS2 portals: scraping is expressly prohibited
+
+`mhd.public.ms2soft.com` is operated by Midwestern Software Solutions (MS2), and
+its footer links to terms that state their own scope: *"These Terms of Use apply
+to the MS2Soft.com web site **and to the other customer-specific or public web
+sites or web pages maintained by MS2**."* That covers the MassDOT portal, and
+the Vermont and New Hampshire ones (§6).
+
+The operative clause, verbatim:
+
+> "Contents may be used solely for the furtherance of your relationship with MS2
+> and you may not copy, use, modify, distribute, transfer, download, upload,
+> **"scrape"**, **"mine"**, resell, or republish any of the contents of this Web
+> site, **including without limitation traffic data** and other information
+> contained on customer-specific web sites or pages within this site, **without
+> the prior written authorization of MS2**."
+
+There is no reading of that under which a scraper is acceptable. It names the
+verb and it names the data. **The previous draft of this plan was wrong on this
+point and the correction is the main result of this revision.**
+
+### 2.2 …but MS2 does not own the data, and says so
+
+From the same terms:
+
+> "**Ownership of Data**: MS2 customers own all traffic data that they input into
+> their customer-specific pages on the MS2 web site and all analyses and reports
+> involving only that data."
+
+MassDOT owns the Massachusetts speed data. MS2 operates the website it is
+displayed on. Those are different things, and the second does not encumber the
+first. MassDOT is a public agency and its records are public under M.G.L. c. 66
+§ 10. So the data is obtainable — through its owner.
+
+### 2.3 The four asks, all free, all parallel, all week one
+
+None blocks the others; send all four the same day.
+
+| ask | to | what it gets | likelihood |
+|---|---|---|---|
+| **GoTime API key** | `api-signup.massgotime.com` | Sanctioned segment travel times, real-time, free. Form explicitly accepts "Individual" | **Good** — the form is built for this |
+| **Bulk export of continuous-count speed data** | MassDOT Traffic Data / Highway Division | ~7 years × 214 Interstate stations of 15-minute speed | Moderate; MS2 has an agency-side bulk export, so the ask is easy for them to fulfil |
+| **Written authorization** | MS2 (`ms2soft.com`) | Unblocks the portals directly — and MS2 hosts MA, VT **and** NH, so one grant may cover three states | Unknown; costs one email; MS2 will likely defer to each customer agency |
+| **Anything post-2019** | CTPS (`ctps.org/data-resources`) | A newer speed index than the 2019 dashboards, which seed the provisional constant (§5.4) | Good; they answer data inquiries as a matter of course |
+
+If the bulk export is ignored, escalate to a formal public records request. It is
+free, it has a statutory response deadline, and the data is plainly a public
+record. Say what is wanted narrowly — continuous-count *speed* records for
+Interstate stations, 2019 onward — because a narrow request is cheap to fulfil
+and a broad one attracts a fee estimate.
+
+### 2.4 Sources eliminated on licence, not availability
+
+* **NPMRDS** — free, exactly the right shape, covers precisely the broken class,
+  and **legally unusable**. The Data Sharing Agreement is executed only by a
+  "State Department of Transportation or Metropolitan Planning Organization
+  receiving federal transportation funds" or their contractors under a named
+  contract; and it **explicitly forbids making "data sets or aggregated average
+  travel time databases publicly available"**, which is what shipping a profile
+  in a public app is. Two independent blockers, either fatal. **Do not
+  re-derive this.**
+* **Sampling a routing API offline** (Google, Mapbox, HERE, TomTom) — ~3,400
+  requests would fit inside free tiers, and all four bar caching and derivative
+  datasets. Fitting a permanent table from responses is derivative-dataset
+  creation. The trap that looks like cleverness.
+
+---
+## 3. How much of a downgrade is free?
+
+**On the defect that exists: none. On access latency: real — weeks, not
+today.** The earlier draft claimed the free path was "available today". §2 makes
+that false, and it is the honest cost of going free.
+
+The coverage question settles cleanly. From §4's per-class table, in minutes:
 
 | class | km | assumed | measured | free-flow min | actual min | **excess** |
 |---|---|---|---|---|---|---|
@@ -71,51 +163,34 @@ narrow. The arithmetic that settles it, from §2's per-class table:
 | residential | 11.8 | 39 | 43 | 18.2 | 16.5 | −1.7 |
 | | | | | | **total** | **+44.8** |
 
-**Motorway is 45.0 minutes of a 44.8-minute error. The other four classes
-combined are −0.1 minutes.** They cancel. So a data source that covers only
-Interstates and principal arterials — which is exactly what a state DOT's
-permanent count stations cover — addresses **100% of the measured defect**, and
-the coverage that the paid products add is coverage of the part that is already
-right to within 7%.
+**Motorway is 45.0 minutes of a 44.8-minute error; the other four combined are
+−0.1 minutes.** They cancel. A source covering only Interstates and principal
+arterials therefore addresses **100% of the measured defect**, and what the paid
+products would add is coverage of the part already right to within 7%.
 
-The three things the free path genuinely costs:
+What free actually costs, in order of severity:
 
-1. **Point speeds, not segment travel times — and this is the real one.** A loop
-   detector measures speed where it sits. A bottleneck's queue extends *upstream*
-   of the sensor, so a station outside a queue reads free-flow while the corridor
-   crawls. The bias is **optimistic — the same direction as the bug being
-   fixed**, which is the worst direction for it to be in. Mitigations: 214
-   stations means many *are* inside queues (station 10 plainly was); and §7
-   measures the bias directly rather than hoping, because the eight traces *are*
-   segment travel times. **This is the plan's largest unquantified risk and it
-   is not resolvable before the fit exists.**
-2. **A class-level profile, not a per-segment one.** 214 stations cannot say that
-   I-93 southbound differs from I-495. But §5 only ever wanted class-level — 214
-   stations is far more than enough for 168 cells — so this costs nothing
-   against the plan as designed, and costs a refinement that was never scoped.
-3. **No independent confirmation for the surface classes.** A paid area product
-   would have confirmed that `secondary`/`tertiary`/`residential` have no
-   time-of-day pattern worth modelling. Permanent stations are thin there, so
-   "flat profile for surface roads" remains an assumption resting on the eight
-   traces rather than a measurement. Given those classes are within 7%, the
-   exposure is small — but it is an assumption, and it is labelled as one.
+1. **Weeks of latency instead of a download** (§2.3). Three emails, then either
+   an eight-week GoTime archive or a fulfilled export request. Mitigated by
+   shipping the machinery in week one behind a provisional constant (§12).
+2. **Point speeds, if the archive route wins.** A loop detector measures speed
+   where it sits; a bottleneck's queue extends *upstream*, so a station outside
+   a queue reads free-flow while the corridor crawls. The bias is **optimistic —
+   the same direction as the bug**. GoTime does not have this problem, which is
+   the main reason it is primary rather than the fallback. §11 measures it.
+3. **No confirmation for the surface classes.** A paid area product would have
+   confirmed that `secondary`/`tertiary`/`residential` carry no time-of-day
+   pattern worth modelling. Neither free source covers them well, so "flat
+   profile for surface roads" stays an assumption resting on the eight traces.
+   Exposure is small — those classes net to −0.1 minutes — but it is an
+   assumption, and it is labelled as one.
 
-Two things the free path is **better** at than the paid plan it replaces:
-
-* **It is available today** — no purchase, no sales conversation, no 30-day
-  trial clock, and no eight-week wait for a self-built archive.
-* **It has roughly seven years of history** (2,685 daily speed records at station
-  10 alone). Seasonality and day-of-week fall straight out. The GoTime fallback
-  could not have answered either question before October.
-
-And the New England problem is mostly solved rather than deferred: **NHDOT runs
-the same MS2 TDMS software**, CTDOT publishes continuous-count-station daytime
-speeds, and MaineDOT runs a public count portal. Largely the same scraper, per
-state, which is a far better position than the MA-only GoTime fallback.
+What free is **better** at: nothing is being licensed, so nothing expires,
+nothing needs renewing, and no clause restricts what the app may ship. That is
+worth more than it sounds for a product intended to keep working.
 
 ---
-
-## 2. The measured state — quoted, not re-derived
+## 4. The measured state — quoted, not re-derived
 
 From `tools/analyze_trace.py` over the three drives of 2026-08-25 (147.9 km):
 
@@ -152,7 +227,7 @@ its own scenic route as more expensive than it is.** A "scenic costs you 25
 extra minutes" that should read five is the reason to do this work; the ETA
 being wrong is only the mechanism.
 
-### 2.1 What this plan does *not* claim
+### 4.1 What this plan does *not* claim
 
 Of the 49.7 minutes of unexplained stopped time, this plan only claims the part
 that happens on congested motorway — where stop-and-go is captured by any
@@ -164,157 +239,198 @@ defect and is not addressed here.
 thing measured** — `analyze_trace.py` already has both the class breakdown and
 the stop attribution, so the split is a reporting change, not new work. If most
 of the unexplained stopped time turns out to be on surface streets, the ceiling
-on this plan is lower than §2 makes it look. That measurement is cheap and it
+on this plan is lower than §4 makes it look. That measurement is cheap and it
 should happen before the data is bought, not after.
 
 ---
 
-## 3. The survey
+## 5. The survey
 
-### 3.1 MassDOT MS2 TCDS permanent count stations — **recommended**
+### 5.1 MassDOT MS2 TCDS — the richest data, behind a request (§2)
 
-MassDOT publishes its traffic count database at `mhd.public.ms2soft.com` — a
-public-facing MS2 TCDS instance, no login. Verified by opening it:
+Verified by opening `mhd.public.ms2soft.com`:
 
-* **454 permanent ("Perm Station") locations**, of which **214 are functional
-  class (1) Interstate**.
-* Data types per station: **Volume, Speed, Classification**, WIM, gap.
-* Speed is stored as **hourly counts across 15 speed bins** (0–20, 20–25, …,
-  85–250 mph), selectable at 15- or 60-minute display intervals.
-* **~2,685 daily speed records** at the one Interstate station inspected — call
-  it seven years — and current to **two days before this survey**.
-* Per-report export to Excel; the underlying pages are plain ASP with stable
-  query strings (`tcount_gcs.asp?...&count_type=SPEED&speedDate=...`).
+* **454 permanent stations**, of which **214 are functional class (1)
+  Interstate**.
+* Per station: Volume, **Speed**, Classification, WIM, gap.
+* Speed stored as **hourly counts across fifteen 5 mph bins**, displayable at
+  15- or 60-minute intervals.
+* **~2,685 daily speed records** at the one Interstate station inspected — about
+  seven years — current to two days before this survey.
 
-**This section is a correction.** The first pass of this survey dismissed MS2 as
-"spot speeds, biased optimistic, a cross-check not a source" — reasoning from
-how count stations are usually sited, without opening one. Opening one overturned
-it: station 10 sat inside a queue and recovered the entire diurnal curve (§1.1).
-The siting concern is still real and is now §1.2's risk 1, but it is a bias to
-measure, not grounds to discard the source.
+**This entry is a correction twice over.** The first draft of this plan dismissed
+MS2 in a sentence as "spot speeds, a cross-check not a source", reasoning from
+how count stations are usually sited without opening one; opening one overturned
+that (§1.1). The second draft then recommended scraping it, which §2.1 forbids.
+The data is excellent; the route to it is a request.
 
-**What must still be checked:** the portal's Terms of Service, which returned 403
-to an automated fetch and needs reading in a browser, specifically on automated
-access. Scraping ~200 stations × N days is a lot of requests against a state
-portal; it should be rate-limited, cached locally, and run once rather than
-repeatedly. If the ToS forbids automated access, ask MassDOT for a bulk extract
-before assuming the fallback — MS2 has an agency-side bulk API and MassDOT can
-export.
+### 5.2 MassDOT GoTime / RTTM — the sanctioned route, and better shaped
 
-### 3.2 MassDOT GoTime / RTTM — **named fallback**
+137 signs over 700+ miles of Massachusetts highway. Critically, the signup page
+states the mechanism: travel times are generated **"by acquiring data from
+Bluetooth sensors"** — device re-identification between sensor pairs, which
+measures how long a vehicle *actually took over a segment*. That is the quantity
+the router needs, and it is immune to §3's risk 2 by construction.
 
-Real-Time Travel Time system: 137 signs over 700+ miles of Massachusetts
-highway, published as a REST API, **free to authorized developers** via a signup
-form at `api-signup.massgotime.com`.
+Licence, quoted from the signup page: *"Data processed by the system is provided
+free-of-charge to authorized developers via a RESTful HTTP API"*, with one
+restriction: *"Data provided by the GoTime API should only be used for
+transportation purposes."* The organisation-type field offers **Public /
+Private / Individual**.
 
-Its one advantage over §3.1 is decisive where it applies: it reports **travel
-time over a segment**, which is the quantity the router needs, and is therefore
-immune to §1.2's risk 1. Its disadvantages are that it is real-time only — the
-archive must be self-polled for ~8 weeks before a fit — Massachusetts only, and
-gated behind an access grant a personal project may not receive.
+Cost: free. Catch: real-time only, so the archive is self-polled — a cron job on
+the Windows laptop that already runs the server, five-minute cadence, ~8 weeks
+before each (segment × hour-of-week) cell has enough observations to median.
 
-**Ask for the key in week 1 regardless of path**, because it is free, it costs
-one form, and it is the only free source that measures segments rather than
-points. If it is granted, start the poller immediately even while §3.1 is being
-fitted: eight weeks later it becomes the instrument that validates §3.1's
-optimistic bias on far more than eight drives.
+**This is not the live traffic feed the brief ruled out.** The router gains no
+runtime dependency, no per-request cost and no latency; a poller writes rows to
+a file and a fitting tool reads that file offline, months later.
 
-### 3.3 Boston Region MPO (CTPS) — free, and the independent check
+### 5.3 Federal TMAS — checked, and it does not carry speed
+
+Worth recording because it is the obvious "surely the feds publish this"
+thought, and it would have solved all six states at once if true.
+
+Every state submits continuous-count data to FHWA monthly, and the Traffic
+Monitoring Guide's submission formats **do** include a speed record (5 mph bins).
+But the public release at `fhwa.dot.gov/policyinformation/tables/tmasdata/` is
+titled **"U.S. Traffic Volume Data"** and publishes station data plus monthly CCS
+files of hourly *volume*; the companion open-data products are **Volume, Class
+and Stations**. No speed. A search of ArcGIS Hub for New England DOT speed
+datasets returns nothing from any of the six states.
+
+**Verdict: eliminated, definitively. Do not re-check.** Hourly volume alone
+cannot substitute: a detector in a jam records *capacity* flow, not demand, so
+volume-to-speed conversion breaks down in exactly the congested regime this plan
+exists to model.
+
+### 5.4 Boston Region MPO (CTPS) — free, published, and the independent check
 
 CTPS publishes Express-Highway and Arterial Performance Dashboards showing a
-**"speed index" — observed speed over posted speed limit** per segment, with
-downloadable tables. That is `SPEED_FACTOR` by another name, published openly.
-It is legal to read precisely because an agency did the summarising: the NPMRDS
-licence that blocks §3.6 permits agencies to publish data summaries.
+**"speed index" — observed speed over posted limit** per segment, with
+downloadable tables. That is `SPEED_FACTOR` by another name. It is legal to use
+precisely because an agency did the summarising: the NPMRDS licence that blocks
+§2.4 expressly permits agencies to publish data summaries.
 
-Limits: **2019 data, peak-period only, Boston region only.** Pre-pandemic, two
-bins rather than a curve.
+Limits: **2019, peak-period only, Boston region only.** Pre-pandemic, two bins
+rather than a curve.
 
-**Role:** not a source — an independent check. It comes from INRIX probe data
-rather than loop detectors, so where it agrees with a TCDS-fitted profile, risk 1
-is bounded at that location. Worth an email to `ctps.org/data-resources` asking
-whether anything post-2019 exists.
+**Role:** the seed for the provisional constant in week one (§12), and an
+independent check afterwards — it derives from INRIX probe data rather than loop
+detectors, so where it agrees with a fitted profile, §3's risk 2 is bounded at
+that location. Worth an email to `ctps.org/data-resources` asking for anything
+post-2019.
 
-### 3.4 Free, checked, and not useful
+### 5.5 Free, checked, not useful
 
-* **OpenStreetMap** — carries no traffic data. `maxspeed:conditional` encodes
-  *legal* limits that vary by time, not congestion. Confirmed; move on.
+* **OpenStreetMap** — no traffic data. `maxspeed:conditional` encodes *legal*
+  limits that vary by time, not congestion. Confirmed; move on.
 * **FHWA Urban Congestion Report / TTI Urban Mobility Report** — free and real,
-  but metro-level summary statistics (travel time index, congested hours) for a
-  whole urban area. No diurnal curve, no road. Useful as a sanity check on the
-  magnitude of a fitted peak, nothing more.
+  but metro-level summary statistics. No diurnal curve, no road. A sanity check
+  on the magnitude of a fitted peak, nothing more.
 * **Uber Movement** — discontinued, no official archive, newest data ~2020 and
-  therefore pre-pandemic, and its Speeds product covered a few cities' streets
-  rather than Massachusetts highways. Dead and would not have helped.
+  therefore pre-pandemic; its Speeds product covered a few cities' streets, not
+  Massachusetts highways. Dead, and would not have helped.
 * **US DOT ITS DataHub connected-vehicle data** — real probe data, wrong places
   (Wyoming, Tampa, NYC pilots). Nothing for New England.
 * **New England 511** (`newengland511.org`, a ME/NH/VT partnership) — real-time
-  travel times on a public map, partly Waze-sourced, with **no documented public
-  API**. Worth one email per state if the expansion needs it; not a plan.
-* **The project's own eight traces** — validation only, per §7. Eight drives, one
-  driver, three afternoons: there is no design in which they fit 168 cells.
+  travel times on a public map, partly Waze-sourced, **no documented public
+  API**. One email per state if the expansion needs it; not a plan.
+* **The project's own eight traces** — validation only (§11). Eight drives, one
+  driver, three afternoons; there is no design in which they fit 168 cells.
 
-### 3.5 Eliminated because they cost money — recorded, not deleted
+### 5.6 Eliminated because they cost money
 
-Priced so nobody re-prices them. All were surveyed before the no-cost constraint
-and all are genuinely good products; none is needed.
+Recorded so nobody re-prices them. All are good products; none is needed.
 
 * **TomTom Traffic Stats** — Area Analysis returns per-segment average speed,
-  travel time, sample size, posted limit and road class by time bin, delivered as
-  shapefiles. Exactly the right shape. There is a **30-day free trial** via the
-  MOVE portal, and one Area Analysis would fit inside it — but pricing beyond the
-  trial is per directional mile and **quote-only**, and whether the trial licence
-  permits shipping derived constants in a public app is **unverified** and sits
-  behind the portal. A recommendation resting on an unverified licence for a
-  one-shot trial is too fragile to build on. Recorded, not relied on.
+  travel time, sample size, posted limit and road class by time bin, as
+  shapefiles. Exactly the right shape. A 30-day free trial exists via the MOVE
+  portal, but pricing beyond it is per directional mile and quote-only, and
+  whether the trial licence permits shipping derived constants is unverified and
+  sits behind the portal.
 * **HERE Traffic Patterns** — average speed for every road, 15-minute intervals
-  per day of week, 3-year average. The best-shaped product surveyed and the
-  hardest to buy: enterprise, quote-only, no self-service trial found.
+  per day of week, 3-year average. Best-shaped product surveyed, hardest to buy:
+  enterprise, quote-only, no self-service trial found.
 * **INRIX MetroLab Challenge** — free INRIX API access for up to a year, but
-  needs a local-government collaborator, costs $250 to apply, and **applications
-  closed 2026-03-03**. Note it for the next cycle if the academic route revives.
-* **StreetLight / Replica** — agency-priced, and the same licence shape as §3.6.
-
-### 3.6 NPMRDS — free, perfect, and **legally unusable**
-
-This is the finding worth keeping even though the answer is no, because NPMRDS
-is what everyone reaches for: FHWA probe speeds on the National Highway System,
-2016–present, 5-minute bins, supplied by INRIX, **free at the point of use**, and
-covering precisely the road class that is broken.
-
-Both blockers were read at source. Either alone is fatal.
-
-1. **The agreement cannot be signed.** The Data Sharing Agreement is executed by
-   a "State Department of Transportation or Metropolitan Planning Organization
-   receiving federal transportation funds", or their contractors under a named
-   contract with an agency point of contact. Universities appear on RITIS's
-   eligibility list as bodies that may *fund integration of their own data* —
-   a different thing. A `.edu` address is not a route in.
-2. **The licence forbids the use.** The DSA grants a "non-exclusive,
-   non-transferable, non-sublicensable" licence and **explicitly forbids making
-   "data sets or aggregated average travel time databases publicly available"**.
-   A speed profile shipped inside a public routing app is exactly that.
-
-**Do not re-derive this.** If he ever works under a MassDOT or MPO contract,
-NPMRDS becomes available *for that work* — and still could not ship in the app.
-
-### 3.7 Sampling a routing API offline — eliminated on terms
-
-The shortcut that looks free: routing APIs take a future `departAt` and price it
-against historical profiles, so ~3,400 offline requests (20 corridors × 168
-hours) would yield the table inside TomTom's free 2,500/day or HERE's free
-5,000/month.
-
-It does not survive the terms. Google's Maps Platform terms prohibit caching and
-derived datasets; TomTom's Maps API terms bar derivative works and permit
-caching only narrowly; Mapbox and HERE restrict storage of directions responses
-comparably. Fitting a permanent constant table from responses and shipping it is
-derivative-dataset creation under all four. **This is the trap that looks like
-cleverness and is a licence breach**, and it is recorded so nobody re-invents it.
+  needs a local-government collaborator, costs $250 to apply, and applications
+  **closed 2026-03-03**. Note for the next cycle.
+* **StreetLight / Replica** — agency-priced, same licence shape as NPMRDS.
 
 ---
 
-## 4. The hard question: time-dependent routing
+## 6. New England, state by state
+
+`docs/new-england-expansion.md` has all six extracts staged, so the traffic
+question has to answer for six states, not one. It does not answer uniformly.
+
+**The earlier draft claimed the other states were "largely the same scraper".
+That was wrong on both halves:** scraping is barred everywhere it would have
+applied (§2.1), and the six states run **three different vendors**.
+
+| state | portal | vendor | permanent stations | speed data | status |
+|---|---|---|---|---|---|
+| **MA** | `mhd.public.ms2soft.com` | MS2 | 454, **214 Interstate** | **Verified** — 15-min bins, ~7 yrs, current | Ask MassDOT (§2.3) |
+| **NH** | `nhdot.public.ms2soft.com` | MS2 | **167** | **Doubtful** — first permanent station reads "SPEED: No Data"; category "Perm Volume" | Confirm, then ask NHDOT |
+| **VT** | `vtrans.public.ms2soft.com` | MS2 | not counted | **Advertised** — VTrans says the portal offers "traffic volume, vehicle classification, vehicle speeds and vehicle weights" | Ask via VTrans' Survey123 data-request form |
+| **ME** | MaineDOT interactive map | **Drakewell** | **91 CCS**, hourly, 2008– | Unconfirmed; the programme is volume-led | Ask MaineDOT Traffic Engineering |
+| **CT** | `trafficmonitoring.dot.ct.gov` | **Bentley** | **40 ATR** | "Continuous Count Station Daytime Vehicle Speeds" published, format unclear, likely reports | Ask the Traffic Monitoring Section |
+| **RI** | RIGIS / ArcGIS | Esri | not published | **None found** — AADT count locations only | Weakest; expect to fall back |
+
+Three observations that matter more than the table:
+
+1. **Coverage is wildly uneven and roughly tracks congestion.** Massachusetts —
+   the state with real recurring congestion and 214 Interstate stations — has by
+   far the best data. Rhode Island and rural Maine have the least data *and* the
+   least congestion. That correlation is lucky, and §6.1 exploits it.
+2. **NH is the one real gap.** It has 167 permanent stations and I-93, I-95 and
+   I-293 carry genuine Boston-commuter congestion at the Massachusetts line, but
+   the first permanent station inspected has no speed data at all. **Confirming
+   whether NHDOT collects speed anywhere is the single highest-value New England
+   check** and it is not resolved here (§11).
+3. **Six asks, not one.** Each state is a separate email to a separate office
+   under separate terms. That is the honest scope of "works across New England",
+   and it is why §1 puts Massachusetts first rather than waiting for six.
+
+### 6.1 The design answer: key the profile by urban/rural, not by state
+
+The naive generalisation — fit one New England motorway profile — would apply
+Boston's 6 PM trough to I-95 in rural Maine, where the road is empty and the
+true factor is near free-flow all day. That would make Maine ETAs *pessimistic*,
+which is a new bug in the opposite direction, and it is exactly the kind of
+error a single pooled number hides.
+
+Keying by **state** would fix it and is the wrong axis: it needs a state
+attribute the graph does not carry, it puts a discontinuity at the state line
+where none exists, and it splits Boston's suburbs from Boston.
+
+**Key on urban/rural instead.** Congestion is a property of where the road is,
+not which state issued the sign, and both halves are already available:
+
+* On the data side, TCDS carries a **Rural/Urban** filter and FHWA functional
+  class encodes it, so observations can be binned without extra work.
+* On the graph side, `score.py` already computes a per-edge **`c_urban`**
+  component ("town"), which `router.py` reads as a beauty type. It is a
+  continuous 0–1 measure of how built-up an edge's surroundings are — precisely
+  the axis congestion varies along, already computed for all 401,695 edges,
+  needing no new pipeline stage and no graph rebuild.
+
+So the table becomes `class × urban-band × hour-of-week`, with two or three
+urban bands. A rural Maine motorway then inherits the rural profile — which the
+Massachusetts data can fit perfectly well, because Massachusetts has rural
+Interstates too — and Boston's peak stays where it belongs. **This is what makes
+Massachusetts-only data legitimately generalise to New England**, and it is the
+main reason not to block on the other five states' asks.
+
+Risk to name: `c_urban` was calibrated for *scenery*, not congestion, and the
+threshold that makes a road "towny" is not necessarily the one that makes it
+congested. Fitting will show whether the bands separate; if they do not, fall
+back to FHWA's binary urban/rural, which is carried in the count data and can be
+joined onto the graph by a spatial overlay of Census urban areas — more work, no
+new dependency.
+
+---
+## 7. The hard question: time-dependent routing
 
 **A 132-minute drive departing at 17:00 finishes in different traffic than it
 started in.** Applying the 17:00 factor to the whole trip is an approximation,
@@ -332,7 +448,7 @@ Three designs, in order of ambition:
 * **(C) Full time-dependent search.** Edge cost becomes a function of the search
   state. Correct, and a different algorithm.
 
-### 4.1 How wrong is (A)? — measured
+### 7.1 How wrong is (A)? — measured
 
 Simulated against a bimodal weekday motorway profile anchored on the project's
 own two measurements (1.16 off-peak, a parameterised PM trough), integrating the
@@ -343,7 +459,7 @@ the worst case. "ff min" is free-flow trip minutes; 110 ff-min is about the
 **The profile's *shape* here is assumed, not fitted.** §1.1 now supplies one
 real curve — one station, one Monday — and its trough of 0.45 sits between the
 "moderate" and "deep" rows below, which is the useful thing to know. But one
-station-day is not a fitted profile (§5.2), so the table is swept across three
+station-day is not a fitted profile (§8.2), so the table is swept across three
 trough depths rather than quoting one number: the conclusions hold across the
 whole range, which is what makes them usable before the fit exists. Re-run this
 sweep against the fitted profile afterwards and the numbers become measurements
@@ -368,7 +484,7 @@ Three things fall out of that table:
    is pessimistic by up to 53%. An 18:00 departure is exactly when the app would
    most oversell the highway — the same product bug, one layer down.
 
-### 4.2 The answer: build (B)
+### 7.2 The answer: build (B)
 
 Integrating along the chosen route removes essentially all of that error, and
 it costs nothing, because **`RouteResult.minutes` (`router.py:1374`) already
@@ -391,7 +507,7 @@ if both are reported by exact integration, the comparison is honest even when
 the chosen fastest route is slightly suboptimal. "We may not have found the
 very fastest route" is a far smaller lie than "we misreported its time by 40%".
 
-### 4.3 Why (C) is deferred — measured, not assumed
+### 7.3 Why (C) is deferred — measured, not assumed
 
 A time-dependent search cannot use `scipy.sparse.csgraph.dijkstra` at all: the
 cost matrix is fixed at call time and time-dependent costs are not. The
@@ -420,7 +536,7 @@ is a scipy keyword that a Python search would have to reimplement.
 So (C) is deferred, and if it is ever wanted the note to leave is: **do not
 write it in Python.** Write the search compiled, or don't write it.
 
-### 4.4 One correctness trap for whoever builds (C) later
+### 7.4 One correctness trap for whoever builds (C) later
 
 Time-dependent Dijkstra is only label-setting on a **FIFO** network — leaving
 later must never let you arrive earlier. A piecewise-constant profile violates
@@ -433,43 +549,49 @@ a real, if incidental, argument for it.
 
 ---
 
-## 5. The model
+## 8. The model
 
-A speed factor, per road class, per hour of week:
+A speed factor, per road class, per urban band, per hour of week:
 
 ```python
 # router.py, beside SPEED_FACTOR
 SPEED_PROFILE = {
-    "motorway": [...168 floats...],   # Mon 00:00 -> Sun 23:00
+    ("motorway", "urban"): [...168 floats...],   # Mon 00:00 -> Sun 23:00
+    ("motorway", "rural"): [...168 floats...],
     ...
 }
 ```
 
-**168 cells, hourly.** Valhalla stores 2,016 five-minute cells per edge; that
-resolution is not supported by this evidence and would be fitting noise. TCDS
-publishes at 15-minute intervals, so finer cells are *available* — they are just
-not *justified* by a validation set of eight drives. Aggregate to hourly.
+**168 cells, hourly.** Valhalla stores 2,016 five-minute cells per edge; both
+free sources could support finer bins (TCDS displays at 15 minutes, GoTime polls
+at five), but neither the eight-drive validation set nor an eight-week archive
+justifies that resolution. Aggregate to hourly.
+
+**Urban banding per §6.1** — two bands to start, from `c_urban`. This is what
+lets Massachusetts data generalise across New England without applying Boston's
+peak to rural Maine.
 
 Which classes get a profile:
 
-* **`motorway` — certainly.** 100% of the measured error (§1.2), and the class
-  the 214 Interstate stations actually cover.
+* **`motorway` — certainly.** 100% of the measured error (§3), and the class
+  both free sources actually cover.
 * **`trunk`, `primary` — from the data.** TCDS functional classes (2) Freeway &
-  Expressway and (3) Other Principal Arterial map onto these, and there are
-  permanent stations on both. Fit them; ship a profile only if the fit shows
-  real diurnal range.
+  Expressway and (3) Other Principal Arterial map onto these, and GoTime covers
+  some arterials. Fit them; ship a profile only if the fit shows real diurnal
+  range.
 * **Everything else — flat, until something argues otherwise.** `secondary`,
-  `tertiary` and `residential` are within 7% and net to −0.1 minutes. Do not
-  spend that on 168 free parameters per class because the file has columns for
-  them. `SURFACE_SPEED_FACTOR = 0.95` earned its single value by three
+  `tertiary` and `residential` are within 7% and net to −0.1 minutes (§3). Do
+  not spend that on 168 free parameters per class because the file has columns
+  for them. `SURFACE_SPEED_FACTOR = 0.95` earned its single value by three
   independent classes agreeing; that evidence still stands.
 
-Fallback chain, in Valhalla's order: profile cell → class daily mean →
-`SPEED_FACTOR`/`SURFACE_SPEED_FACTOR` exactly as today. A cell with too few
-observations falls back rather than shipping noise, and the fitting tool reports
-how often it did.
+Fallback chain, in Valhalla's order: profile cell → class/band daily mean →
+class mean → `SPEED_FACTOR`/`SURFACE_SPEED_FACTOR` exactly as today. A cell with
+too few observations falls back rather than shipping noise, and the fitting tool
+reports how often it did — a New England build will lean on that fallback hard
+in states whose asks came back empty (§6), and it must be visible when it does.
 
-### 5.1 The `CONTROL_SECONDS` firewall
+### 8.1 The `CONTROL_SECONDS` firewall
 
 `analyze_trace.py`'s docstring is right and this plan obeys it: the speed factor
 scales with distance and the junction cost scales with junction count, so
@@ -482,23 +604,29 @@ summing them fits one drive and nothing else.
 quietly migrate congestion into a per-junction constant where it would be baked
 in permanently.
 
-### 5.2 Fitting: three rules that matter more than the estimator
+### 8.2 Fitting: four rules that matter more than the estimator
 
 1. **Median across days, never one day.** §1.1's 5 PM → 6 PM → 7 PM shape may be
    one evening's incident. Recurrent congestion is what survives a median over
-   every same-weekday observation at that station; incidents do not.
+   every same-weekday observation; incidents do not.
 2. **Space-mean, not time-mean.** A detector counts vehicles, so the arithmetic
    mean of its speed bins is a *time*-mean speed, which overestimates the speed
    that produces travel time. Use the harmonic mean over bin midpoints — at
-   6 PM in §1.1 the two differ by 54.8 vs 29.2 mph, so this is not a rounding
-   detail, it is most of the answer.
-3. **Cap the open top bin.** The 85–250 mph bin was held at 90 in §1.1.
-   It barely moves an off-peak factor and cannot move a congested one, but it
-   should be a named constant in the fitting tool rather than a magic number.
+   6 PM in §1.1 the two differ by 54.8 vs 29.2 mph. This is most of the answer,
+   not a rounding detail. **GoTime needs no such correction**: a Bluetooth
+   segment time is already a space-mean measurement, which is one more reason it
+   is the primary source.
+3. **Cap the open top bin.** The 85–250 mph bin was held at 90 in §1.1. It
+   barely moves an off-peak factor and cannot move a congested one, but it
+   belongs in the fitting tool as a named constant, not a magic number.
+4. **Record provenance per cell.** Every cell should carry which source and how
+   many observations produced it. With two sources, six states and an uneven
+   fallback chain, a table that cannot say where a number came from is a table
+   nobody can debug a year from now.
 
 ---
 
-## 6. What lands where
+## 9. What lands where
 
 No graph rebuild. `graph_edges.parquet` is not regenerated, `pipeline/graph.py`
 is not modified, nothing is copied to the serving box.
@@ -510,12 +638,14 @@ is not modified, nothing is copied to the serving box.
 | `pipeline/router.py:739` | **unchanged**, deliberately, and tested for it |
 | `pipeline/router.py:868` | `_weights(...)` takes a departure time and passes it down |
 | `pipeline/router.py:967` | `route(...)` takes `depart`; the scipy call is unchanged |
-| `pipeline/router.py:1374` | `RouteResult.minutes` walks `edge_minutes` with a clock — design (B) |
+| `pipeline/router.py:1374` | `RouteResult.minutes` walks `edge_minutes` with a clock — design (B), §7.2 |
 | `server/app.py:150` | `/api/route?depart=<ISO8601>`, default now; **both** fastest and scenic priced at it |
-| `tools/scrape_tcds.py` | new; polite, rate-limited, resumable, writes one local parquet. Run once |
-| `tools/fit_speed_profile.py` | new; the parquet → the table. §5.2's three rules live here |
-| `tools/analyze_trace.py` | report error **by departure hour**, and split the 49.7 unexplained stopped minutes by class (§2.1). Still reads no corrected constant — that is what makes it a valid instrument |
-| `tests/` | guards, §7.2 |
+| `tools/poll_gotime.py` | new; five-minute cron, append-only, resumable. Starts the day the key arrives |
+| `tools/fit_speed_profile.py` | new; archive or export → the table. §8.2's four rules live here |
+| `tools/analyze_trace.py` | report error **by departure hour**, and split the 49.7 unexplained stopped minutes by class (§4.1). Still reads no corrected constant — that is what makes it a valid instrument |
+| `tests/` | guards, §11.2 |
+
+There is deliberately **no scraper in this table.** §2.1 is why.
 
 **Out of scope here, flagged for whoever owns the client:** the iOS app must send
 a departure time for a drive planned in advance, and must decide whether a
@@ -526,111 +656,130 @@ now" case that is most of the app's use.
 
 ---
 
-## 7. Validation
+## 10. What could not be established
 
-### 7.1 The eight traces, used correctly
+* **Whether MassDOT grants a GoTime key to an individual project.** The form
+  accepts "Individual" and asks for intended use, which is encouraging, but the
+  answer is theirs. This gates the primary source.
+* **Whether MassDOT will export the continuous-count speed archive**, and how
+  long a public records request would take if the informal ask is ignored.
+* **Whether MS2 grants written authorization**, and whether one grant could
+  cover MA, VT and NH since they host all three.
+* **Whether NHDOT collects speed data at all** (§6). The first permanent station
+  inspected reads "SPEED: No Data" and is categorised "Perm Volume". This is the
+  single highest-value New England check and it was not resolved — the portal's
+  count-type filter needs driving to completion, or NHDOT needs asking.
+* **Whether VT, ME and CT publish speed at usable granularity.** VTrans
+  advertises vehicle speeds; MaineDOT is on Drakewell and volume-led; CTDOT
+  publishes "daytime vehicle speeds" in a format not established. Three emails.
+* **How badly point speeds understate corridor congestion** (§3 risk 2). Not
+  answerable before a fit exists; §11.1 criterion 5 is the measurement, and
+  GoTime sidesteps it entirely.
+* **The class split of the 49.7 unexplained stopped minutes** (§4.1). Not
+  external — nobody has run it. Cheapest item here and the one that most changes
+  the plan's expected ceiling.
+* **The §2.4 routing-API terms are second-hand.** The NPMRDS DSA and the MS2
+  terms were both read at their own sources and are quoted verbatim; the
+  caching and derivative-work restrictions for Google, Mapbox, HERE and TomTom
+  came from comparison write-ups because TomTom's terms page would not render.
+  None is on the recommended path, so the verdict stands — but anyone reviving
+  that idea must read the contracts rather than trust this.
+
+---
+
+## 11. Validation
+
+### 11.1 The eight traces, used correctly
 
 They cannot fit the profile. They can falsify it, and they are the only ground
-truth here measured by the actual car on the actual roads — **and, uniquely, they
-measure segment travel times, which is the one thing a loop detector cannot.**
-That makes them the instrument for §1.2's risk 1, not merely a sanity check.
-
-Each trace carries its own departure timestamp, so each is evaluated **at the
-hour it was actually driven**, never pooled. Criteria:
+truth measured by the actual car on the actual roads. Each carries its own
+departure timestamp, so each is evaluated **at the hour it was actually driven**,
+never pooled.
 
 1. **The broken case improves.** Needham→Wachusett: +242% → within ±25%. If the
    fitted profile cannot move that leg, either the profile is wrong or the wrong
    class is being blamed, and the plan has failed its one clear test.
 2. **The working case does not regress.** Harvard→Needham stays within ±10%. A
    profile that fixes the highway by making back roads worse has traded one bias
-   for another; the +2% is the most valuable number in §2 and the easiest to break.
+   for another; the +2% is the most valuable number in §4 and the easiest to break.
 3. **Off-peak still matches.** The 2026-08-14 traces that fitted `1.16` were
-   driven off-peak; the profile's off-peak cells must reproduce them. This is
-   the direct check that the fit did not simply shift everything down.
+   driven off-peak; the profile's off-peak cells must reproduce them. The direct
+   check that the fit did not simply shift everything down.
 4. **`CONTROL_SECONDS` is unmoved.** Re-run `fit_junction_cost.py` afterwards;
    the pooled 11.5 s / 8.1 s should not move materially. If it does, congestion
    is leaking into the junction term.
-5. **The point-vs-segment bias is measured, not assumed.** Compare the profile's
-   predicted motorway factor at each trace's hour against that trace's measured
-   factor. A systematic optimistic gap **is** risk 1, quantified. If it is large,
-   §3.2's GoTime archive stops being a fallback and becomes the correction.
+5. **The point-vs-segment bias is measured, not assumed.** If the archive route
+   won, compare the profile's predicted motorway factor at each trace's hour
+   against that trace's measured factor. A systematic optimistic gap **is** §3's
+   risk 2, quantified. If it is large, GoTime stops being merely primary and
+   becomes the only source.
+6. **The urban band separates.** Check that the fitted urban and rural motorway
+   profiles actually differ, and that traces on rural motorway are priced by the
+   rural one. If the bands do not separate, §6.1's generalisation to New England
+   does not hold and the fallback in §6.1 is needed.
 
-**Stated plainly: three afternoons cannot validate 168 cells.** These criteria
-test a handful of cells and the overall direction. Every other cell rests on
-TCDS alone. That is a real limitation, it has no fix inside the available data,
-and it should not be hidden behind a pooled average that conceals which cells
-were exercised.
+**Stated plainly: three afternoons cannot validate 168 cells, still less 168 ×
+classes × bands.** These criteria test a handful of cells and the overall
+direction. Everything else rests on the source. That is a real limitation with
+no fix inside the available data, and it should not be hidden behind a pooled
+average that conceals which cells were exercised.
 
-### 7.2 Tripwires
+### 11.2 Tripwires
 
 In `tests/test_calibration.py`'s style — loose guards against a constant drifted
 into nonsense, not fitted precision:
 
 * every profile cell within `[0.3, 1.4]`; outside that an ETA is absurd;
-* the motorway profile has real diurnal range (peak-to-trough ≥ 20%), so a
+* the urban motorway profile has real diurnal range (peak-to-trough ≥ 20%), so a
   silently-flat table fails loudly instead of reverting to today's bug in silence;
 * cells are continuous across bin boundaries within a bounded step — the FIFO
-  trap of §4.4, caught at test time rather than in a route;
-* `CONTROL_SECONDS` invariant to departure time — the §5.1 firewall;
+  trap of §7.4, caught at test time rather than in a route;
+* `CONTROL_SECONDS` invariant to departure time — the §8.1 firewall;
 * a long trip priced by integration differs from the flat departure-time price
-  by roughly what §4.1 predicts, so design (B) is provably wired in rather than
-  quietly bypassed.
+  by roughly what §7.1 predicts, so design (B) is provably wired in rather than
+  quietly bypassed;
+* every shipped cell carries provenance and an observation count (§8.2 rule 4).
 
 ---
 
-## 8. What could not be established
+## 12. Sequencing
 
-* **The MS2 portal's Terms of Service on automated access.** It returned 403 to
-  an automated fetch — which is itself a signal — and needs reading in a browser
-  before any scraper runs. If it forbids automated access, ask MassDOT for a
-  bulk extract rather than assuming the fallback; MS2 has an agency-side bulk
-  API and MassDOT can export.
-* **How badly point speeds understate corridor congestion** (§1.2 risk 1). Not
-  answerable before the fit exists; §7.1 criterion 5 is the measurement.
-* **Whether MassDOT grants GoTime API access to a personal project.** One form
-  to find out, and it gates the fallback. Submit it in week 1 either way.
-* **Whether CTPS has anything newer than the 2019 dashboards.** The CMP page
-  shows 2015 and 2019 and nothing later; one email to `ctps.org/data-resources`.
-* **The class split of the 49.7 unexplained stopped minutes** (§2.1). Not
-  external — nobody has run it. Cheapest item here and the one that most changes
-  the plan's expected ceiling.
-* **The §3.7 terms readings are second-hand.** The NPMRDS DSA (§3.6) was read at
-  its own source and is quoted; the caching and derivative-work restrictions for
-  Google, Mapbox, HERE and TomTom's Maps API were not — TomTom's terms page would
-  not render and the rest came from comparison write-ups. The conclusion is not
-  close to the line and none is on the recommended path, so the verdict stands;
-  but anyone reviving §3.7 must read the contracts rather than trust this.
+**Week 1 — send the emails, ship the machinery.**
+The four asks of §2.3 go out the same day, all free, none blocking: the
+**GoTime key**; the **MassDOT bulk speed export**; **MS2 written
+authorization**; and **CTPS** for anything post-2019. Then run the §4.1 class split, which needs nobody's
+permission.
 
----
-
-## 9. Sequencing
-
-**Week 1 — the free things that take time to answer, plus the plumbing.**
-Submit the GoTime access request and email CTPS the same day; both have latency
-measured in weeks and neither blocks anything. Read the MS2 ToS. Run the §2.1
-class split.
-
-Then build the machinery against a hand-seeded profile: `SPEED_PROFILE`, the
+Then build against a provisional constant: `SPEED_PROFILE`, the
 time-parameterised `_driving_minutes`, integrated `RouteResult.minutes`, the
-`depart` parameter, the §7.2 tripwires. Seed it from §1.1's single station and
-CTPS's published speed index, label the constants `PROVISIONAL` in the source,
-and ship. **The product bug is fixed in week 1, not week 6** — and the real fit
-then arrives to a working harness that only needs its constants replaced.
+`depart` parameter, the §11.2 tripwires. Seed from **CTPS's published speed
+index** — free, legal, agency-published, and independent of every pending ask —
+label the constants `PROVISIONAL` in the source, and ship. **The product bug is
+fixed in week one, and the real fit lands in a working harness that needs only
+its constants replaced.**
 
-**Week 2 — scrape and fit.** `tools/scrape_tcds.py` over the 214 Interstate
-stations plus the Freeway/Expressway and Principal Arterial permanent stations;
-rate-limited, resumable, run once to a local parquet. Then
-`tools/fit_speed_profile.py` under §5.2's three rules. Replace the provisional
-constants, drop the label.
+**Week 2 — start the clock, chase New England.**
+The moment the GoTime key arrives, start `tools/poll_gotime.py`; its value is
+purely a function of how early it starts. In parallel, resolve §10's New England
+unknowns: confirm whether NHDOT has speed at all, and email VTrans, MaineDOT and
+CTDOT. Six states, six answers, no code.
 
-**Week 3 — validate and decide.** Run §7.1 against all eight traces, criterion 5
-included, because that is the one that prices the free path's main weakness. Then
-the judgement call this plan deliberately leaves open: measure how often route
+**Weeks 3–10 — fit whatever arrived first.**
+If the MassDOT export lands, fit it immediately — seven years beats eight weeks,
+and it can be re-fitted against GoTime later. If it does not, the GoTime archive
+matures around week ten. Either way, `tools/fit_speed_profile.py` under §8.2's
+four rules, replace the provisional constants, drop the label.
+
+**Then — validate and decide.**
+Run §11.1 against all eight traces, criteria 5 and 6 included: 5 prices the free
+path's main weakness, 6 decides whether New England generalisation holds. Then
+the judgement call this plan deliberately leaves open — measure how often route
 *choice* differs between design (B) and a design (C) prototype on long trips. If
-it is rare, (C) stays deferred permanently and §4.3's benchmark is the reason. If
-it is common, (C) gets scoped — compiled, per §4.3, never in Python.
+rare, (C) stays deferred permanently and §7.3's benchmark is the reason. If
+common, (C) gets scoped: compiled, per §7.3, never in Python.
 
-**If risk 1 turns out large:** start the GoTime poller (already keyed from week
-1), keep the TCDS profile shipping meanwhile, and re-fit at week ten against
-segment travel times. The harness does not change; only the file the fitting tool
-reads does. That is the whole point of putting the fitting tool behind a file.
+**If every ask is refused** — the genuinely bad case — the fallback is the
+provisional CTPS-seeded profile, shipped permanently and labelled as
+approximate. It is 2019, peak-period-only, Boston-only data. It is also still
+enormously better than believing motorway runs at 1.16 of the limit at six in
+the evening, which is what the app does today.
