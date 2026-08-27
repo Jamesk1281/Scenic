@@ -309,6 +309,88 @@ final class RerouteTests: XCTestCase {
         XCTAssertFalse(model.hasJoinedRoute)
     }
 
+    // MARK: - What the road readout says across a reroute
+
+    /// The gap between the car and a freshly adopted line is where a stale road
+    /// name would do the most damage.
+    ///
+    /// A replacement begins at the junction `snap` chose — a median 99 m ahead,
+    /// p90 217 m — and `advanceSteps` deliberately holds while `awaitingJoin`,
+    /// so `currentStep` sits frozen at 0 for the seconds it takes to get there.
+    /// Naming a road off a frozen index would put the *new* route's first road
+    /// under a car still on the old one, and it would do it at exactly the
+    /// moment a bad snap needs noticing. Quiet until the driver is actually on
+    /// the line, then named.
+    func test_no_road_is_named_over_the_gap_to_a_freshly_adopted_line() async {
+        let backend = Backend()
+        let model = NavigationModel(route: Fixture.routeWithRoadNames(),
+                                    destination: Fixture.north(5000),
+                                    pref: 0.8, weights: [:])
+        model.fetchRoute = backend.fetch
+        model.update(Fixture.fixAt(500))
+        XCTAssertEqual(model.currentRoad, .named("Test Road"))
+
+        model.update(offRoute(800))
+        await waitFor { backend.inFlight == 1 }
+        let replacement = Fixture.routeWithRoadNames(
+            start: 150,
+            steps: [(0, "Continue on New Road", "New Road"),
+                    (5000, "Arrive at your destination", "")])
+        backend.reply(0, with: Fixture.response(fastest: replacement,
+                                                scenic: replacement))
+        await waitFor { !model.isRerouting }
+
+        // The banner is already giving the new route's instruction — it has to,
+        // over the gap — but the driver is 300 m east of the line it belongs to.
+        XCTAssertEqual(model.currentInstruction, "Continue on New Road")
+        XCTAssertEqual(model.currentRoad, .offRoute,
+                       "a name off a frozen step is a stale name")
+
+        // On the new line: now it can be named.
+        model.update(Fixture.fixAt(900))
+        XCTAssertEqual(model.currentRoad, .named("New Road"))
+    }
+
+    /// A replacement the driver is already on keeps naming their road.
+    ///
+    /// `merge` re-arms `awaitingJoin` on purpose — the driver had left the line,
+    /// so off-route recovery has to keep holding — but the line is unchanged and
+    /// the car may well be back on it. The readout must not blank or flicker to
+    /// "off route" for a driver who never left the road they are on.
+    ///
+    /// It does lag one fix. `advanceSteps` is held while `awaitingJoin`, and
+    /// `settleAwaitingJoin` clears it only *after* that on the same fix, so the
+    /// first fix following a merge names the road from the step index `merge`
+    /// derived rather than from where the car now is. Inherited rather than
+    /// introduced — `currentInstruction` lags by exactly the same fix, and both
+    /// catch up on the next one, about a second later. Asserted here so it is a
+    /// known second rather than a mystery.
+    func test_a_merged_route_keeps_naming_the_road() async {
+        let backend = Backend()
+        let model = NavigationModel(route: Fixture.routeWithRoadNames(),
+                                    destination: Fixture.north(5000),
+                                    pref: 0.8, weights: [:])
+        model.fetchRoute = backend.fetch
+        model.update(Fixture.fixAt(500))
+        model.update(offRoute(800))
+        await waitFor { backend.inFlight == 1 }
+        // The same line back again, which is the server's right answer when the
+        // road the driver left is still the best way on.
+        let same = Fixture.routeWithRoadNames()
+        backend.reply(0, with: Fixture.response(fastest: same, scenic: same))
+        await waitFor { !model.isRerouting }
+
+        // Back on the line, having passed the 1 km maneuver while away from it.
+        model.update(Fixture.fixAt(1500))
+        XCTAssertEqual(model.currentRoad, .named("Test Road"),
+                       "one fix behind, with the banner, not off route")
+        XCTAssertEqual(model.currentInstruction, "Turn right onto Elm Street",
+                       "the same one-fix lag, and not something this readout added")
+
+        model.update(Fixture.fixAt(1520))
+        XCTAssertEqual(model.currentRoad, .named("Elm Street"))
+    }
+
     // MARK: - Arriving
 
     func test_the_last_few_hundred_metres_are_not_re_planned() async {

@@ -521,6 +521,71 @@ final class NavigationModel {
         currentStep < steps.count ? steps[currentStep].symbol : "arrow.up"
     }
 
+    /// What can honestly be said about the road under the car.
+    ///
+    /// Three cases and not an optional string, because "we don't know" and
+    /// "you have left your route" are different things to tell a driver and
+    /// only one of them is worth screen space.
+    enum CurrentRoad: Equatable {
+        /// The road the driver is on, named by the maneuver they last drove
+        /// through.
+        case named(String)
+        /// The driver is not on the line being navigated, so the step list
+        /// describes some other road. Said out loud rather than left blank:
+        /// this is the state a wrong snap puts the driver in, and it is the
+        /// one they have no other way to notice.
+        case offRoute
+        /// Nothing to say — no fix yet, the route never named this road, or
+        /// the drive is over.
+        case unknown
+    }
+
+    /// The road the driver is currently on, for the bottom of the nav screen.
+    ///
+    /// `steps[currentStep].name` is the road that maneuver goes **onto**, and
+    /// `currentStep` is the maneuver being *approached* — so the road under the
+    /// car is the name on the maneuver already driven through, one index back.
+    /// Reading the current step instead would name the road the driver is about
+    /// to join as though they were already on it, which is the exact confusion
+    /// this readout exists to remove.
+    ///
+    /// Everything before the name is a check that the step list still describes
+    /// where the car is:
+    ///
+    /// - **Not joined.** The trip was planned from somewhere the driver isn't;
+    ///   they are on a road this route has never heard of. The banner already
+    ///   says so, so this stays quiet rather than saying it twice.
+    /// - **`awaitingJoin`.** A freshly adopted line starts at the junction
+    ///   `snap` chose — a median 99 m ahead, p90 217 m — and `advanceSteps`
+    ///   deliberately does not run until the driver reaches it. A frozen index
+    ///   is not a measurement of anything, so no name is derived from one.
+    /// - **`runningBackwards`.** The match landed on a leg the driver is
+    ///   driving away from; every index off it is from the far side of a turn
+    ///   they have not made.
+    /// - **Off the line.** `offRouteMeters`, the same 60 m that triggers a
+    ///   reroute, so the readout and the rerouting can never disagree about
+    ///   whether the driver is on their route.
+    ///
+    /// Note that off-route does *not* freeze `currentStep` on its own — only
+    /// the three conditions above do. A driver 500 m down the wrong road still
+    /// projects onto the abandoned line, and `advanceSteps` keeps walking the
+    /// index off that projection. Which is worse than frozen, not better: the
+    /// name changes, plausibly, and means nothing.
+    var currentRoad: CurrentRoad {
+        // `lastProgress` nil is not off-route, it is no fix yet: the reroute
+        // path forces `hasJoinedRoute` true by hand, so tapping "fastest"
+        // before the first fix lands would otherwise read as having strayed.
+        guard !arrived, hasJoinedRoute, !steps.isEmpty,
+              let here = lastProgress else { return .unknown }
+        guard !awaitingJoin, !runningBackwards(here),
+              here.offRoute <= Self.offRouteMeters else { return .offRoute }
+        // Empty rather than absent on the arrival step and on a way carrying
+        // neither name nor ref; nil on a response cached before the field
+        // existed. An unnamed road is not an off-route one — say nothing.
+        let road = steps[max(0, currentStep - 1)].name ?? ""
+        return road.isEmpty ? .unknown : .named(road)
+    }
+
     /// Where each maneuver sits along the route, as distance-still-to-drive.
     ///
     /// Walked in travel order, each step matched only against the road ahead of

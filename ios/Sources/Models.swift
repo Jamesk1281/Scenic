@@ -87,6 +87,13 @@ struct RouteStep: Decodable, Identifiable {
     let destination: String?
     /// Which exit to take at a rotary, 1-based; 0 when it can't be counted.
     let roundabout_exit: Int?
+    /// The road this maneuver puts you **onto** — not the one it starts from.
+    /// That is what makes the road under the car the *previous* step's name;
+    /// see `NavigationModel.currentRoad`.
+    ///
+    /// Empty on the arrival step, and on the 4% of legs whose way carries
+    /// neither a `name` nor a `ref` (service roads, tracks, most ramps).
+    let name: String?
 
     var maneuver: ManeuverType { type ?? .unknown }
 

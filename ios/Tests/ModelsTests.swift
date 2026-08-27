@@ -16,7 +16,7 @@ final class ModelsTests: XCTestCase {
         "scenery_km": {"water": 4.1, "coast": 0.0, "forest/park": 12.5,
                        "hills": 0.0, "farmland": 1.2, "town": 20.3},
         "steps": [{"instruction": "Head east on Main Street", "lat": 42.2626,
-                   "lon": -71.8023, "distance_m": 820}]}},
+                   "lon": -71.8023, "distance_m": 820, "name": "Main Street"}]}},
      "scenic": {"type": "Feature",
       "geometry": {"type": "LineString", "coordinates": [[-71.8, 42.26], [-71.07, 42.35]]},
       "properties": {"km": 77.2, "minutes": 86.1, "mean_score": 6.0,
@@ -51,6 +51,30 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(step.instruction, "Head east on Main Street")
         XCTAssertEqual(step.distance_m, 820)
         XCTAssertEqual(step.coordinate.latitude, 42.2626, accuracy: 1e-6)
+    }
+
+    /// The road each step goes onto. `pipeline/router.py` has always sent it;
+    /// this side dropped it on the floor for want of a declaration, which is
+    /// the whole reason the nav screen could not say what road you were on.
+    func test_a_step_carries_the_road_it_puts_you_on() throws {
+        let step = try decoded().fastest.properties.steps.first!
+        XCTAssertEqual(step.name, "Main Street")
+    }
+
+    /// The arrival step really does carry an empty name (`router.py:1659`), and
+    /// so does any leg whose way has neither a `name` nor a `ref`. Empty has to
+    /// stay distinguishable from a road actually called something, because
+    /// `NavigationModel.currentRoad` shows nothing for it rather than guessing.
+    func test_an_unnamed_road_decodes_as_empty_not_missing() throws {
+        let step = try decoded().scenic.properties.steps.first!
+        XCTAssertEqual(step.instruction, "Arrive at your destination")
+        XCTAssertNil(step.name, "this fixture omits the key entirely")
+
+        let json = """
+        {"instruction":"Arrive at your destination","lat":42.1,"lon":-71.2,
+         "distance_m":0,"name":""}
+        """.data(using: .utf8)!
+        XCTAssertEqual(try JSONDecoder().decode(RouteStep.self, from: json).name, "")
     }
 
     // MARK: - The scenery breakdown
@@ -151,6 +175,7 @@ final class ModelsTests: XCTestCase {
         let step = try! JSONDecoder().decode(RouteStep.self, from: json)
         XCTAssertEqual(step.maneuver, .unknown)
         XCTAssertNil(step.exit_ref)
+        XCTAssertNil(step.name)
     }
 
     func test_left_and_right_turns_do_not_share_an_icon() {

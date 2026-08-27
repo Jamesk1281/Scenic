@@ -103,6 +103,55 @@ final class LiveDriveTests: XCTestCase {
                        "finished on step \(model.currentStep) of \(steps.count - 1)")
     }
 
+    /// The road readout, checked against a second instrument on the same real
+    /// route.
+    ///
+    /// The fixture test pins the off-by-one on four invented steps. This pins it
+    /// on a real Worcester–Boston route — 40-odd maneuvers of real ramps, forks
+    /// and unnamed ways — by comparing the road shown against the road named
+    /// *in the instruction of the step already driven through*. The server
+    /// renders that sentence from the same leg label it puts in `name`
+    /// (`_describe_turn`), so agreeing is a real check and disagreeing means the
+    /// index is off by one.
+    ///
+    /// Parsing a road name out of an instruction is a trap in production — the
+    /// wording varies by maneuver and the structured field exists — which is
+    /// exactly why it is worth doing here: an independently rendered string is
+    /// the only thing on hand that is not the field under test.
+    func test_the_road_shown_matches_the_instruction_that_put_the_driver_there() async throws {
+        let response = try await liveRoute(from: worcester, to: boston, pref: 1.0)
+        let steps = response.scenic.properties.steps
+        XCTAssertGreaterThan(steps.filter { !($0.name ?? "").isEmpty }.count, 20,
+                             "expected a real route to name most of its roads")
+
+        let model = NavigationModel(route: response.scenic,
+                                    destination: response.scenic.coordinates.last!,
+                                    pref: 0.8, weights: [:])
+        model.fetchRoute = { _, _, _, _, _ in throw URLError(.notConnectedToInternet) }
+
+        var checked = 0
+        for fix in fixes(along: response.scenic.coordinates, metresPerFix: 29) {
+            model.update(fix)
+            if model.arrived { break }
+            guard case .named(let road) = model.currentRoad, model.currentStep > 0
+            else { continue }
+            // "Turn left onto Bolton Road", "Continue onto X", "Merge onto X",
+            // "Keep left to stay on X" — take the tail after the last " onto "
+            // or " on ", and only when the sentence ends there.
+            let driven = steps[model.currentStep - 1].instruction
+            guard let said = ["onto ", "on "].lazy.compactMap({ marker in
+                driven.range(of: " " + marker, options: .backwards)
+                    .map { String(driven[$0.upperBound...]) }
+            }).first, !said.isEmpty, !said.contains(":") else { continue }
+            XCTAssertEqual(road, said,
+                           "on step \(model.currentStep): \"\(driven)\" put the "
+                           + "driver on \(said), the screen says \(road)")
+            checked += 1
+        }
+        XCTAssertGreaterThan(checked, 100,
+                             "too few fixes cross-checked to mean anything")
+    }
+
     func test_every_maneuver_is_reached_even_with_fixes_dropped() async throws {
         // The defect this guards, on real geometry: one in three fixes thrown
         // away, as the accuracy filter does under an overpass or in a canyon.

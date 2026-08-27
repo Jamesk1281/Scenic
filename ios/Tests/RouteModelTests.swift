@@ -35,8 +35,8 @@ final class RouteModelTests: XCTestCase {
             coordinates: [[Self.harvard.longitude, Self.harvard.latitude],
                           [Self.needham.longitude, Self.needham.latitude]],
             km: 49.2, minutes: 62,
-            steps: [(Self.harvard, "Head south on the scenic route"),
-                    (Self.needham, "Arrive at your destination")]))
+            steps: [(Self.harvard, "Head south on the scenic route", nil),
+                    (Self.needham, "Arrive at your destination", nil)]))
 
         let model = RouteModel()
         model.start = Self.harvard

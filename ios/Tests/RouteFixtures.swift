@@ -39,6 +39,38 @@ enum Fixture {
                                      (5000, "Arrive at your destination")],
         minutes: Double = 10
     ) -> RouteFeature {
+        // Names omitted, which is also worth keeping: a step with no `name` key
+        // is what a response cached before the field existed looks like, and
+        // `RouteStep` has to go on decoding one.
+        routeWithRoadNames(start: start, lengthMeters: lengthMeters,
+                           vertexSpacing: vertexSpacing,
+                           steps: steps.map { ($0.0, $0.1, nil) },
+                           minutes: minutes)
+    }
+
+    /// `straightRoute`'s geometry, with the `name` the server really puts on
+    /// every step: the road that maneuver takes you **onto**.
+    ///
+    /// `steps` are (metres along the route, instruction, name), and a nil name
+    /// omits the key altogether. The default list is the same four maneuvers
+    /// `straightRoute` uses, named the way `pipeline/router.py` names them —
+    /// including the empty name on arrival, which is what it really sends
+    /// (`router.py:1659`).
+    ///
+    /// The names deliberately are not derivable from the instructions by
+    /// position: reading "Turn right onto Elm Street" and displaying Elm Street
+    /// is the off-by-one this fixture exists to catch, so a test that passes by
+    /// accident has to be impossible.
+    static func routeWithRoadNames(
+        start: Double = 0,
+        lengthMeters: Double = 5000,
+        vertexSpacing: Double = 250,
+        steps: [(Double, String, String?)] = [(0, "Head north on Test Road", "Test Road"),
+                                              (1000, "Turn right onto Elm Street", "Elm Street"),
+                                              (3000, "Turn left onto Oak Street", "Oak Street"),
+                                              (5000, "Arrive at your destination", "")],
+        minutes: Double = 10
+    ) -> RouteFeature {
         let count = Int(lengthMeters / vertexSpacing)
         let coordinates = (0...count).map { i -> [Double] in
             let c = north(start + Double(i) * vertexSpacing)
@@ -46,9 +78,8 @@ enum Fixture {
         }
         return decode(feature(coordinates: coordinates,
                               km: lengthMeters / 1000, minutes: minutes,
-                              steps: steps.map { along, text in
-                                  let c = north(start + along)
-                                  return (c, text)
+                              steps: steps.map { along, text, name in
+                                  (north(start + along), text, name)
                               }))
     }
 
@@ -76,7 +107,7 @@ enum Fixture {
         return decode(feature(coordinates: coordinates,
                               km: lengthMeters / 1000, minutes: minutes,
                               steps: steps.map { along, text in
-                                  (north(start - along), text)
+                                  (north(start - along), text, nil)
                               }))
     }
 
@@ -91,18 +122,20 @@ enum Fixture {
         for i in stride(from: 2750.0, through: 500.0, by: -250) {
             let c = north(i); points.append([c.longitude, c.latitude])
         }
-        let steps: [(CLLocationCoordinate2D, String)] = [
-            (north(0), "Head north on Test Road"),
-            (north(3000), "Sharp right onto Return Road"),
-            (north(500), "Arrive at your destination"),
+        let steps: [(CLLocationCoordinate2D, String, String?)] = [
+            (north(0), "Head north on Test Road", nil),
+            (north(3000), "Sharp right onto Return Road", nil),
+            (north(500), "Arrive at your destination", nil),
         ]
         return decode(feature(coordinates: points, km: 5.5, minutes: 11, steps: steps))
     }
 
     // MARK: - JSON plumbing
 
+    /// `steps` are (maneuver coordinate, instruction, name), where a nil name
+    /// leaves the key off the step entirely.
     static func feature(coordinates: [[Double]], km: Double, minutes: Double,
-                        steps: [(CLLocationCoordinate2D, String)],
+                        steps: [(CLLocationCoordinate2D, String, String?)],
                         meanScore: Double = 6.0,
                         sceneryKm: [String: Double] = ["water": 3.0, "coast": 0.0,
                                                        "forest/park": 2.0]) -> [String: Any] {
@@ -114,9 +147,13 @@ enum Fixture {
                 "minutes": minutes,
                 "mean_score": meanScore,
                 "scenery_km": sceneryKm,
-                "steps": steps.map { coordinate, text in
-                    ["instruction": text, "lat": coordinate.latitude,
-                     "lon": coordinate.longitude, "distance_m": 0]
+                "steps": steps.map { coordinate, text, name -> [String: Any] in
+                    var step: [String: Any] = ["instruction": text,
+                                               "lat": coordinate.latitude,
+                                               "lon": coordinate.longitude,
+                                               "distance_m": 0]
+                    if let name { step["name"] = name }
+                    return step
                 },
             ],
         ]
@@ -134,7 +171,9 @@ enum Fixture {
             Fixture.feature(
                 coordinates: feature.geometry.coordinates,
                 km: feature.properties.km, minutes: feature.properties.minutes,
-                steps: feature.properties.steps.map { ($0.coordinate, $0.instruction) })
+                steps: feature.properties.steps.map {
+                    ($0.coordinate, $0.instruction, $0.name)
+                })
         }
         let data = try! JSONSerialization.data(
             withJSONObject: ["fastest": encode(fastest), "scenic": encode(scenic)])
