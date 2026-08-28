@@ -15,7 +15,7 @@ import pytest
 
 from score import CURVE_FULL, curvature_deg_per_km
 
-COMPONENTS = ["c_water", "c_coast", "c_green", "c_curves", "c_relief",
+COMPONENTS = ["c_water", "c_coast", "c_forest", "c_curves", "c_relief",
               "c_farm", "c_views", "c_scenic_tag", "c_urban"]
 
 
@@ -45,7 +45,7 @@ class TestComponents:
         component a constant rather than a signal."""
         assert share(km, edges[component].to_numpy() >= 0.999) < 0.35
 
-    @pytest.mark.parametrize("component", ["c_water", "c_green", "c_curves",
+    @pytest.mark.parametrize("component", ["c_water", "c_forest", "c_curves",
                                            "c_relief", "c_urban"])
     def test_broad_components_have_usable_range(self, edges, km, component):
         """c_relief was scaled for alpine terrain, so in Massachusetts it never
@@ -79,7 +79,7 @@ class TestScoreScale:
         vector — if graph.py ever attaches a chunk's score to the wrong edge,
         this is what catches it."""
         from score import WEIGHTS, composite
-        key = {"c_water": "water", "c_coast": "coast", "c_green": "green",
+        key = {"c_water": "water", "c_coast": "coast", "c_forest": "forest",
                "c_curves": "curves", "c_relief": "relief", "c_farm": "farm",
                "c_views": "views", "c_scenic_tag": "scenic_tag",
                "c_urban": "urban"}

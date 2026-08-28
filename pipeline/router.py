@@ -164,7 +164,7 @@ PREF_CURVE = 2.0
 BEAUTY_TYPES = [
     ("water",  "water",       "c_water",  WEIGHTS["water"]),
     ("coast",  "coast",       "c_coast",  WEIGHTS["coast"]),
-    ("forest", "forest/park", "c_green",  WEIGHTS["green"]),
+    ("forest", "forest/park", "c_forest", WEIGHTS["forest"]),
     ("hills",  "hills",       "c_relief", WEIGHTS["relief"]),
     ("farm",   "farmland",    "c_farm",   WEIGHTS["farm"]),
     ("town",   "town",        "c_urban",  WEIGHTS["urban"]),

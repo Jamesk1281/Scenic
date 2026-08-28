@@ -3,7 +3,8 @@
 Scoring components (the per-segment "beauty vector"):
   water   - proximity to lakes/reservoirs/rivers
   coast   - proximity to the ocean coastline
-  green   - adjacency to woods, forests, parks, reserves
+  forest  - OSM woods/forests/parks/reserves, blended half-and-half with
+            measured tree cover from landcover.py
   curves  - heading change per km (twistiness)
   relief  - local terrain relief from elevation.py (hills, valleys, overlooks)
   farm    - adjacency to farmland/orchards/meadows
@@ -12,7 +13,9 @@ Scoring components (the per-segment "beauty vector"):
   urban   - proximity to town/village centers and retail/commercial districts
 
 The relief component is read from data/processed/relief.tif if present
-(run elevation.py first); otherwise it is zero and a notice is printed.
+(run elevation.py first); the tree-cover half of forest from
+data/processed/tree_cover.parquet (run landcover.py first). Either one missing
+degrades its component to zero and prints a notice.
 
 Each chunk keeps its component vector (the per-segment "beauty vector")
 plus a composite 0-10 score. Output: scored_chunks.parquet.
@@ -47,7 +50,7 @@ DIST = {
 }
 MIN_AREA = {"water": 20_000, "green": 30_000, "farm": 20_000}
 WEIGHTS = {
-    "water": 0.22, "coast": 0.13, "green": 0.18, "curves": 0.13,
+    "water": 0.22, "coast": 0.13, "forest": 0.18, "curves": 0.13,
     "relief": 0.16, "farm": 0.06, "views": 0.05, "scenic_tag": 0.07,
     "urban": 0.14,
 }
@@ -180,6 +183,31 @@ def sample_relief(chunks: gpd.GeoDataFrame, relief_path: Path) -> np.ndarray:
     return np.clip(vals / RELIEF_FULL, 0, 1)
 
 
+def sample_tree_cover(chunks: gpd.GeoDataFrame, path: Path) -> np.ndarray:
+    """Per-chunk WorldCover tree-cover fraction, as written by landcover.py.
+
+    Joined by position, so the file has to have been built from this same
+    roads.parquet. It records the midpoint it sampled and every one of them is
+    checked here, because a misaligned join has no symptom: it would credit one
+    road with another's trees and still produce a plausible score.
+    """
+    if not path.exists():
+        print(f"NOTE: {path.name} missing; c_forest falls back to OSM green at "
+              f"half strength, which under-scores the whole network "
+              f"(run landcover.py to enable measured tree cover)")
+        return np.zeros(len(chunks))
+    mids = chunks.geometry.interpolate(0.5, normalized=True).to_crs(4326)
+    tc = pd.read_parquet(path)
+    if not (len(tc) == len(chunks)
+            and np.allclose(tc["lon"].to_numpy(), mids.x.to_numpy(), atol=1e-9)
+            and np.allclose(tc["lat"].to_numpy(), mids.y.to_numpy(), atol=1e-9)):
+        raise SystemExit(
+            f"{path.name} holds {len(tc):,} chunks that do not line up with the "
+            f"{len(chunks):,} being scored — it was built from a different "
+            f"roads.parquet. Re-run landcover.py against this one.")
+    return tc["tree"].to_numpy()
+
+
 def components(df) -> list[str]:
     """The per-segment "beauty vector" columns present on a frame, in order."""
     return [c for c in df.columns if c.startswith("c_")]
@@ -257,7 +285,23 @@ def main(processed_dir: str):
     mid_water = near_flags(water_tree, geoms, DIST["water_mid"])
     chunks["c_water"] = np.where(near_water, 1.0, np.where(mid_water, 0.45, 0.0))
     chunks["c_coast"] = near_flags(coast_tree, geoms, DIST["coast"]).astype(float)
-    chunks["c_green"] = near_flags(green_tree, geoms, DIST["green"]).astype(float)
+    # Forest: OSM's designated green polygons and WorldCover's measured tree
+    # cover, half each. OSM green records land *designation*, not vegetation, so
+    # on its own it is not comparable between states — its completeness against
+    # WorldCover runs 0.24 in Maine to 0.80 in Rhode Island while the tree cover
+    # actually beside those roads is flat at 82-91%, which leaves the most
+    # forested state in the country with the least green credit. Half and half
+    # rather than a straight swap because the two are only correlated at
+    # rho=+0.3: a state park is worth crediting as a park even where the canopy
+    # is thin, and 27% of Massachusetts road-km has no polygon at all on land
+    # indistinguishable from the land OSM does call green. One blended column
+    # rather than two weighted ones so the forest/park slider keeps its whole
+    # 0.18 — a separate baseline column would leave half of forest-ness
+    # permanently on for a user who set the slider to zero. See
+    # docs/geodata-sources-findings.md.
+    green = near_flags(green_tree, geoms, DIST["green"]).astype(float)
+    tree = sample_tree_cover(chunks, d / "tree_cover.parquet")
+    chunks["c_forest"] = 0.5 * green + 0.5 * tree
     chunks["c_farm"] = near_flags(farm_tree, geoms, DIST["farm"]).astype(float)
     chunks["c_views"] = near_flags(view_tree, geoms, DIST["view"]).astype(float)
     name_l = chunks["name"].str.lower()

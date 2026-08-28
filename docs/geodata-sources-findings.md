@@ -72,6 +72,17 @@ review's 27.0%, not against its 22.6%.
 
 ## 1. Is OSM feature coverage uniform across the six states? **No.**
 
+Three measurements carry this section, and the second and third were added
+after peer review because the first alone is attackable:
+
+1. The OSM ÷ WorldCover completeness ratio for green spans **3.21×** across the
+   six states while the tree cover on the ground spans 1.09×.
+2. **The same estimator run on `c_water` — the layer this document calls
+   uniform — returns 1.52×.** It does not manufacture spread.
+3. Every stricter definition of "wooded" makes the non-uniformity **worse**, up
+   to 5.11× at a ≥75% tree bar. The headline 3.21× is the most conservative
+   number available, not the most flattering.
+
 Replicating `score.py`'s exact `DIST` / `MIN_AREA` thresholds and 400 m chunking
 on each Geofabrik state extract (951,182 chunks, 239,204 road-km):
 
@@ -105,6 +116,51 @@ states.
 | Maine | 21.9 | 89.8 | **0.24** | 1.9 | 41.2 | **0.05** | 10.3 | 26.0 | **0.39** |
 
 **Completeness spread: green 3.3×, farmland 5.9×, townscape 2.3×.**
+
+### The negative control: the same instrument on the layer that is fine
+
+Divide two differently-measured quantities and you can get spread out of
+nothing, so before reading anything into 3.3×, run the identical estimator on
+the one polygon layer this document declares uniform. `c_water`'s 1.3× below is
+*raw OSM prevalence*, not a completeness ratio — it was declared safe on
+reasoning ("a lake is a lake everywhere"), never measured with the instrument
+used to condemn the others.
+
+| state | OSM water | WC water ≥10% | **ratio** |
+|---|---:|---:|---:|
+| Maine | 32.5 | 1.6 | 20.1 |
+| Vermont | 31.7 | 1.5 | 21.1 |
+| New Hampshire | 38.4 | 1.4 | 28.2 |
+| Connecticut | 29.3 | 1.0 | 30.6 |
+| Massachusetts | 32.4 | 1.3 | 25.4 |
+| Rhode Island | 32.6 | 1.4 | 23.1 |
+
+**Water completeness-ratio spread: 1.52×. Green's: 3.21×.** Run the machinery
+on the layer that is fine and it comes back fine — roughly in line with the raw
+OSM water spread (1.31×) and less than half green's. The absolute level (~25,
+not ~1) is meaningless and expected: OSM credits `waterway=river|canal` *lines*
+out to 120/350 m with no area floor, while WorldCover class 80 cannot see a
+river narrower than its pixel. Only the spread is the test. One caveat, stated:
+water's numerator uses a wider `DIST` than green's, so this is the same family
+of operation rather than the identical one.
+
+### Is ≥10% tree too low a bar? Yes — and that is the conservative direction
+
+82–91% of road-km clears ≥10% everywhere, so that denominator really is nearly
+saturated. It does not do what the objection assumes. Rebuilding the
+completeness ratio at every stricter denominator:
+
+| denominator | WorldCover spread | **completeness-ratio spread** |
+|---|---:|---:|
+| ≥10% tree *(used above)* | 1.09× | **3.21×** |
+| ≥25% tree | 1.18× | 3.47× |
+| ≥50% tree | 1.37× | 4.11× |
+| ≥75% tree | 1.70× | 5.11× |
+| mean tree fraction (continuous) | 1.31× | 3.93× |
+
+Every stricter or continuous denominator makes the non-uniformity look worse.
+This document picked the denominator that *minimises* its own headline number
+and still got 3.2×; the objection inverts.
 
 The load-bearing column is the second. **WorldCover's tree cover is nearly flat
 across all six states (82–91% of road-km) while OSM's green credit ranges 21.9%
@@ -150,6 +206,15 @@ green credit at 0.24 of its due in Maine and 0.80 in Rhode Island. Re-fitting
 would not remove that — it would average it, making every state wrong by a
 different fixed amount and calling it calibrated.
 
+**What the fix below does and does not do.** Adding a uniformly-produced
+land-cover signal at half of green's weight **takes the non-uniform share of
+composite weight from 37.7% to 29.8%** — it removes 8 of the 38 points. It does
+not make the Phase 4 re-fit safe. `c_urban` (0.14, completeness spread 2.3×, and
+the one component measured to point the *wrong way* — §3), `c_farm` (0.06, 5.9×,
+the worst on the board) and `c_views` (0.05, pure designation by construction)
+are all untouched by it. **This is the first of at least three changes**, and
+anything that reads as though the problem is then solved is wrong.
+
 ---
 
 ## 2. The 22.6% hypothesis: **confirmed — those roads are under-mapped, not empty**
@@ -167,9 +232,28 @@ WorldCover see?
 | Rhode Island | 744 | 74.6% | 0.38 | 0.54 | −0.15 |
 
 **In Massachusetts, 91.2% of the road-km the model scores blind has real tree
-cover beside it, and that population is on average *slightly more wooded* than
-the population the model does credit (0.66 vs 0.62).** They are not roads with
-nothing to map. They are roads with something to map that nobody has mapped.
+cover beside it, and that population is nearly indistinguishable from the roads
+OSM *does* call green — 0.678 against 0.720.** They are not roads with nothing
+to map. They are roads with something to map that nobody has mapped.
+
+An earlier draft of this section said the blind roads were *slightly more
+wooded* than the population the model credits, 0.66 vs 0.62. That comparison is
+against the wrong population and its sign reverses when corrected: "any polygon"
+pools green credit with water, coast, farm and urban credit, and the 41.6% of
+km credited for something other than green averages only 0.584. Like for like:
+
+| population | % of MA km | mean WorldCover tree |
+|---|---:|---:|
+| no polygon at all | 27.0% | **0.678** |
+| any polygon *(the old comparator)* | 73.0% | 0.642 |
+| `c_green > 0` *(like-for-like)* | 31.4% | **0.720** |
+| polygon but no green | 41.6% | 0.584 |
+
+Against the green-credited population the blind roads are *less* wooded, not
+more. **"Under-mapped, not featureless" survives; "more wooded than the credited
+population" does not.** Incidentally, `c_green > 0` and `c_green >= 1.0` select
+the identical 31.4% of km — green is binary in practice, with no partial-credit
+band at all.
 
 That holds in five of six states. Rhode Island is the exception and the exception
 makes sense: with only 6.8% uncredited, what is left there really is the
@@ -322,10 +406,31 @@ score better, and how much of the map moves.
 | E — keep green 0.18, add tree 0.09 | 0.709 | 0.979 | 30% | 3.08 |
 | F — D + built-up in `BASELINE` | 0.722 | 0.937 | 74% | 3.90 |
 
+**B, C, E and F all break the calibration** (§7.2). E was left open in an
+earlier draft and belongs on that list: it adds weight without removing any, so
+`WEIGHTS` sums 1.14 → 1.23, road-km pinned at 10.0 goes from 0.32% to **1.03%**
+and p99 reaches 10.0. That is one more reason for D over E, and it is why D
+holds green + tree at 0.18 rather than adding a component beside a full-weight
+`c_green`.
+
 **D gets ~56% of the separation gain for ~40% of the disruption.** And since
 every separation here sits inside one standard error (0.080) of every other
 (§3), they are statistically indistinguishable — **so the choice must be made on
 structural grounds, not on the score.**
+
+**D is a choice, not a derivation, and the decision rule has two halves.** On
+uniformity the family is *monotone*: green+tree held at 0.18, the non-uniform
+share falls from 37.7% at 0.18/0.00 to 29.8% at D to 21.9% at A, and calibration
+does not stop you either — p99 holds at 9.1–9.2 throughout and p50 crosses
+`score.py`'s 4.5 target between D (4.4) and 0.06/0.12 (4.6). Uniformity alone
+therefore recommends **A**. What actually stops this document at half is
+disruption (ρ and %km moved) plus the review's "`WEIGHTS` are out of scope"
+constraint. Both are legitimate, but only the first was stated: *§1 establishes
+that a change is warranted; disruption tolerance picks which change.* Worth
+putting on the board for whoever approves it — **0.135/0.045 moves 0.0% of
+road-km by more than a point** (ρ 0.990) and still takes the non-uniform share
+to 33.8%. If "don't re-rank the map" is the binding constraint, that is a
+strictly better uniformity-per-disruption trade than D.
 
 Structurally D is right and A is wrong. `c_green` is not uniformly bad: in Rhode
 Island its completeness is 0.80 and it carries genuine information. Replacing it
@@ -337,14 +442,50 @@ not redundant.
 road-km and would carry almost no ranking signal. The fraction keeps real spread
 (p25 0.25, p50 0.62, p75 0.94) and that is what scored 0.705.
 
+**Use a latitude-corrected ~100 m ground box, not the fixed 9×9 pixel window
+these numbers were measured with.** WorldCover pixels are 1/12000° in both axes,
+which up here is 9.3 m north–south but only 6.9 m east–west, so 9×9 is 83 m ×
+62 m rather than the 90 m square it reads as. The anisotropy does not move §1 —
+the ratio spread is 3.28× at 9×9 and 3.21× ground-corrected — but a smaller box
+raises the share of road pinned at tree = 1.0, and 9×9 puts Maine at **0.335**
+against the `< 0.35` ceiling guard in `tests/test_calibration.py:46`. The
+ground-correct box drops it to 0.258. This is the one place the correction is
+load-bearing.
+
 **How it tiles** — the review demands this, and it is where WorldCover wins.
-WorldCover needs **no mosaic at all**. The kernel is a 9×9 box, so a chunk is
+WorldCover needs **no mosaic at all**. The kernel is a ~100 m box, so a chunk is
 sampled directly from the COG containing it. Measured peak RSS 2.83 GB is *one
 36000×36000 tile* — **it does not grow with the region.** Compare `elevation.py`'s
 in-RAM float64 mosaic with `maximum_filter`/`minimum_filter` over it, ~5× the
 array, already 5.6 GB for New England and the known wall past the Northeast.
 This is the opposite cost shape. The tiles are COGs with overviews and range
 requests, so even the 343 MB download is optional.
+
+### The wiring decision has changed: one blended column, not a second one
+
+§7.1 below recommends a separate `c_treecover` column in `router.py`'s
+`BASELINE`. **That is superseded.** `score.py` instead writes a single
+`c_forest = 0.5 * c_green + 0.5 * tree` and `WEIGHTS["green"]` is renamed
+`WEIGHTS["forest"]` at the same 0.18, so `BEAUTY_TYPES`' existing `forest` row
+just points at the new column. Arithmetically the two are the same blend. The
+difference is what happens to the app's forest/park slider:
+
+| | separate column in `BASELINE` | **blended `c_forest`** |
+|---|---|---|
+| tunable weight mass | 0.89 → 0.80 | **unchanged at 0.89** |
+| does `forest = 0` still ignore forest? | **no** — half becomes permanently on | **yes** |
+| `forest`'s share of tunable mass | 20.2% → 11.2% | **unchanged** |
+| `WEIGHTS` sum | 1.14 | **1.14** |
+| Maine road-km pinned at 1.0 (guard `< 0.35`) | 0.255 | **0.068** |
+
+`Router._edge_scores` renormalises a user's weights onto `DEFAULT_WEIGHTS.sum()`
+— the total *tunable* mass — and moving 0.09 into `BASELINE` moves it out of
+that pot, so a user who sets forest to 0 would still get half of forest-ness and
+the slider would lose 44% of its pull. The cost table below books that at "zero
+iOS changes", which is true of the code and false of the product. Blending
+avoids the trade instead of taking it. The last row is the operational reason:
+pinning now requires *both* designation and full canopy, so the ceiling guard
+that was 4% from tripping in Maine gains an order of magnitude of headroom.
 
 ### `c_urban` is confirmed backwards — handed over, not applied
 
@@ -366,11 +507,17 @@ labels — not the columns.** That decoupling is what makes this cheap.
 | item | cost |
 |---|---|
 | new `landcover.py` stage | **the only real engineering.** Simpler than `elevation.py`: no mosaic, no filters, no coverage guard. The sampling loop is written and measured (9.3 s for Massachusetts) |
-| `score.py` — new `c_treecover` column, 2 `WEIGHTS` entries | ~3 lines |
-| `router.py` — add `("c_treecover", WEIGHTS["treecover"])` to `BASELINE` | **1 line** |
-| **iOS app** | **zero changes** — `forest` apiName and `BEAUTY_TYPES` are untouched |
-| `tests/test_calibration.py` `COMPONENTS` list (line 18) | ~2 lines |
+| `score.py` — `c_forest = 0.5*c_green + 0.5*tree`, `WEIGHTS["green"]` renamed `"forest"` at the same 0.18 | ~4 lines plus the join guard |
+| `router.py` — the existing `BEAUTY_TYPES` forest row points at `c_forest` | **1 line** |
+| **iOS app** | **zero changes** — `forest` apiName, the display labels and the slider's share of tunable mass are all untouched |
+| `tests/test_calibration.py` — **three** hardcoded lists, not one: `COMPONENTS` (line 18), the `test_broad_components_have_usable_range` parametrize (line 48), and the `key` dict inside `test_score_matches_components` (lines 82-85) | ~3 lines |
 | rebuild + test run | one pipeline run |
+
+In all three test lists `c_green` is **replaced** by `c_forest`, not joined by
+it. Miss the `key` dict and `test_score_matches_components` recomputes `raw`
+short and fails with a confusing message. `tests/test_graph.py` derives
+`ALL_COMPONENTS` from `WEIGHTS` and needs nothing; `tests/test_scoring.py:91`
+asserts on `sum(WEIGHTS.values())`, which this change leaves at 1.14 exactly.
 
 ### 7.1 The trap
 
@@ -385,9 +532,13 @@ self.pref_matrix = column_stack([w * e[col] for _, _, col, w in BEAUTY_TYPES])
 A new column in `WEIGHTS` but in **neither** list is included in the precomputed
 `score` and silently dropped from the live re-blend, breaking the documented
 invariant that all-1.0 weights reproduce the precomputed column exactly
-(`test_routing.py:1016` is the tripwire). **`BASELINE` is the right home** — the
-existing "always on, not user-tunable" list where `c_curves`, `c_views` and
-`c_scenic_tag` already live. Putting it there also means no iOS work.
+(`test_routing.py:1013` is the tripwire). An earlier draft put the new column in
+`BASELINE` — the existing "always on, not user-tunable" list where `c_curves`,
+`c_views` and `c_scenic_tag` live — and called the iOS cost zero. **That is
+superseded by the blended `c_forest` column in §6**, which sidesteps the trap
+entirely by adding no column to `WEIGHTS` at all: the existing `BEAUTY_TYPES`
+row simply points somewhere new, so both lists stay complete by construction and
+the forest/park slider keeps all 0.18 of its pull.
 
 ### 7.2 Two costs the review warned about that do not bite
 
@@ -408,9 +559,10 @@ Length-weighted, against `score.py`'s stated targets of p50 ≈ 4.5 and p99 ≈ 
 **D lands closer to the p50 target than the shipped scoring does.** Road-km pinned
 at 10.0 goes 0.31% → 0.24%; pinned at 0.0, 3.31% → 3.10%.
 
-(Variants B, C and F *do* break the calibration — their means run to 5.65 and
-6.52 — which is a further reason to prefer D. Those numbers are an artifact of
-not re-fitting, not an improvement.)
+(Variants B, C, E and F *do* break the calibration — B/C/F's means run to 5.65
+and 6.52, and E raises road-km pinned at 10.0 from 0.32% to 1.03% with p99 at
+10.0, because it adds weight without removing any and `WEIGHTS` sums 1.23. Those
+numbers are an artifact of not re-fitting, not an improvement.)
 
 ### 7.3 How big the change is, in plain terms
 
@@ -430,10 +582,33 @@ On that alone, the pipeline stage is not obviously worth it.
 not really about accuracy. 38% of the composite's weight rides on inputs varying
 3–5× by state for mapping reasons. Phase 4 promises a 7/10 means the same in
 Stowe as in Sudbury; on these inputs it cannot, and re-fitting averages the bias
-rather than removing it. Variant D is roughly one pipeline stage plus four lines,
-needs no iOS work and no recalibration, and buys uniformity by construction.
+rather than removing it. Variant D is roughly one pipeline stage plus four lines
+and needs no iOS work and no recalibration — and it **takes the non-uniform
+share of composite weight from 37.7% to 29.8%**, which is a first instalment,
+not a solution. `c_urban` (0.14, and measured backwards) and `c_farm` (0.06,
+5.9× spread) are the remaining 0.20 and are untouched here. Anyone reading this
+as "Phase 4 is now safe" has read it wrong; it is the first of at least three
+changes.
 
 **So the decision is not "is the score good enough". It is "is the rollout real".**
+
+### The cheapest competing option, and why it still loses
+
+Fit `RAW_BASE` / `STRETCH` **per state**. It removes the between-state level
+shift at *zero* pipeline cost, using the same mechanism this section invokes
+when it says a roughly constant intra-Massachusetts bias is absorbed by
+calibration. It has to be rejected explicitly, because on §1 alone it is not:
+§1 measures a *between*-state distortion, and per-state calibration is precisely
+the instrument for a between-state distortion.
+
+**§1 and §2 together rule it out; neither does alone.** Per-state constants
+cannot touch the *within*-state distortion, and §2 measures that at 27% of
+Massachusetts road-km scored blind on land indistinguishable from the land OSM
+does credit (tree 0.678 against 0.720). A per-state `RAW_BASE` would raise every
+Maine road by the same amount, including the ones OSM already credits correctly,
+and would leave the wooded-but-unmapped road and the bare-but-designated road
+exactly as far apart as they are today. It re-levels the states; it does not
+re-rank the roads inside them, which is what a driver actually experiences.
 
 ---
 
@@ -492,3 +667,86 @@ table was wrong this way and read as merely surprising. A bounds assertion caugh
 it; the fix was verified against five corner points of the region and against the
 published `esa_worldcover_grid.geojson`. Any promoted version must keep that
 assertion.
+
+---
+
+## 10. What the build actually produced
+
+Built 2026-08-28 on branch `claude/landcover-impl-4d47e8`: `pipeline/landcover.py`
+plus `c_forest = 0.5*c_green + 0.5*tree` in `score.py`, the existing
+`BEAUTY_TYPES` forest row repointed, and `c_green` replaced by `c_forest` in
+`tests/test_calibration.py`'s three hardcoded lists. Massachusetts was rebuilt
+from the same `roads.parquet` and `massachusetts-latest.osm.pbf` the shipped
+data came from, into a scratch directory so the shipped columns survived for the
+comparison.
+
+| quantity | expected | **built** |
+|---|---|---|
+| length-weighted p50 | 4.49 | **4.49** |
+| length-weighted p99 | 9.12 | **9.12** |
+| road-km pinned at 0.0 | 2.98% | 3.01% |
+| road-km pinned at 10.0 | 0.24% | 0.25% |
+| Spearman vs shipped | 0.957 | **0.9565** |
+| road-km moving > 1 point | 18.1% | **18.1%** |
+| Maine `c_forest ≥ 0.999` (guard `< 0.35`) | 0.068 | **0.068** |
+| full suite | 294 pass, 0 skipped | 293 pass, **1 fail** (below) |
+
+The two pinned-share rows are the only numeric differences, and they are not
+disagreements: 3.01% / 0.25% is exactly what the peer review measured for
+variant D (its §1 reproduction table), against the 3.10% / 0.24% this document
+had. The build agrees with the review to the digit.
+
+Benchmarks landed within 0.01 of the review's variant-D column throughout —
+Greylock 6.62, Jacob's Ladder 5.17 (5.16), Mohawk Trail 5.31, Route 6A 5.57
+(5.56), I-90 0.57, I-95 0.49; scenic − interstate 4.73 → 5.13. `TestBenchmarkRoads`
+and `TestScoreScale` pass with more margin than the shipped scoring, as the
+review predicted.
+
+**The sampler was validated against published numbers before it was wired in.**
+Run at a fixed 9×9 box it reproduces §6's unweighted tree quartiles
+(0.25 / 0.62 / 0.94), the review's §3e length-weighted IQR (0.64) and its
+Massachusetts ceiling share (0.198) *exactly*; switched to the ground-corrected
+~100 m box those become 0.32 / 0.65 / 0.92, 0.53 and 0.128. On the shipped
+313,791 chunks it reproduces the §3c population table to 0.001 (blind 0.679 vs
+0.678, any-polygon 0.643 vs 0.642, green-credited 0.720, credited-but-not-green
+0.585 vs 0.584) and Maine's corrected ceiling share to 0.002 (0.256 vs 0.258).
+Every difference between this build and the earlier numbers is the sampling box,
+which is what the review said it was.
+
+### Three things the build found that the plan did not
+
+1. **`tests/test_calibration.py` has *three* hardcoded component lists, not
+   two.** Besides `COMPONENTS` (line 18) and the `key` dict (lines 82-85), the
+   `test_broad_components_have_usable_range` parametrize at line 48 names
+   `c_green` too.
+
+2. **`BREAKDOWN_MIN` does not bite, and the interesting movement is the other
+   way.** The worry was a road with no OSM green and 0.7 tree scoring
+   `c_forest = 0.35` and dropping out of the route summary's forest/park
+   kilometres. It cannot happen: `c_green` is binary, so any road that counts
+   today has `c_forest ≥ 0.5`. **Zero km loses the label.** What does happen is
+   that the labelled share nearly doubles — 31.4% → **58.6%** of Massachusetts
+   road-km at `c_forest ≥ 0.4` — because wooded-but-unmapped road now qualifies.
+   That is the change working as intended, but it is worth knowing that
+   "forest/park" will now describe more than half the network's km, and that
+   there is no guard on forest of the kind `test_town_is_not_most_of_the_state`
+   puts on `c_urban`. Not retuned; flagged.
+
+3. **One test fails, and it is a wart that moved rather than a regression.**
+   `test_loops.py::test_the_middle_of_the_pref_slider_is_not_monotone` asserts
+   that a Needham 40 km loop at `pref` 0.25 comes back *worse* than at 0.0 — a
+   defect in `looper.py` deliberately pinned so that fixing it fails loudly.
+   Under `c_forest` it no longer does (4.76 → 5.41). The wart itself is **not**
+   fixed: sweeping `pref` over 0.0–1.0 at three starts shows the shipped build
+   is already non-monotone at Concord (5.50 → 5.09 at pref 0.5) and already
+   monotone at Worcester, and the `c_forest` build is still non-monotone at
+   Concord (5.86 → 4.99). The test samples one start; this change moved that one
+   start. Retargeting it means asserting a new coincidence, so it is left
+   failing for `looper.py`'s owner rather than rewritten here.
+
+### What is still open
+
+§8.1 — whether this actually improves the composite — is *narrower* but not
+closed. The column now exists region-wide, so the separation measurement §8.1
+asks for is finally runnable; §8.2 remains the real blocker, and marks from a
+second state (ideally Maine) would still settle more than anything else here.
