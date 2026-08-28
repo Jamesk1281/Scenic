@@ -1,6 +1,12 @@
 # Loop routes: a start point, a distance slider, and a shuffle button
 
-**Status: designed and measured. No source file touched, no code written.**
+**Status: designed, measured, and now built — see §12 for what changed on the
+way.** Architecture 1 shipped: `pipeline/looper.py`, `/api/loop` and `via` on
+`/api/route`, and a Loop segment in the planning sheet. The design below is left
+as it was written, with §12 recording where building it proved the design wrong.
+The original status line read:
+
+> **Designed and measured. No source file touched, no code written.**
 Everything below was measured against the shipped graph at the shipped
 calibration (`BETA = 8.0`, `PREF_CURVE = 2.0`, pref 1.0 unless stated) on
 2026-08-26, from three starts chosen to span the geography: Needham (suburb),
@@ -549,3 +555,108 @@ existing directions tab's map and step list.
    by pointer doubling; verify against `route().km` before trusting anything
    else. The verification in §1 is the check that catches an error in the
    accumulation, and it should be the first thing an implementation writes.
+
+---
+
+## 12. What changed when it was built
+
+Six things. Four are corrections to numbers above; two are things the design
+missed entirely.
+
+**1. Five candidate builds, not three.** §6 recommended `k=3` interactive and
+`k=5` in the background. Shipped is 5 everywhere, and the reason is not the
+distance accuracy that §6 measured — it is a defect §6 could not see, because it
+only looked at length. At `k=3` the slice holding the target sometimes offers
+only a candidate that doubles back: at a Needham 40 km target it chose a 39.7 km
+loop repeating 2.0 km over a 43.2 km loop repeating none. Narrower slices fix it.
+
+| picks | worst distance error | worst repeated | mean repeated |
+|---|---|---|---|
+| 1 | +21% | — | — |
+| 3 | −7% | 5.0% | 1.7% |
+| 5 | +5% | 3.4% | 1.1% |
+
+Weighting repeated road more heavily in the choice was tried first and is worse:
+at 4x it saved 0.4% of retrace and cost 14% of distance accuracy. The shipped
+rule adds distance error and repeated kilometres with **equal weight**, since
+they are the same unit and the same complaint — a kilometre the driver did not
+ask for — which leaves no exchange rate to tune.
+
+**2. The 0% retrace figures in §3 are for one hand-picked turnaround, not for
+what ships.** Those three loops were chosen for scenery. `plan` chooses for
+distance, which is a different candidate: **1.1% repeated road on average and
+3.4% at worst** over three starts and three targets. Still against 26%/50%/18%
+with the penalty off, so the conclusion holds — but 0% was never the shipped
+number.
+
+**3. Latency is higher than §3 quoted, because of point 1.** Measured through the
+endpoint rather than in a scratch script:
+
+| action | measured |
+|---|---|
+| first loop at a new start | 1,216 ms |
+| regenerate (warm cache) | ~650 ms |
+| new distance, same start | 667 ms |
+| after moving `pref` | 1,125 ms |
+| an identical repeat request | ~0 ms |
+| `/api/route`, for comparison | 281 ms |
+
+§3's 145–435 ms was for 1–3 passes. Five is the price of the slider landing
+within 5%. The background pool that would make regenerate free was **not**
+built; identical requests are memoised instead, which covers shuffling forward
+and back to the one you liked.
+
+**4. The `session` token in §10 was over-engineering and is gone.** The cache key
+is derived from the request itself — snapped start node, pref, weights — so the
+client sends nothing extra and the server stays stateless from its point of view.
+
+**5. `pref` is a poor control for loops, and not monotone.** Not noticed in
+design. Measured at a Needham 40 km target:
+
+| pref | 0.00 | 0.25 | 0.50 | 1.00 |
+|---|---|---|---|---|
+| mean score | 5.00 | **3.58** | 5.43 | 5.84 |
+| km scoring ≥7 | 3.2 | 4.7 | 10.5 | 15.8 |
+
+The endpoints behave; 0.25 comes back worse than 0.0. Two structural causes:
+candidate turnarounds are ranked by scenery whatever `pref` is, so a small
+non-zero pref moves *where you go* without buying the routing to justify it; and
+the final choice among built loops is on distance and repeated road with no
+scenery term, which is harmless at pref 1.0 where every candidate is pretty and
+is not at low pref. With the length already pinned by the slider, pref has little
+left to trade. **The tab pins it at 1.0** — which is also what the field cache
+wants, since pref is the one parameter that invalidates it.
+
+**6. Rerouting a loop needed a server change, which the plan said it would not.**
+This is the design's real miss. A loop ends where it began, so its destination is
+the driver's own driveway: `NavigationModel` reroutes there and the server
+correctly returns the short way home. On the 39.8 km Needham loop, going 2 km off
+route early replaced 35 remaining kilometres with **4.8**.
+
+Aiming the replacement at the turnaround instead — the obvious fix, and the one
+this document would have led to — makes the driver *arrive* at the turnaround,
+halfway round. The replacement has to be pinned **through** it. So `/api/route`
+gained an optional `via`, and `LoopPlanner.resume` runs the two legs and returns a
+single `RouteResult` whose turn-by-turn reads continuously across the join: 41.7
+km and 71 steps with one depart and one arrive, at 645 ms instead of 322 ms.
+
+`resume` threads its second leg through whichever index of the waypoint the first
+leg arrived at rather than the junction's original index, so a restricted
+approach cannot be evaded at the waypoint — the same invariant §11 item 4 argues
+for the turnaround.
+
+### Still open
+
+- **§11 items 1, 2, 3 and 5 stand.** The penalty factor is still one measured
+  point; the ranker is still unmeasured in the middle of the band; nobody has
+  driven one of these, which remains the largest product risk; cache hit rate is
+  still unknown.
+- **§11 item 4 is now asserted rather than argued** for arrival (a driver sitting
+  at the start with the loop ahead does not latch), but the turn-restriction
+  legality of the turnaround itself is still an invariant argument and not a
+  replay test.
+- **`heading` is dropped on a `via` route.** It picks which end of the driver's
+  road to leave from, and this caller is mid-drive, so it matters — a rejoin can
+  open by turning the car around. `resume` has no way to express it because the
+  search starts from the node `snap` returned. Worth fixing.
+- **The background pool** (§3) is unbuilt, and worth ~650 ms per regenerate.
