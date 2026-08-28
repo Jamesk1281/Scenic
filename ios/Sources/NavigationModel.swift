@@ -129,6 +129,16 @@ final class NavigationModel {
     /// re-match an out-and-back route onto the leg it drove twenty minutes ago.
     private static let backtrackToleranceMeters: Double = 100
 
+    /// How far back the match may be re-seated when the floor turns out to have
+    /// been holding it behind the car — see `reseatIfPinned`.
+    ///
+    /// Releasing the floor has to stay bounded, because the floor is what stops
+    /// a match jumping to an earlier pass over the same road. Wide enough to
+    /// cover the measured failure (282 m, 2026-08-25), narrow enough that the
+    /// outbound leg of a scenic loop — kilometres away along the line, however
+    /// close across the ground — can never be mistaken for the return.
+    private static let reseatWindowMeters: Double = 500
+
     /// How far along the route the driver has been matched, monotonically.
     /// Keeps the match moving forwards over a route that crosses itself.
     private var travelled: Double = 0
@@ -545,7 +555,9 @@ final class NavigationModel {
         // for GPS jitter — see `progress`. Before they have joined the route
         // nothing is known, so the whole line is fair game.
         let floor = hasJoinedRoute ? max(0, travelled - Self.backtrackToleranceMeters) : 0
-        let here = progress(of: location.coordinate, along: coordinates, notBefore: floor)
+        let here = reseatIfPinned(progress(of: location.coordinate,
+                                           along: coordinates, notBefore: floor),
+                                  at: location)
         lastProgress = here
 
         if !hasJoinedRoute {
@@ -622,6 +634,59 @@ final class NavigationModel {
         }
     }
 
+    /// Let the match off the floor when the floor is what put it off route.
+    ///
+    /// `offRoute` is not the distance to the route. It is the distance to the
+    /// nearest point of the route *at or after* `notBefore` — `progress` skips
+    /// every segment ending before it — and `update` feeds that from a running
+    /// maximum. On a route that doubles back over the road the driver is on (a
+    /// reroute that opens by passing them, the return leg of a loop) the match
+    /// can land on the wrong pass. The driver then drives forwards while their
+    /// position *along that pass* runs backwards, and once it has run back
+    /// further than `backtrackToleranceMeters` the floor pins the match to a
+    /// point they are driving away from. From there `offRoute` measures the
+    /// distance to the pin rather than to the road, and climbs without limit
+    /// with nothing wrong on the road at all.
+    ///
+    /// Measured on 2026-08-25: **168.2 m recorded where the whole-line
+    /// projection put the car 11.8 m from its route**, on a polyline
+    /// byte-identical to the one adopted a second later. It crossed
+    /// `offRouteMeters` at 65 m, re-routed, and the reply was the same line —
+    /// correctly, the car was on the best route. `adopt` then reset `travelled`
+    /// to 0, which released the floor and dropped the reading back to 11.6 m.
+    /// The reroute storm *was* the recovery mechanism; 6 of the 8 same-route
+    /// adoptions across the recorded drives began this way.
+    ///
+    /// So: only once the constrained match claims off-route, ask the
+    /// unconstrained one. If that says the driver is *on* the line — measured at
+    /// `joinConfirmMeters`, the deadband `trackSettling` uses, not the 60 m
+    /// trigger — the floor was wrong, and the match is re-seated onto the
+    /// whole-line answer.
+    ///
+    /// This cannot skip the driver forwards. Any match later than the floor is
+    /// available to the constrained search too, so the two can only differ by
+    /// the free one being *earlier*: the worst it can do is admit the driver is
+    /// further back than the floor believed. `currentStep` is re-derived from
+    /// zero because an index read off the wrong pass is wrong too, and
+    /// `advanceSteps` walks it back up on this same fix.
+    ///
+    /// Deliberately not run while `awaitingJoin`: a freshly adopted route has
+    /// `travelled` at 0 and so no floor to be pinned by, and the gap between
+    /// the car and a line starting at the junction ahead is exactly the
+    /// legitimate off-route this must not swallow.
+    private func reseatIfPinned(_ here: RouteProgress,
+                                at location: CLLocation) -> RouteProgress {
+        guard hasJoinedRoute, !awaitingJoin,
+              here.offRoute > Self.offRouteMeters else { return here }
+        let free = progress(of: location.coordinate, along: coordinates, notBefore: 0)
+        guard free.offRoute <= Self.joinConfirmMeters,
+              travelled - free.travelled <= Self.reseatWindowMeters else { return here }
+        travelled = free.travelled
+        matchAtAdoption = free.travelled
+        currentStep = 0
+        return free
+    }
+
     /// Move the banner past every maneuver the driver has already driven
     /// through, and measure how far the next one is.
     ///
@@ -658,11 +723,22 @@ final class NavigationModel {
         // both distances are the whole route, and `>=` consumed the
         // instruction on equality. That happened on 21 of the 51 reroutes
         // recorded across five drives.
-        while currentStep < steps.count - 1,
-              here.remaining < stepRemaining[currentStep] - passedMargin(currentStep) {
-            currentStep += 1
-        }
+        currentStep = firstStepAhead(of: here.remaining, from: currentStep)
         distanceToNext = max(0, here.remaining - stepRemaining[currentStep])
+    }
+
+    /// The first maneuver not yet driven through, searching forward from
+    /// `index`.
+    ///
+    /// Split out of `advanceSteps` because `merge` needs the same walk from a
+    /// standing start: it swaps the step list under a drive in progress, and an
+    /// index into the old list means nothing in the new one.
+    private func firstStepAhead(of remaining: Double, from index: Int) -> Int {
+        var i = index
+        while i < steps.count - 1, remaining < stepRemaining[i] - passedMargin(i) {
+            i += 1
+        }
+        return i
     }
 
     /// Whether the driver is running *against* the route they were just handed.
@@ -770,6 +846,8 @@ final class NavigationModel {
     /// Abandon the scenic route and head straight there the quick way.
     func switchToFastest(from location: CLLocation) async {
         let previousPref = pref
+        let previousReroutes = consecutiveReroutes
+        let previousOnRouteSince = onRouteSince
         followingFastest = true
         pref = 0
         // The driver has changed their mind about where they are going, so the
@@ -792,6 +870,12 @@ final class NavigationModel {
         case .failed, .ended:
             followingFastest = false
             pref = previousPref
+            // Restored with the rest, and for the same reason. On a switch that
+            // never happened the driver declined nothing, so a backoff that had
+            // climbed to two minutes must not come back at eight seconds
+            // because one request timed out.
+            consecutiveReroutes = previousReroutes
+            onRouteSince = previousOnRouteSince
         case .adopted, .superseded:
             break
         }
@@ -823,10 +907,25 @@ final class NavigationModel {
         // road that lies *ahead*. Without it the nearest graph node is as often
         // as not the junction just passed, and the replacement route opens by
         // turning the driver around — which the first test drive did.
+        //
+        // Both held in locals because the trace records them beside the reply:
+        // what was asked is what makes the answer checkable afterwards.
+        let askedHeading = Self.usableHeading(origin)
+        let askedPref = pref
         guard let response = try? await fetchRoute(origin.coordinate, destination,
-                                                   pref, weights,
-                                                   Self.usableHeading(origin))
-        else { return generation == rerouteGeneration ? .failed : .superseded }
+                                                   askedPref, weights, askedHeading)
+        else {
+            guard generation == rerouteGeneration else { return .superseded }
+            // A request that never lands is the plainest case of asking not
+            // helping, so it backs off with the rest. Reaching the 120 s cap
+            // takes four consecutive failures, by which point the network is
+            // gone and retrying every eight seconds is a radio draining the
+            // battery to no end. `trackSettling` clears the counter as soon as
+            // the driver holds the line for 30 s, so one dropped request costs
+            // a single doubling rather than the drive.
+            if reason == "offroute" { consecutiveReroutes += 1 }
+            return .failed
+        }
         guard generation == rerouteGeneration else { return .superseded }
         // The drive can end while a reroute is in the air. `update` stops
         // looking at fixes once `arrived` latches and NavView stops the
@@ -836,7 +935,19 @@ final class NavigationModel {
         // new trip, with no fix left to undo either.
         guard !arrived else { return .ended }
 
-        adopt(wantFastest ? response.fastest : response.scenic, reason: reason)
+        let replacement = wantFastest ? response.fastest : response.scenic
+        // The server is entitled to hand back the route the driver is already
+        // on: if they have left it and this is still the best way there, that
+        // is the right answer and not a fault. Adopting it *as new* is the
+        // fault — it restarts the banner, discards `travelled` and re-arms the
+        // join gate against a line the car never left.
+        if sameLine(as: replacement) {
+            merge(replacement, reason: reason, from: origin.coordinate,
+                  heading: askedHeading, pref: askedPref)
+        } else {
+            adopt(replacement, reason: reason, from: origin.coordinate,
+                  heading: askedHeading, pref: askedPref)
+        }
         // Only off-route reroutes back off. A user tapping "fastest" has asked
         // for this one and is owed it immediately, and counting it would then
         // slow down the recovery they asked for.
@@ -855,12 +966,72 @@ final class NavigationModel {
         return .adopted
     }
 
+    /// Whether a replacement covers exactly the ground already being driven.
+    ///
+    /// Compared on the geometry, because that is the only field that settles
+    /// it: `km`, `minutes` and `mean_score` are rounded to one decimal in the
+    /// trace and to rather less than that in a driver's judgement, so two
+    /// genuinely different routes can agree on all three. Across the recorded
+    /// drives 8 of 51 off-route reroutes came back byte-identical to the line
+    /// already being followed.
+    private func sameLine(as feature: RouteFeature) -> Bool {
+        let other = feature.coordinates
+        guard other.count == coordinates.count else { return false }
+        return zip(coordinates, other).allSatisfy { $0.matches($1) }
+    }
+
+    /// Take a replacement's instructions without disturbing the drive.
+    ///
+    /// Same line, so there is nothing to re-join and no progress worth
+    /// discarding — but the *words* can still be better. On 2026-08-25 a
+    /// reroute returned the identical 1821-point polyline with its opening
+    /// maneuver corrected from "Turn right onto Lake Avenue" to "Head north on
+    /// Lake Avenue", because the car's heading had changed since the request
+    /// before it. Dropping the reply outright would have thrown that away;
+    /// adopting it restarted the drive to collect it. This does neither.
+    ///
+    /// Recorded in the trace like any other route, with the reason marked, so a
+    /// drive that was handed the same line six times still says so.
+    private func merge(_ feature: RouteFeature, reason: String,
+                       from origin: CLLocationCoordinate2D? = nil,
+                       heading: CLLocationDirection? = nil,
+                       pref: Double? = nil) {
+        trace?.route(feature, reason: reason + "-same",
+                     from: origin, heading: heading, pref: pref)
+        route = feature
+        steps = feature.properties.steps
+        // Against `coordinates`, which by definition are the feature's own.
+        stepRemaining = Self.remainingAtEachStep(of: steps, along: coordinates)
+        // Re-derived rather than kept. The line is unchanged, so the driver's
+        // place on it is too — but the step *list* has just been replaced, and
+        // an index into the old one names a different maneuver in the new one
+        // (or none at all, if it is shorter). Walked from zero against the
+        // distance already measured, which lands on the same ground the old
+        // index did whenever the two lists agree.
+        currentStep = lastProgress.map { firstStepAhead(of: $0.remaining, from: 0) } ?? 0
+        // Still armed, and this is the half of `adopt` that must survive.
+        // Nothing about the line has changed, but the reason the driver was
+        // sent a replacement at all is that they had left it — so off-route
+        // recovery has to keep holding until they are back on it, exactly as it
+        // would for a line they had never seen. Without this a driver drifting
+        // beside their route asks again on every cooldown, which is the storm
+        // this whole path exists to stop. When they are in fact already on the
+        // line — the pinned-match case — `settleAwaitingJoin` clears it on the
+        // very next fix, so it costs nothing there.
+        awaitingJoin = true
+        awaitingJoinSince = now()
+    }
+
     /// Follow a different route from here on.
-    private func adopt(_ feature: RouteFeature, reason: String) {
+    private func adopt(_ feature: RouteFeature, reason: String,
+                       from origin: CLLocationCoordinate2D? = nil,
+                       heading: CLLocationDirection? = nil,
+                       pref: Double? = nil) {
         // Recorded before the state changes under it. `travelled` restarts at
         // zero on the new line, so a trace that didn't know the line had been
         // replaced would read the reset as the car teleporting backwards.
-        trace?.route(feature, reason: reason)
+        trace?.route(feature, reason: reason,
+                     from: origin, heading: heading, pref: pref)
         route = feature
         steps = feature.properties.steps
         coordinates = feature.coordinates

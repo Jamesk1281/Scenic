@@ -68,8 +68,18 @@ final class RerouteTests: XCTestCase {
             longitude: -71.0 + 300 / 82_600))
     }
 
+    /// A replacement line, beginning where a replacement really begins.
+    ///
+    /// `start` is deliberately non-zero: a route built at 0 would be the
+    /// *byte-identical* line these tests already follow, which `reroute` now
+    /// recognises and merges instead of adopting. That is the right behaviour
+    /// for a server handing back the road you are on, and the wrong path for
+    /// every test below, which is about adopting a genuinely new one. Collinear
+    /// with the original, so a driver on one is on the other and the geometry
+    /// these tests reason about is unchanged.
     private func namedRoute(_ instruction: String) -> RouteResponse {
         let feature = Fixture.straightRoute(
+            start: 150,
             steps: [(0, instruction), (5000, "Arrive at your destination")])
         return Fixture.response(fastest: feature, scenic: feature)
     }

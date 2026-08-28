@@ -472,6 +472,7 @@ final class DriveTraceTests: XCTestCase {
         // teleporting 3 km backwards — and would price the whole drive wrong.
         let trace = self.trace()
         let replacement = Fixture.straightRoute(
+            start: 150,
             steps: [(0, "Head north on Detour Road"), (5000, "Arrive at your destination")])
         let model = NavigationModel(route: Fixture.straightRoute(),
                                     destination: Fixture.north(5000),
@@ -513,7 +514,10 @@ final class DriveTraceTests: XCTestCase {
                                     destination: Fixture.north(5000),
                                     pref: 0.8, weights: [:], trace: trace)
         model.fetchRoute = { _, _, _, _, _ in
-            let feature = Fixture.straightRoute()
+            // A distinct line: the fastest route is a different road from the
+            // scenic one, and an identical one would be merged rather than
+            // adopted, which is a different test.
+            let feature = Fixture.straightRoute(start: 150)
             return Fixture.response(fastest: feature, scenic: feature)
         }
         model.update(Fixture.fixAt(500))
@@ -523,4 +527,50 @@ final class DriveTraceTests: XCTestCase {
         let routes = records(of: trace).filter { $0["t"] as? String == "route" }
         XCTAssertEqual(routes.map { $0["reason"] as? String }, ["start", "fastest"])
     }
+
+    func test_a_reroute_records_the_request_it_answered() async {
+        // "The server handed back the route the driver was already on" is a
+        // fault or a correct answer depending entirely on where the request was
+        // made from and which way it said the car was pointing — and the
+        // 2026-08-26 audit could not settle that for a single one of the 51
+        // reroutes on disk, because the trace kept every reply and no request.
+        let trace = self.trace()
+        let replacement = Fixture.straightRoute(
+            start: 150,
+            steps: [(0, "Head north on Detour Road"), (5000, "Arrive at your destination")])
+        let model = NavigationModel(route: Fixture.straightRoute(),
+                                    destination: Fixture.north(5000),
+                                    pref: 0.8, weights: [:], trace: trace)
+        model.fetchRoute = { _, _, _, _, _ in
+            Fixture.response(fastest: replacement, scenic: replacement)
+        }
+
+        model.update(Fixture.fixAt(500))                       // on the line
+        let strayed = Fixture.movingFix(                       // 300 m east of it,
+            CLLocationCoordinate2D(latitude: Fixture.north(800).latitude,
+                                   longitude: -71.0 + 300 / 82_600),
+            course: 15, speed: 20)                             // and fast enough to
+        model.update(strayed)                                  // have a real heading
+
+        let deadline = Date().addingTimeInterval(2)
+        while Date() < deadline {
+            if records(of: trace).filter({ $0["t"] as? String == "route" }).count == 2 { break }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        model.finish()
+
+        let routes = records(of: trace).filter { $0["t"] as? String == "route" }
+        XCTAssertEqual(routes.count, 2, "the replacement should be recorded")
+        XCTAssertEqual(routes.last?["req_lat"] as? Double, strayed.coordinate.latitude)
+        XCTAssertEqual(routes.last?["req_lon"] as? Double, strayed.coordinate.longitude)
+        XCTAssertEqual(routes.last?["req_heading"] as? Double, 15,
+                       "without the heading, a route that opens the wrong way is unreadable")
+        XCTAssertEqual(routes.last?["req_pref"] as? Double, 0.8,
+                       "pref moves to 0 on a fastest switch, so each request carries its own")
+
+        // The opening route answers no request; the `drive` record has its origin.
+        XCTAssertNil(routes.first?["req_lat"])
+        XCTAssertNil(routes.first?["req_heading"])
+    }
+
 }
