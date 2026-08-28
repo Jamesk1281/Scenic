@@ -5,6 +5,21 @@ extension Double {
     /// distance the user sees is in miles. Converted at the view layer so the
     /// numbers coming off the API stay in their original units.
     var milesFromKm: Double { self * 0.621371 }
+
+    /// Kilometers as the whole number of miles the UI puts on screen.
+    ///
+    /// Rounded rather than truncated, and — the point of it existing — shared
+    /// with the filter that decides whether a scenery row appears at all. Those
+    /// two used to measure different things: `sceneryBreakdown` dropped a
+    /// feature at `km > 0` while the label truncated `Int(km.milesFromKm)`, so
+    /// anything under 1.6 km survived the filter and then rendered as "0 mi".
+    /// Seen on a real loop as a "farmland  0 mi" row beside a dot-sized bar,
+    /// claiming a feature the drive did not have. One rule, read from both
+    /// sides, cannot drift like that again.
+    ///
+    /// Truncation was also just wrong on its own terms: a 24.9 km route reads
+    /// 15 mi truncated and 16 mi at 15.5.
+    var wholeMilesFromKm: Int { Int(milesFromKm.rounded()) }
 }
 
 extension CLLocation {

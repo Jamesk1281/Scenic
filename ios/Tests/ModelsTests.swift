@@ -91,14 +91,44 @@ final class ModelsTests: XCTestCase {
         let shown = Set(props.sceneryBreakdown.map(\.label))
         let sent = Set(props.scenery_km.keys)
         XCTAssertEqual(Set(serverLabels), sent, "fixture drifted from the server")
-        // everything the server sent with a non-zero length is shown
-        XCTAssertEqual(shown, Set(sent.filter { props.scenery_km[$0]! > 0 }))
+        // Everything the server sent that has a mile in it is shown. The test is
+        // the label's own rule and not `> 0`, which is what let a "0 mi" row
+        // through — see `test_a_feature_under_a_mile_is_dropped`.
+        XCTAssertEqual(shown,
+                       Set(sent.filter { props.scenery_km[$0]!.wholeMilesFromKm > 0 }))
     }
 
     func test_features_the_route_never_touches_are_dropped() throws {
         let breakdown = try decoded().scenic.properties.sceneryBreakdown
         XCTAssertFalse(breakdown.contains { $0.label == "coast" },
                        "a 0 km feature is noise, not information")
+    }
+
+    func test_a_feature_under_a_mile_is_dropped() {
+        // The bug this rule exists for. 0.3 km of farmland cleared a `km > 0`
+        // filter and then truncated to "farmland  0 mi" beside a dot-sized bar,
+        // telling the driver about a feature the drive doesn't have. Seen on a
+        // real 24 mi loop out of Needham.
+        let json = """
+        {"type":"Feature","geometry":{"coordinates":[[0,0],[1,1]]},
+         "properties":{"km":40,"minutes":60,"mean_score":5,
+           "scenery_km":{"farmland":0.3,"water":21.0},"steps":[]}}
+        """.data(using: .utf8)!
+        let props = try! JSONDecoder().decode(RouteFeature.self, from: json).properties
+        XCTAssertEqual(props.sceneryBreakdown.map(\.label), ["water"])
+    }
+
+    func test_a_feature_that_rounds_up_to_a_mile_is_kept() {
+        // The other side of the same line: 1.2 km is 0.75 mi, which rounds to 1
+        // and is worth a row. Truncating would have shown it as "0 mi".
+        let json = """
+        {"type":"Feature","geometry":{"coordinates":[[0,0],[1,1]]},
+         "properties":{"km":40,"minutes":60,"mean_score":5,
+           "scenery_km":{"hills":1.2},"steps":[]}}
+        """.data(using: .utf8)!
+        let props = try! JSONDecoder().decode(RouteFeature.self, from: json).properties
+        XCTAssertEqual(props.sceneryBreakdown.map(\.label), ["hills"])
+        XCTAssertEqual(props.sceneryBreakdown[0].km.wholeMilesFromKm, 1)
     }
 
     func test_breakdown_keeps_its_display_order() throws {

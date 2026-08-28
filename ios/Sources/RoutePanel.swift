@@ -32,24 +32,24 @@ struct RoutePanel: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     header
-                    searchField("Start address or place", $model.startQuery, dot: .green, role: .start)
-                    searchField("Destination address or place", $model.endQuery, dot: .red, role: .end)
-                    prefSlider
-
-                    if model.isLoading {
-                        ProgressView().frame(maxWidth: .infinity)
-                    }
-                    if let error = model.errorText {
-                        Text(error).font(.caption).foregroundStyle(.red)
-                    }
-                    if let response = model.response {
-                        RouteResults(response: response)
+                    modePicker
+                    switch model.mode {
+                    case .directions:
+                        directionsContent
+                    case .loops:
+                        LoopPanel(model: model.loops) { response in
+                            model.startLoopDrive(response)
+                        }
                     }
                 }
                 .padding(20)
             }
 
-            if let response = model.response {
+            // Only the directions tab pins its primary action outside the
+            // scroll view. The loop tab's two buttons sit with the numbers they
+            // act on, and its panel is short enough that they are never below
+            // the fold.
+            if model.mode == .directions, let response = model.response {
                 startButton(for: response)
                     .padding(.horizontal, 20)
                     .padding(.bottom, 10)
@@ -80,6 +80,45 @@ struct RoutePanel: View {
         .sheet(isPresented: $showingTune) {
             TuneView(model: model)
         }
+        // The tune screen edits one set of beauty weights for the whole app, so
+        // the loop tab has to be routing under them too. Pushed rather than
+        // read through a back-reference, which would be a retain cycle.
+        .onChange(of: model.weights) { _, weights in model.loops.weights = weights }
+        .task { model.loops.weights = model.weights }
+        // A loop arriving should open the sheet enough to show it, the same way
+        // a route does.
+        .onChange(of: model.loops.response == nil) { _, noLoop in
+            if !noLoop, detent == .planningCompact { detent = .medium }
+        }
+    }
+
+    /// Directions or a loop. Two words, because the difference is whether the
+    /// user has a destination in mind.
+    private var modePicker: some View {
+        Picker("What to plan", selection: $model.mode) {
+            ForEach(PlanningMode.allCases) { mode in
+                Text(mode.rawValue).tag(mode)
+            }
+        }
+        .pickerStyle(.segmented)
+    }
+
+    /// The original planning content: two addresses, the preference slider and
+    /// the route comparison.
+    @ViewBuilder private var directionsContent: some View {
+        searchField("Start address or place", $model.startQuery, dot: .green, role: .start)
+        searchField("Destination address or place", $model.endQuery, dot: .red, role: .end)
+        prefSlider
+
+        if model.isLoading {
+            ProgressView().frame(maxWidth: .infinity)
+        }
+        if let error = model.errorText {
+            Text(error).font(.caption).foregroundStyle(.red)
+        }
+        if let response = model.response {
+            RouteResults(response: response)
+        }
     }
 
     /// Title + a short hint, with the Tune button and (once something is set)
@@ -88,10 +127,7 @@ struct RoutePanel: View {
         HStack(spacing: 14) {
             VStack(alignment: .leading, spacing: 1) {
                 Text("Scenic").font(.title2.bold())
-                Text(model.response == nil
-                     ? "Search for a start and destination"
-                     : "Drag the slider to trade time for scenery")
-                    .font(.caption).foregroundStyle(.secondary)
+                Text(hint).font(.caption).foregroundStyle(.secondary)
             }
             Spacer()
             // Tune is always available — the accent tint signals an active
@@ -100,7 +136,9 @@ struct RoutePanel: View {
                 Label("Tune", systemImage: "slider.horizontal.3").font(.subheadline)
             }
             .tint(model.isTuned ? .scenic : .secondary)
-            if model.start != nil || model.end != nil {
+            // Swap and clear belong to a trip with two ends. A loop has one,
+            // and its own clear button lives in its start field.
+            if model.mode == .directions, model.start != nil || model.end != nil {
                 Button { model.swapEnds() } label: { Image(systemName: "arrow.up.arrow.down") }
                     .disabled(model.start == nil || model.end == nil)
                 Button {
@@ -108,6 +146,19 @@ struct RoutePanel: View {
                     detent = .planningCompact
                 } label: { Image(systemName: "xmark.circle") }
             }
+        }
+    }
+
+    private var hint: String {
+        switch model.mode {
+        case .directions:
+            return model.response == nil
+                ? "Search for a start and destination"
+                : "Drag the slider to trade time for scenery"
+        case .loops:
+            return model.loops.response == nil
+                ? "A scenic loop back to where you started"
+                : "Shuffle for a different direction"
         }
     }
 

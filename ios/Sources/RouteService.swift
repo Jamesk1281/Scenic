@@ -1,9 +1,9 @@
 import CoreLocation
 import Foundation
 
-/// The network layer: turns a (start, end, preference) into routes by calling
-/// the backend. It's an `enum` with only static members because it holds no
-/// state — it's just a namespace for the `route(...)` function.
+/// The network layer: turns a (start, end, preference) into routes, or a (start,
+/// distance) into a scenic loop, by calling the backend. It's an `enum` with only
+/// static members because it holds no state — it's just a namespace.
 enum RouteService {
 
     /// Where the backend lives, in order of precedence:
@@ -93,9 +93,15 @@ enum RouteService {
     ///     from, so a replacement doesn't open by turning the car around. Leave
     ///     it nil when planning from a standstill — the server then falls back
     ///     to the nearer end, which is the right answer for a parked car.
+    ///   - via: a waypoint the route must pass through. One caller: a driver who
+    ///     has come off a *loop*. A loop's destination is its own origin, so a
+    ///     plain replacement is the short way home and throws the rest of the
+    ///     drive away; pinning through the loop's far point makes it a rejoin.
+    ///     Note the server ignores `heading` when `via` is set.
     static func route(
         from start: CLLocationCoordinate2D,
         to end: CLLocationCoordinate2D,
+        via: CLLocationCoordinate2D? = nil,
         pref: Double,
         weights: [String: Double] = [:],
         heading: CLLocationDirection? = nil
@@ -110,6 +116,8 @@ enum RouteService {
             URLQueryItem(name: "w_\(type)", value: String(format: "%.2f", weight))
         } + (heading.map {
             [URLQueryItem(name: "heading", value: headingParameter($0))]
+        } ?? []) + (via.map {
+            [URLQueryItem(name: "via", value: "\($0.latitude),\($0.longitude)")]
         } ?? [])
 
         let (data, response) = try await session.data(from: components.url!)
@@ -124,6 +132,62 @@ enum RouteService {
 
         do {
             return try JSONDecoder().decode(RouteResponse.self, from: data)
+        } catch {
+            throw ServiceError.badResponse
+        }
+    }
+
+    /// Request one scenic loop from a start point, of about `km`.
+    ///
+    /// The loop feature's whole job is choosing where to go, so there is no
+    /// destination to pass — only a length. See docs/loop-routes-design.md.
+    ///
+    /// - Parameters:
+    ///   - km: the distance slider, in kilometers. The server clamps it to its
+    ///     own range and reports what it settled on in `meta.target_km`, so the
+    ///     UI should read the target back rather than assume it was honoured.
+    ///   - sector: which compass direction to head off in — what the regenerate
+    ///     button varies. Pass nil for the first loop and the server picks the
+    ///     best-scoring direction. Only the sectors named in a previous
+    ///     response's `alternatives` are worth asking for; the others have no
+    ///     loop in them and would be rejected.
+    ///   - pref: overall scenery strength. Defaults to full, and the loop tab
+    ///     should leave it there: with the length already pinned by the slider,
+    ///     pref has little left to trade, its middle range is measurably not
+    ///     monotone for loops, and it is the one parameter that throws away the
+    ///     server's cached work — 1,125 ms against 650 ms.
+    ///   - weights: per-beauty-type weights, exactly as `route(...)` takes them,
+    ///     so the tune screen shapes a loop the same way it shapes a route.
+    ///
+    /// Expect roughly 1.2 s for the first loop from a given start and 0.65 s for
+    /// each one after that, because the server caches two full-graph searches per
+    /// start. Changing only the distance keeps that cache; changing `pref` does
+    /// not.
+    static func loop(
+        from start: CLLocationCoordinate2D,
+        km: Double,
+        sector: String? = nil,
+        pref: Double = 1.0,
+        weights: [String: Double] = [:]
+    ) async throws -> LoopResponse {
+        var components = URLComponents(string: "\(baseURL)/api/loop")!
+        components.queryItems = [
+            URLQueryItem(name: "from", value: "\(start.latitude),\(start.longitude)"),
+            URLQueryItem(name: "km", value: String(format: "%.1f", km)),
+            URLQueryItem(name: "pref", value: String(format: "%.2f", pref)),
+        ] + weights.map { type, weight in
+            URLQueryItem(name: "w_\(type)", value: String(format: "%.2f", weight))
+        } + (sector.map { [URLQueryItem(name: "sector", value: $0)] } ?? [])
+
+        let (data, response) = try await session.data(from: components.url!)
+
+        if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+            let body = try? JSONDecoder().decode([String: String].self, from: data)
+            throw ServiceError.server(body?["error"] ?? "HTTP \(http.statusCode)")
+        }
+
+        do {
+            return try JSONDecoder().decode(LoopResponse.self, from: data)
         } catch {
             throw ServiceError.badResponse
         }

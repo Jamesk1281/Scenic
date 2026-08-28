@@ -29,7 +29,7 @@ struct RouteResults: View {
         VStack(alignment: .leading, spacing: 3) {
             Text(title.uppercased()).font(.caption2).foregroundStyle(.secondary)
             Text("\(Int(p.minutes.rounded())) min").font(.title3.bold())
-            Text("\(Int(p.km.milesFromKm)) mi · \(p.mean_score, format: .number.precision(.fractionLength(1)))/10")
+            Text("\(p.km.wholeMilesFromKm) mi · \(p.mean_score, format: .number.precision(.fractionLength(1)))/10")
                 .font(.caption2).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -69,12 +69,12 @@ struct SceneryBar: View {
                     .frame(maxHeight: .infinity, alignment: .center)
             }
             .frame(height: 10)
-            Text("\(Int(km.milesFromKm)) mi").font(.caption2)
+            Text("\(km.wholeMilesFromKm) mi").font(.caption2)
                 .frame(width: valueWidth, alignment: .trailing)
         }
         // Read as one fact. Left to itself VoiceOver announces the label, then a
         // decorative bar, then the number, as three separate stops.
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(label), \(Int(km.milesFromKm)) miles")
+        .accessibilityLabel("\(label), \(km.wholeMilesFromKm) miles")
     }
 }

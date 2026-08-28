@@ -11,6 +11,16 @@ typealias RouteFetcher = (CLLocationCoordinate2D, CLLocationCoordinate2D,
                           Double, [String: Double],
                           CLLocationDirection?) async throws -> RouteResponse
 
+/// How a replacement route is fetched for a drive that is a *loop* and has not
+/// yet reached its far point: `(from, via, to, pref, weights, heading)`.
+///
+/// Separate from `RouteFetcher` rather than growing it a sixth parameter, so
+/// that every existing reroute test and stub is untouched by an argument only
+/// loops use.
+typealias LoopResumeFetcher = (CLLocationCoordinate2D, CLLocationCoordinate2D,
+                               CLLocationCoordinate2D, Double, [String: Double],
+                               CLLocationDirection?) async throws -> RouteResponse
+
 /// Drives one live navigation session: which route we're following, which step
 /// is current, how far to the next maneuver, and how much trip is left. It's
 /// fed a stream of locations from `LocationManager` (via `update`) and reshapes
@@ -165,6 +175,56 @@ final class NavigationModel {
     var fetchRoute: RouteFetcher = { from, to, pref, weights, heading in
         try await RouteService.route(from: from, to: to, pref: pref,
                                      weights: weights, heading: heading)
+    }
+
+    /// How a loop's replacement routes are fetched, pinned through its far point.
+    var fetchLoopResume: LoopResumeFetcher = { from, via, to, pref, weights, heading in
+        try await RouteService.route(from: from, to: to, via: via, pref: pref,
+                                     weights: weights, heading: heading)
+    }
+
+    // MARK: - Loops
+
+    /// The far point of a loop and how far along the current line it sits, or
+    /// nil for an ordinary point-to-point drive.
+    ///
+    /// `along` is re-measured whenever the line is replaced (see `adopt`),
+    /// because `travelled` restarts on a new line and comparing the two across
+    /// a reroute would otherwise decide the far point was behind the driver the
+    /// moment they rejoined.
+    private var loopTurnaround: (coordinate: CLLocationCoordinate2D, along: Double)?
+
+    /// Latches once the driver has driven past the loop's far point, after which
+    /// a loop reroutes like any other trip — home.
+    private(set) var passedTurnaround = false
+
+    /// The waypoint a replacement route has to be pinned through, or nil when
+    /// there is none to pin through.
+    ///
+    /// This is the whole reason `LoopResumeFetcher` exists. A loop ends where it
+    /// began, so `destination` is the driver's own driveway: asking for a route
+    /// to it hands back the short way home and silently deletes the rest of the
+    /// drive. Measured against a real 24 mi Needham loop, a missed turn two miles
+    /// in would have replaced 22 remaining miles with about three. Until the far
+    /// point is behind them, a loop's reroute goes *via* it.
+    private var loopWaypoint: CLLocationCoordinate2D? {
+        guard let loop = loopTurnaround, !passedTurnaround else { return nil }
+        return loop.coordinate
+    }
+
+    /// Notice the far point going by.
+    ///
+    /// Two tests, because either alone has a hole. Position along the line is
+    /// the exact one, but a replacement route can rejoin beyond the far point,
+    /// which leaves the driver past it having never been near it. Proximity
+    /// catches that; on its own it would miss a driver whose fixes are coarse
+    /// enough to skip the radius entirely.
+    private func trackTurnaround(_ location: CLLocation, _ here: RouteProgress) {
+        guard let loop = loopTurnaround, !passedTurnaround else { return }
+        if here.travelled >= loop.along
+            || location.distance(to: loop.coordinate) < Self.arrivalMeters {
+            passedTurnaround = true
+        }
     }
 
     /// When the last reroute was attempted. Off-route checks run on every GPS
@@ -387,8 +447,12 @@ final class NavigationModel {
     /// of them; only `RouteModel.startNavigation` — a real drive — passes one in.
     private let trace: DriveTrace?
 
+    /// - Parameter turnaround: the far point of a loop, when this drive is one.
+    ///   Nil for an ordinary trip, which is every other caller — so an existing
+    ///   `NavigationModel` behaves exactly as it did.
     init(route: RouteFeature, destination: CLLocationCoordinate2D,
-         pref: Double, weights: [String: Double], trace: DriveTrace? = nil) {
+         pref: Double, weights: [String: Double], trace: DriveTrace? = nil,
+         turnaround: CLLocationCoordinate2D? = nil) {
         self.route = route
         self.steps = route.properties.steps
         self.coordinates = route.coordinates
@@ -398,6 +462,11 @@ final class NavigationModel {
         self.remainingMeters = route.properties.km * 1000
         self.remainingMinutes = route.properties.minutes
         self.trace = trace
+        if let turnaround {
+            self.loopTurnaround = (turnaround,
+                                   progress(of: turnaround,
+                                            along: route.coordinates).travelled)
+        }
         // Last, and after every stored property: it reads `steps` and
         // `coordinates` back off `self`.
         self.stepRemaining = Self.remainingAtEachStep(of: steps, along: coordinates)
@@ -648,6 +717,7 @@ final class NavigationModel {
         // passes its own destination, and its own final coordinate, long before
         // the drive is over.
         trackStopping(location)
+        trackTurnaround(location, here)
         let drivenTheLine = hasJoinedRoute && here.remaining < Self.arrivalMeters
         let stoppedAtThePin = hasJoinedRoute
             && location.distance(to: destination) < Self.arrivalMeters
@@ -977,8 +1047,17 @@ final class NavigationModel {
         // what was asked is what makes the answer checkable afterwards.
         let askedHeading = Self.usableHeading(origin)
         let askedPref = pref
-        guard let response = try? await fetchRoute(origin.coordinate, destination,
-                                                   askedPref, weights, askedHeading)
+        // A loop that has not reached its far point must be pinned through it;
+        // anything else asks for the short way home. See `loopWaypoint`.
+        let reply: RouteResponse?
+        if let via = loopWaypoint {
+            reply = try? await fetchLoopResume(origin.coordinate, via, destination,
+                                               askedPref, weights, askedHeading)
+        } else {
+            reply = try? await fetchRoute(origin.coordinate, destination,
+                                          askedPref, weights, askedHeading)
+        }
+        guard let response = reply
         else {
             guard generation == rerouteGeneration else { return .superseded }
             // A request that never lands is the plainest case of asking not
@@ -1100,6 +1179,13 @@ final class NavigationModel {
         route = feature
         steps = feature.properties.steps
         coordinates = feature.coordinates
+        // Where the loop's far point sits has to be re-measured on the new line,
+        // since `travelled` restarts below and the two are compared.
+        if let loop = loopTurnaround {
+            loopTurnaround = (loop.coordinate,
+                              progress(of: loop.coordinate,
+                                       along: coordinates).travelled)
+        }
         stepRemaining = Self.remainingAtEachStep(of: steps, along: coordinates)
         currentStep = 0
         travelled = 0

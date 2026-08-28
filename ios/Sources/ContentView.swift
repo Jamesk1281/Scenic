@@ -38,20 +38,37 @@ struct ContentView: View {
 
     private var planningView: some View {
         Map(position: $camera) {
-            // Fastest route (gray, dashed) sits under the scenic route (green).
-            if let fastest = model.response?.fastest {
-                MapPolyline(coordinates: fastest.coordinates)
-                    .stroke(.gray, style: StrokeStyle(lineWidth: 4, dash: [6, 5]))
-            }
-            if let scenic = model.response?.scenic {
-                MapPolyline(coordinates: scenic.coordinates)
-                    .stroke(Color.scenic, lineWidth: 6)
-            }
-            if let start = model.start {
-                Marker("Start", coordinate: start).tint(.green)
-            }
-            if let end = model.end {
-                Marker("End", coordinate: end).tint(.red)
+            switch model.mode {
+            case .directions:
+                // Fastest route (gray, dashed) sits under the scenic route (green).
+                if let fastest = model.response?.fastest {
+                    MapPolyline(coordinates: fastest.coordinates)
+                        .stroke(.gray, style: StrokeStyle(lineWidth: 4, dash: [6, 5]))
+                }
+                if let scenic = model.response?.scenic {
+                    MapPolyline(coordinates: scenic.coordinates)
+                        .stroke(Color.scenic, lineWidth: 6)
+                }
+                if let start = model.start {
+                    Marker("Start", coordinate: start).tint(.green)
+                }
+                if let end = model.end {
+                    Marker("End", coordinate: end).tint(.red)
+                }
+            case .loops:
+                // One closed line, and the far point marked — which is the only
+                // thing a loop has to say about its shape that the line doesn't.
+                if let loop = model.loops.response?.loop {
+                    MapPolyline(coordinates: loop.coordinates)
+                        .stroke(Color.scenic, lineWidth: 6)
+                }
+                if let start = model.loops.start {
+                    Marker("Start and finish", coordinate: start).tint(.green)
+                }
+                if let turnaround = model.loops.response?.meta.turnaroundCoordinate {
+                    Marker("Turnaround", systemImage: "arrow.uturn.left",
+                           coordinate: turnaround).tint(.orange)
+                }
             }
             UserAnnotation()
         }
@@ -65,11 +82,22 @@ struct ContentView: View {
         }
         // Refit the camera whenever a new scenic route arrives.
         .onChange(of: model.response?.scenic.coordinates.count) { frameRoute() }
+        // ...and whenever a new loop does, or the user switches which one they
+        // are looking at. Without the mode change the map keeps the other tab's
+        // framing, which on a loop of a different size reads as a broken draw.
+        .onChange(of: model.loops.response?.loop.coordinates.count) { frameLine() }
+        .onChange(of: model.mode) { frameLine() }
         // Setting a start with no destination yet (typically "My Location")
         // shows nothing on screen otherwise — and seeing the pin land on the
         // right street is how you catch a bad fix before pulling away.
         .onChange(of: model.start?.latitude) {
             guard model.response == nil, let start = model.start else { return }
+            withAnimation { camera = .region(.around(start, meters: 1_200)) }
+        }
+        // The same for a loop start, which is the only pin that tab has, so
+        // seeing it land on the right street matters just as much.
+        .onChange(of: model.loops.start?.latitude) {
+            guard model.loops.response == nil, let start = model.loops.start else { return }
             withAnimation { camera = .region(.around(start, meters: 1_200)) }
         }
         .sheet(isPresented: .constant(true)) {
@@ -85,7 +113,19 @@ struct ContentView: View {
     /// doesn't cover it. The sheet is draggable, so this only needs to be
     /// roughly right — no per-device tuning.
     private func frameRoute() {
-        guard let coords = model.response?.scenic.coordinates, !coords.isEmpty else { return }
+        frame(model.response?.scenic.coordinates)
+    }
+
+    /// Fit whichever line the current mode is showing.
+    private func frameLine() {
+        switch model.mode {
+        case .directions: frame(model.response?.scenic.coordinates)
+        case .loops:      frame(model.loops.response?.loop.coordinates)
+        }
+    }
+
+    private func frame(_ coordinates: [CLLocationCoordinate2D]?) {
+        guard let coords = coordinates, !coords.isEmpty else { return }
 
         // Smallest rectangle (in MapKit's projected plane) containing the route.
         var rect = MKMapRect.null
