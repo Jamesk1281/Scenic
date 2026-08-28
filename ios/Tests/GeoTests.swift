@@ -70,6 +70,18 @@ final class GeoTests: XCTestCase {
         XCTAssertEqual(160.9344.milesFromKm, 100, accuracy: 0.01)
     }
 
+    func test_whole_miles_round_rather_than_truncate() {
+        // 24.9 km is 15.47 mi. Truncated that reads 15, which is the rounding
+        // the scenery breakdown used to do on its way to showing "0 mi".
+        XCTAssertEqual(24.9.wholeMilesFromKm, 15)
+        XCTAssertEqual(25.5.wholeMilesFromKm, 16)
+        // Anything below half a mile has no whole mile in it, which is what the
+        // breakdown filter keys off.
+        XCTAssertEqual(0.3.wholeMilesFromKm, 0)
+        XCTAssertEqual(0.8.wholeMilesFromKm, 0)
+        XCTAssertEqual(0.9.wholeMilesFromKm, 1)
+    }
+
     func test_coordinates_compare_by_value() {
         XCTAssertTrue(Fixture.origin.matches(Fixture.origin))
         XCTAssertFalse(Fixture.origin.matches(Fixture.north(1)))

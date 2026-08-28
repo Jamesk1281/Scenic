@@ -151,18 +151,18 @@ struct LoopPanel: View {
     private var distanceSlider: some View {
         VStack(spacing: 2) {
             HStack {
-                Text("\(Int(LoopModel.minKm.milesFromKm)) mi").font(.caption2)
+                Text("\(LoopModel.minKm.wholeMilesFromKm) mi").font(.caption2)
                 Slider(value: $model.targetKm,
                        in: LoopModel.minKm...LoopModel.maxKm) { editing in
                     if !editing, model.start != nil {
                         Task { await model.generate() }
                     }
                 }
-                Text("\(Int(LoopModel.maxKm.milesFromKm)) mi").font(.caption2)
+                Text("\(LoopModel.maxKm.wholeMilesFromKm) mi").font(.caption2)
             }
-            Text("about \(Int(model.targetKm.milesFromKm)) miles")
+            Text("about \(model.targetKm.wholeMilesFromKm) miles")
                 .font(.caption2).foregroundStyle(.secondary)
-                .accessibilityLabel("Loop distance, about \(Int(model.targetKm.milesFromKm)) miles")
+                .accessibilityLabel("Loop distance, about \(model.targetKm.wholeMilesFromKm) miles")
         }
     }
 
@@ -173,13 +173,13 @@ struct LoopPanel: View {
         return VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 10) {
                 card("Loop", value: "\(Int(meta.minutes.rounded())) min",
-                     detail: "\(Int(meta.km.milesFromKm)) mi · heading \(meta.sector)",
+                     detail: "\(meta.km.wholeMilesFromKm) mi · heading \(meta.sector)",
                      tint: .scenic)
                 // The legible number. The mean score separates a scenic loop
                 // from a fast one of the same length by about a point; this
                 // separates them five-fold, so it leads.
                 card("Beautiful road",
-                     value: "\(Int(meta.beautiful_km.milesFromKm)) mi",
+                     value: "\(meta.beautiful_km.wholeMilesFromKm) mi",
                      detail: "scoring \(Int(meta.beautiful_score))+ of 10",
                      tint: .gray)
             }
@@ -224,7 +224,7 @@ struct LoopPanel: View {
 
     /// "A 25 mi loop scoring 5.8/10, back where you started."
     private func summary(_ meta: LoopMeta) -> AttributedString {
-        let markdown = "**\(Int(meta.km.milesFromKm)) mi** scoring "
+        let markdown = "**\(meta.km.wholeMilesFromKm) mi** scoring "
             + "**\(String(format: "%.1f", meta.mean_score))/10**, "
             + "back where you started"
         return (try? AttributedString(markdown: markdown)) ?? AttributedString(markdown)

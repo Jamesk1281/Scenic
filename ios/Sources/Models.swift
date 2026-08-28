@@ -142,14 +142,18 @@ struct RouteProps: Decodable {
     /// Turn-by-turn maneuvers from start to destination, for live navigation.
     let steps: [RouteStep]
 
-    /// The scenery features in display order, dropping any the route never
-    /// actually touches (0 km), so the breakdown only shows what's relevant.
+    /// The scenery features in display order, dropping any the route barely
+    /// touches, so the breakdown only shows what's relevant.
+    ///
+    /// The test is "would show as at least 1 mi", not "is more than 0 km", and
+    /// the difference is a row on screen: see `Double.wholeMilesFromKm`, which
+    /// `SceneryBar`'s label reads too so the two cannot disagree again.
     /// Keep this list in sync with SCENERY_BREAKDOWN in pipeline/router.py —
     /// a label missing here silently vanishes from the app's breakdown.
     var sceneryBreakdown: [(label: String, km: Double)] {
         let displayOrder = ["forest/park", "water", "coast", "hills", "farmland", "town"]
         return displayOrder.compactMap { key in
-            guard let km = scenery_km[key], km > 0 else { return nil }
+            guard let km = scenery_km[key], km.wholeMilesFromKm > 0 else { return nil }
             return (key, km)
         }
     }
