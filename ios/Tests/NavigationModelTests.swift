@@ -122,6 +122,107 @@ final class NavigationModelTests: XCTestCase {
         XCTAssertEqual(model.remainingMinutes, 6, accuracy: 0.1)   // 10 min * 3/5
     }
 
+    // MARK: - The road under the car
+
+    /// The off-by-one this readout lives or dies by.
+    ///
+    /// `step.name` is the road a maneuver goes *onto* and `currentStep` is the
+    /// maneuver being *approached*, so the road under the car is one index
+    /// back. Get it wrong and the screen names the road the driver is about to
+    /// join as though they were already on it — which is precisely the
+    /// confusion the readout exists to remove.
+    ///
+    /// Each assertion pairs the road with the instruction showing beside it, so
+    /// the two can be read together the way the driver reads them: you are on
+    /// Test Road, you are about to turn onto Elm Street.
+    func test_the_road_shown_is_the_one_being_driven_not_the_one_ahead() {
+        let model = nav(Fixture.routeWithRoadNames())
+
+        model.update(Fixture.fixAt(100))
+        XCTAssertEqual(model.currentInstruction, "Turn right onto Elm Street")
+        XCTAssertEqual(model.currentRoad, .named("Test Road"))
+
+        model.update(Fixture.fixAt(1500))
+        XCTAssertEqual(model.currentInstruction, "Turn left onto Oak Street")
+        XCTAssertEqual(model.currentRoad, .named("Elm Street"))
+
+        model.update(Fixture.fixAt(3500))
+        XCTAssertEqual(model.currentInstruction, "Arrive at your destination")
+        XCTAssertEqual(model.currentRoad, .named("Oak Street"))
+    }
+
+    /// Before any maneuver has been driven through there is no previous step,
+    /// and the road under the car is the departing step's own name — the road
+    /// the route sets off along.
+    func test_the_first_road_is_named_before_any_maneuver_is_passed() {
+        let model = nav(Fixture.routeWithRoadNames())
+        model.update(Fixture.fixAt(0))
+        XCTAssertEqual(model.currentStep, 0, "no maneuver driven through yet")
+        XCTAssertEqual(model.currentRoad, .named("Test Road"))
+    }
+
+    /// Arrival carries an empty name (`router.py:1659`), and it is the last
+    /// step, so the final leg has to keep naming the road it runs along rather
+    /// than blanking as the driver comes up to the pin.
+    func test_the_empty_name_on_arrival_never_reaches_the_screen() {
+        let model = nav(Fixture.routeWithRoadNames())
+        model.update(Fixture.fixAt(4900))
+        XCTAssertEqual(model.currentRoad, .named("Oak Street"))
+    }
+
+    /// Nothing before the driver reaches the line — not "off route".
+    ///
+    /// The trip was planned from somewhere they are not, which is not a wrong
+    /// turn; the banner already says "head to the start of your route" and this
+    /// would only say it again, less well.
+    func test_nothing_is_shown_before_the_driver_joins_the_route() {
+        let model = nav(Fixture.routeWithRoadNames())
+        model.update(Fixture.fix(CLLocationCoordinate2D(
+            latitude: 42.0, longitude: -71.0 + 2000 / 82_600)))
+        XCTAssertFalse(model.hasJoinedRoute)
+        XCTAssertEqual(model.currentRoad, .unknown)
+    }
+
+    /// The one unacceptable outcome: a stale name once the driver has left the
+    /// line.
+    ///
+    /// Off-route does not freeze `currentStep` — the car still projects onto the
+    /// abandoned line and `advanceSteps` keeps walking the index off that
+    /// projection — so without this gate the screen would go on naming roads,
+    /// plausibly and wrongly, all the way down the wrong turning.
+    func test_no_road_is_named_once_the_driver_has_left_the_line() {
+        let model = nav(Fixture.routeWithRoadNames())
+        model.update(Fixture.fixAt(500))
+        XCTAssertEqual(model.currentRoad, .named("Test Road"))
+
+        // 300 m east of the line: well past the 60 m that counts as off route.
+        model.update(Fixture.fix(CLLocationCoordinate2D(
+            latitude: Fixture.north(800).latitude,
+            longitude: -71.0 + 300 / 82_600)))
+        XCTAssertEqual(model.currentRoad, .offRoute)
+    }
+
+    /// A road the route never named shows nothing rather than the last road
+    /// that had a name. 4% of legs carry neither a `name` nor a `ref` — service
+    /// roads, tracks, most ramps — and a blank is the honest answer for them.
+    func test_a_route_without_names_shows_nothing_rather_than_guessing() {
+        // `straightRoute` omits the key entirely, which is also what a response
+        // cached before the field existed looks like.
+        let model = nav(Fixture.straightRoute())
+        model.update(Fixture.fixAt(1500))
+        XCTAssertEqual(model.currentStep, 2, "the drive itself is unaffected")
+        XCTAssertEqual(model.currentRoad, .unknown)
+    }
+
+    /// Nothing once the drive is over. The screen has switched to "Arrived" and
+    /// the car is parked; the road it is parked on is no longer the question.
+    func test_nothing_is_shown_after_arriving() {
+        let model = nav(Fixture.routeWithRoadNames())
+        model.update(Fixture.fixAt(4990))
+        XCTAssertTrue(model.arrived)
+        XCTAssertEqual(model.currentRoad, .unknown)
+    }
+
     // MARK: - Arrival
 
     func test_reaching_the_end_of_the_line_arrives() {

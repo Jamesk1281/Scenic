@@ -180,6 +180,7 @@ struct NavView: View {
             sceneryVerdict
 
             VStack(spacing: 6) {
+                currentRoadLabel
                 controlRow
                 // Under the controls, not in the banner: the banner is where
                 // the next maneuver goes, and no diagnostic outranks the turn
@@ -194,6 +195,44 @@ struct NavView: View {
             .padding(.horizontal)
             .padding(.vertical, 10)
             .background(.ultraThinMaterial)
+        }
+    }
+
+    /// The road under the car, across the top of the trip bar.
+    ///
+    /// Here rather than in the banner because the banner is for the maneuver
+    /// ahead, and this is the opposite question — where am I *now*. It reads as
+    /// a caption to the trip stats below it, which is about the attention it
+    /// deserves: useful continuously, urgent never.
+    ///
+    /// The off-route wording is the point of the whole readout as much as the
+    /// name is. `RouteModel.nameCurrentLocation` already spends a
+    /// reverse-geocode on labelling the start, on the grounds that "My
+    /// Location" alone gives the driver no way to notice we have put them on
+    /// the wrong road; the same is true at 60 km/h, and this is the line that
+    /// says so. A stale street name would be worse than nothing, so
+    /// `NavigationModel.currentRoad` returns one only while the step list still
+    /// describes where the car is.
+    @ViewBuilder private var currentRoadLabel: some View {
+        switch nav.currentRoad {
+        case .named(let road):
+            // One line, truncated rather than wrapped: a long road name must
+            // not reflow the controls underneath it mid-drive.
+            Text(road)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(maxWidth: .infinity)
+                .accessibilityLabel("On \(road)")
+        case .offRoute:
+            Text("Off route")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.orange)
+                .frame(maxWidth: .infinity)
+                .accessibilityLabel("Off your route")
+        case .unknown:
+            EmptyView()
         }
     }
 

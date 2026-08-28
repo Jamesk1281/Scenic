@@ -115,6 +115,37 @@ class TestSteps:
                          ["Main Street", "Main Street"])
         assert any("stay on Main Street" in s["instruction"] for s in r.steps())
 
+    def test_name_is_the_road_the_step_goes_onto(self):
+        """`name` names the road a maneuver puts you *onto*, not the one it
+        starts from.
+
+        Pinned from this side because the app now derives the road under the car
+        from it, one step back: `NavigationModel.currentRoad` reads
+        `steps[currentStep - 1].name`, `currentStep` being the maneuver still
+        being approached. Flip the sense of this field and the nav screen names
+        the road the driver is about to join as though they were already on it,
+        with nothing on either side to fail.
+        """
+        steps = self._result([[(0, 0), (0, 0.01)], [(0, 0.01), (0.01, 0.01)]],
+                             ["Main Street", "Elm Street"]).steps()
+        assert [s["name"] for s in steps] == ["Main Street", "Elm Street", ""]
+        # The load-bearing half: the turn is announced *from* Main Street and
+        # carries Elm Street, so a driver reading the previous step's name is on
+        # the road they are actually on.
+        assert steps[1]["instruction"] == "Turn right onto Elm Street"
+        assert steps[1]["name"] != "Main Street"
+
+    def test_every_step_carries_a_name_key(self):
+        """Absent is not the same as empty, and the app treats them the same way
+        only because it has to guess. A step with no `name` at all is a response
+        cached before the field existed; a live one always has the key."""
+        steps = self._result([[(0, 0), (0, 0.01)], [(0, 0.01), (0.01, 0.01)]],
+                             ["Main Street", ""]).steps()
+        assert all("name" in s for s in steps)
+        # An unnamed way falls through `name or ref or ""` to empty, which is
+        # what the client shows nothing for.
+        assert steps[-1]["name"] == ""
+
 
 # Degrees per metre at the equator, where the fixtures live — near enough for
 # geometry whose only job is to have the right angles in it.
