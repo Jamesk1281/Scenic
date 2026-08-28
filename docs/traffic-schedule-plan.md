@@ -1,12 +1,55 @@
 # Plan: time-of-day travel times
 
-**Scope: one coarse peak/off-peak factor on motorway, applied at load. Roughly a
-day's work — gated on one lookup that, on the evidence so far, will probably say
-not to bother (§3.1).**
+## Verdict: do not build this — not on borrowed data
+
+**Three reasons, in order of weight.**
+
+**1. It would be the only unmeasured constant in `router.py`.** Every number in
+that file is measured by this project, on these roads, and defended in its own
+comment: `SPEED_FACTOR` cites 52 km of trace and argues why one figure covers
+three classes; `CONTROL_SECONDS` is fitted over eight drives with leave-one-out
+bounds (10.0–13.8 s) and flags `giveway` as a judgement rather than a
+measurement; `BETA` and `PREF_CURVE` were swept together over ten routes.
+A peak factor taken from FHWA's area-wide Boston index would carry no
+measurement, no error bar, and — because that source publishes its numbers as
+images (§3) — no way to check it automatically, ever. That is a drop in the
+project's standard of evidence, not a small risk.
+
+**2. At the most likely value it is invisible.** The one indicative figure
+available is Boston TTI 1.26, a peak factor of 0.92. Applied to the worked
+example, that moves the displayed penalty from 43 minutes to 33–36 — a 7 to 13
+minute change on a number the user reads as "about forty minutes", during
+weekday peaks only. It only becomes material at TTI ≥ 1.5 (MassDOT's own
+"moderately congested" band, factor 0.77), which moves it to 18–30 minutes.
+
+**3. Nothing retrievable can tell us which of those is true.** The area-wide
+index understates the corridors a fastest route actually uses; the corridor-level
+document that would settle it is not on the web (§3).
+
+**What to do instead**
+
+* **Ship the disclaimer.** A line under the fastest ETA saying it does not
+  account for traffic. An hour's work, free, honest, and independent of
+  everything else here. It does not fix the delta, and that is fine — see below.
+* **If the delta bothers you, measure it.** Three deliberate weekday runs at
+  17:30 on one expressway corridor, recorded with the existing `DriveTrace` and
+  read with `analyze_trace.py`. That is the instrument that established 1.16 in
+  the first place; it measures motorway speed factors to a few percent; and
+  three runs handle the incident problem that ruined the Wachusett drive, since
+  a crash shows up as the outlier. **A measured peak factor would be better
+  evidence than anything in this survey, and cheaper than the emails.**
+* Then, and only then, §4–§6 is about a day's work. The design below is
+  finished and correct; it is waiting on a number worth putting in it.
+
+**What is not in doubt:** the scenic route's own ETA — the number a driver
+actually watches — sits at 5.7% error and is untouched by any of this, because
+scenic routes hold almost no motorway. Nothing here is a navigation defect.
+
+---
 
 An earlier draft of this file planned a 168-cell hour-of-week profile fitted
 from probe data, with agency data requests, an eight-week polling archive and a
-six-state New England survey. That was scoped to the wrong question. §7 records
+six-state New England survey. That was scoped to the wrong question. §8 records
 what it ruled out so nobody repeats the survey; everything else is deleted.
 
 ---
@@ -77,11 +120,18 @@ summary would have hidden, so the status column is the point of this section.
 **The previous draft recommended the CTPS dashboard. That was the stalest of the
 four**, and it was chosen from a page description rather than from the data.
 
-### 3.1 What to actually do
+### 3.1 If this is ever reopened, the gate is a drive — not a PDF
 
-**Read the Boston row of the Travel Time Index column in the latest UCR PDF, by
-eye.** `ops.fhwa.dot.gov/perf_measurement/ucr/` → newest quarter. It is a table
-in a picture; there is no way around looking at it, and it takes a minute.
+The verdict is that no source above is good enough to put a number in
+`router.py`. So the gate is **three deliberate weekday runs at 17:30 on one
+expressway corridor**, read with `analyze_trace.py`. That yields a measured
+factor with the same provenance as every other constant in the file, and three
+runs separate recurrence from an incident.
+
+Before spending an afternoon on that, spend one minute on a prior: **read the
+Boston row of the Travel Time Index column in the latest UCR PDF, by eye.**
+`ops.fhwa.dot.gov/perf_measurement/ucr/` → newest quarter. It is a table in a
+picture; there is no way around looking at it.
 
 Convert. MassDOT and FHWA both define the index against *observed free-flow*
 travel time, and this project measured motorway free-flow at 1.16 × the posted
@@ -91,7 +141,8 @@ limit, so:
 motorway peak factor  =  1.16 / TravelTimeIndex
 ```
 
-Then decide against §1's table: **≥ 0.9 → ship nothing. < 0.9 → build §4.**
+Then decide against §1's table: **≥ 0.9 → ship nothing, do not bother driving.
+< 0.9 → the drives are worth an afternoon, and §4 follows from what they say.**
 
 **Expect the answer to be "ship nothing."** The one indicative figure found —
 Boston TTI 1.26, from a search snippet of the Q3 2024 UCR — gives 1.16/1.26 =
@@ -151,7 +202,7 @@ SPEED_PROFILE_DATA_YEAR = 20XX      # §3.2 staleness tripwire reads this
   commute phenomenon.
 * **Motorway only.** Surface classes are within 7% (§2); giving them bands
   spends that evidence on free parameters nothing measured.
-* **`trunk` only if CTPS's tables separate it** and the number differs from
+* **`trunk` only if the source separates it** and the number differs from
   motorway. Otherwise leave it on `SURFACE_SPEED_FACTOR` as today.
 * **Ramp the band edges over ~30 minutes** rather than stepping. A cliff at
   19:00 makes leaving at 18:55 arrive later than leaving at 19:05, which is
@@ -216,6 +267,11 @@ than the part that is unreliable.
 * **`CONTROL_SECONDS` must not move.** Re-run `tools/fit_junction_cost.py`; the
   pooled 11.5 s / 8.1 s should hold. If it drifts, congestion is leaking into
   the junction term.
+* **The data ages, and nothing will tell you.** The UCR publishes numbers as
+  images, so no automated check can compare the constant against the current
+  quarter. The staleness tripwire (§3.2) checks the recorded data year instead
+  and fails at three years, which is the most an automated test can do here.
+
 * **The peak band is not validated by anything in the trace set, and cannot be.**
   There is no clean recorded peak-hour motorway drive — the one that looked like
   it was a crash. Say so in the constant's comment.
@@ -225,11 +281,6 @@ or three deliberate drives on the same expressway corridor at 17:30 on
 weekdays.** That is the only thing that would turn the peak band from a borrowed
 number into a measured one, it costs an afternoon, and it should be scheduled at
 the same time the constant lands rather than left implicit.
-
-* **The data ages, and nothing will tell you.** The UCR publishes numbers as
-  images, so no automated check can compare the constant against the current
-  quarter. The staleness tripwire (§3.2) checks the recorded data year instead
-  and fails at three years, which is the most an automated test can do here.
 
 Tripwires, in `tests/test_calibration.py`'s style: every band within `[0.4, 1.4]`
 and never below the 0.6 floor;
