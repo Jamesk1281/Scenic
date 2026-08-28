@@ -252,8 +252,10 @@ final class RouteModel {
         guard let origin = loops.start else { return }
         let trace = DriveTrace(origin: origin, destination: origin,
                                pref: 1.0, weights: weights)
-        let session = NavigationModel(route: response.loop, destination: origin,
-                                      pref: 1.0, weights: weights, trace: trace)
+        let session = NavigationModel(
+            route: response.loop, destination: origin,
+            pref: 1.0, weights: weights, trace: trace,
+            turnaround: response.meta.turnaroundCoordinate)
         locationManager.onFix = { [weak session] location in session?.update(location) }
         nav = session
     }

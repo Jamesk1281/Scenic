@@ -1,7 +1,8 @@
 """Scenic routing API (backend for the iOS app).
 
 Loads the routing graph once at startup and serves:
-  GET  /api/route?from=LAT,LON&to=LAT,LON&pref=0.5[&heading=DEG][&w_<type>=...]
+  GET  /api/route?from=LAT,LON&to=LAT,LON&pref=0.5[&heading=DEG][&via=LAT,LON]
+                 [&w_<type>=...]
                               -> {"fastest": <GeoJSON Feature>,
                                   "scenic":  <GeoJSON Feature>}
   GET  /api/loop?from=LAT,LON&km=40[&pref=1.0][&sector=NE][&w_<type>=...]
@@ -13,6 +14,12 @@ Loads the routing graph once at startup and serves:
 weighted with w_<type> (e.g. w_coast=2&w_town=3&w_farm=0); each defaults to 1.0
 (neutral) and is clamped to a sane range. The tunable types are listed by
 BEAUTY_TYPES in router.py.
+
+`via` pins a route through a waypoint. It exists for one caller: a driver who
+has gone off a *loop* and needs to rejoin it. A loop ends where it began, so
+asking for a route to its destination hands back the short way home and deletes
+the rest of the drive — the waypoint is the loop's far point, and pinning through
+it is what makes the replacement a continuation rather than an abandonment.
 
 `/api/loop` takes one endpoint and a length instead of two endpoints, and
 returns a closed scenic drive of about that length. `sector` (a compass octant)
@@ -158,9 +165,11 @@ def api_route():
         pref = float(request.args.get("pref", 0.5))
         heading = _parse_heading(request.args)
         weights = _parse_weights(request.args)
+        raw_via = request.args.get("via")
+        via = _parse_ll(raw_via) if raw_via else None
     except (KeyError, ValueError):
         return jsonify(error="need from=lat,lon&to=lat,lon[&pref=0..1]"
-                             "[&heading=0..360][&w_<type>=...]"), 400
+                             "[&heading=0..360][&via=lat,lon][&w_<type>=...]"), 400
 
     # Heading applies to the start only: it says which way the driver is
     # travelling, and a destination isn't travelling anywhere.
@@ -188,6 +197,29 @@ def api_route():
     # the opening instruction is a compass heading or a turn — a route that has
     # to begin by sending a moving car back the way it came must say so.
     pref = max(0.0, min(1.0, pref))
+    if via is not None:
+        # A waypoint is a point on a road, so it snaps like a start and not like
+        # a destination — there is no building to find the car park entrance for.
+        w, w_off = ROUTER.snap(*via)
+        if w_off > SNAP_MAX_M:
+            return jsonify(error="that waypoint is outside the covered road "
+                                 "network (currently Massachusetts)"), 400
+        # Under the loop planner's lock: `resume` reads the same cached cost
+        # models that `/api/loop` fills, and they are plain dicts.
+        with LOOP_LOCK:
+            fastest = LOOPER.resume(s, w, t, 0.0, weights)
+            scenic = (fastest if pref == 0.0
+                      else LOOPER.resume(s, w, t, pref, weights))
+        # `heading` is deliberately dropped here. It picks which end of the
+        # driver's road to leave from, and this caller is mid-drive, so it
+        # matters — but honouring it would mean starting the search from a
+        # different node than the one `snap` returned above, which `resume` has
+        # no way to express. A rejoin that opens by turning the car around is
+        # worth fixing; see docs/loop-routes-design.md.
+        if fastest is None or scenic is None:
+            return jsonify(error="no route found through that waypoint"), 404
+        return jsonify(fastest=fastest.geojson(), scenic=scenic.geojson())
+
     fastest = ROUTER.route(s, t, 0.0, weights, heading=heading)
     scenic = (fastest if pref == 0.0
               else ROUTER.route(s, t, pref, weights, heading=heading))
@@ -311,7 +343,8 @@ def index():
         nodes=len(ROUTER.nodes),
         routing_slots=ROUTER.n,
         endpoints={
-            "/api/route": "from=LAT,LON&to=LAT,LON[&pref=0..1][&w_<type>=0..4]",
+            "/api/route": ("from=LAT,LON&to=LAT,LON[&pref=0..1][&via=LAT,LON]"
+                           "[&w_<type>=0..4]"),
             "/api/loop": (f"from=LAT,LON&km={MIN_TARGET_KM:.0f}..{MAX_TARGET_KM:.0f}"
                           "[&sector=NE][&pref=0..1][&w_<type>=0..4]"),
             "/api/health": "liveness check",

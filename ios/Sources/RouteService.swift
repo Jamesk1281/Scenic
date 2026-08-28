@@ -93,9 +93,15 @@ enum RouteService {
     ///     from, so a replacement doesn't open by turning the car around. Leave
     ///     it nil when planning from a standstill — the server then falls back
     ///     to the nearer end, which is the right answer for a parked car.
+    ///   - via: a waypoint the route must pass through. One caller: a driver who
+    ///     has come off a *loop*. A loop's destination is its own origin, so a
+    ///     plain replacement is the short way home and throws the rest of the
+    ///     drive away; pinning through the loop's far point makes it a rejoin.
+    ///     Note the server ignores `heading` when `via` is set.
     static func route(
         from start: CLLocationCoordinate2D,
         to end: CLLocationCoordinate2D,
+        via: CLLocationCoordinate2D? = nil,
         pref: Double,
         weights: [String: Double] = [:],
         heading: CLLocationDirection? = nil
@@ -110,6 +116,8 @@ enum RouteService {
             URLQueryItem(name: "w_\(type)", value: String(format: "%.2f", weight))
         } + (heading.map {
             [URLQueryItem(name: "heading", value: headingParameter($0))]
+        } ?? []) + (via.map {
+            [URLQueryItem(name: "via", value: "\($0.latitude),\($0.longitude)")]
         } ?? [])
 
         let (data, response) = try await session.data(from: components.url!)

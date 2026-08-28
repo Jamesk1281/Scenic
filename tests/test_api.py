@@ -316,3 +316,59 @@ def test_an_identical_loop_request_is_served_from_memory(client):
     elapsed = time.perf_counter() - started
     assert again == first
     assert elapsed < 0.05, f"a repeat request took {elapsed*1000:.0f} ms"
+
+
+# --- via, for rejoining a loop ----------------------------------------------
+# One caller: a driver who has left a loop. A loop's destination is its origin,
+# so a plain reroute would hand back the short way home; `via` pins the
+# replacement through the loop's far point so the rest of the drive survives.
+
+def test_via_pins_the_route_through_the_waypoint(client):
+    plain = client.get(f"/api/route?from={NEEDHAM}&to={NEEDHAM.replace('42.2809', '42.2909')}"
+                       "&pref=1.0").get_json()
+    detour = client.get(f"/api/route?from={NEEDHAM}"
+                        f"&to={NEEDHAM.replace('42.2809', '42.2909')}"
+                        f"&via={WORCESTER}&pref=1.0").get_json()
+    # Worcester is 60 km west; a route through it cannot be the direct one.
+    assert detour["scenic"]["properties"]["km"] > \
+        plain["scenic"]["properties"]["km"] * 5
+    # ...and it really passes through, rather than merely being longer.
+    line = detour["scenic"]["geometry"]["coordinates"]
+    worcester_lat, worcester_lon = (float(x) for x in WORCESTER.split(","))
+    closest = min(abs(lon - worcester_lon) + abs(lat - worcester_lat)
+                  for lon, lat in line)
+    assert closest < 0.02, "the route never gets near the waypoint"
+
+
+def test_a_via_route_is_one_continuous_set_of_directions(client):
+    """Spliced from two searches, but the driver must not be able to tell: one
+    depart at the front, one arrive at the back, and nothing in between."""
+    body = client.get(f"/api/route?from={NEEDHAM}&to={BOSTON}"
+                      f"&via={WORCESTER}&pref=1.0").get_json()
+    steps = body["scenic"]["properties"]["steps"]
+    assert steps[0]["type"] == "depart"
+    assert steps[-1]["type"] == "arrive"
+    assert [s["type"] for s in steps].count("depart") == 1
+    assert [s["type"] for s in steps].count("arrive") == 1
+    # Distances and the drawn line have to agree across the join too.
+    assert body["scenic"]["properties"]["km"] > 0
+    assert body["scenic"]["properties"]["minutes"] > 0
+
+
+def test_a_via_route_still_returns_both_options(client):
+    body = client.get(f"/api/route?from={NEEDHAM}&to={BOSTON}"
+                      f"&via={WORCESTER}&pref=1.0").get_json()
+    assert set(body) == {"fastest", "scenic"}
+    assert body["scenic"]["properties"]["mean_score"] > \
+        body["fastest"]["properties"]["mean_score"]
+
+
+def test_a_waypoint_outside_the_region_is_rejected(client):
+    response = client.get(f"/api/route?from={NEEDHAM}&to={BOSTON}&via=45.5,-73.6")
+    assert response.status_code == 400
+    assert "waypoint" in response.get_json()["error"]
+
+
+def test_an_unparseable_waypoint_is_a_bad_request(client):
+    assert client.get(f"/api/route?from={NEEDHAM}&to={BOSTON}"
+                      "&via=nonsense").status_code == 400

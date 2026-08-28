@@ -363,6 +363,68 @@ class LoopPlanner:
         best.target_km = target_km
         return best
 
+    def resume(self, src: int, via: int, dst: int, pref: float = 1.0,
+               weights: dict = None):
+        """A drive from `src` to `dst` that still goes round by way of `via`.
+
+        What a loop's reroute needs, and it cannot be had from `route()`. A loop
+        ends where it began, so a driver who misses a turn and asks for a route
+        to their destination is asking for a route to the place they are trying
+        to get away from — and gets the short way home, which deletes the rest of
+        the drive. Measured on a 24 mi Needham loop, a missed turn two miles in
+        would have replaced 22 remaining miles with about three.
+
+        So until the driver has passed the far point of the loop, the replacement
+        has to be pinned through it. Two Dijkstras rather than one, and no
+        candidate filtering — the geography was already chosen when the loop was
+        generated, and this is only the way back onto it.
+
+        Returns a single `RouteResult`, so the caller cannot tell it was built
+        from two searches and the turn-by-turn reads continuously across the
+        waypoint.
+        """
+        cost = self._cost(round(float(pref), 4), _weights_key(weights))
+        out = self._leg(cost, int(src), int(via))
+        if out is None:
+            return None
+        # Threaded through whichever index of `via` the first leg actually
+        # arrived at, not through the junction's original index. If `via` is a
+        # junction split for turn restrictions, arriving on a restricted
+        # approach lands on a copy whose exits are the legal ones — so
+        # continuing from that copy is what keeps the second leg from taking a
+        # turn the first leg's arrival forbids.
+        for arrival in out:
+            back = self._leg(cost, arrival[-1], int(dst))
+            if back is not None:
+                # The cheapest way home from here; unlike the waypoint, the end
+                # of the route has nothing to continue into, so any arrival at
+                # it will do and the first is the best.
+                path = arrival + back[0][1:]
+                return self.router._collect(path, cost.w_slot, cost.scores)
+        return None
+
+    def _leg(self, cost: _CostModel, src: int, dst: int):
+        """Node paths from `src` to `dst`, cheapest arrival first.
+
+        A list rather than one path, because a split junction can be arrived at
+        several ways and only the caller knows whether the cheapest one can be
+        continued from.
+        """
+        r = self.router
+        g = csr_matrix((cost.pair_w, (r.u_tail, r.u_head)), shape=(r.n, r.n))
+        dist, pred = dijkstra(g, directed=True, indices=src,
+                              return_predecessors=True)
+        ends = self._arrival_indices(dst)
+        ends = ends[np.isfinite(dist[ends])]
+        if not len(ends):
+            return None
+        paths = []
+        for end in ends[np.argsort(dist[ends])]:
+            path = _tree_path(pred, src, int(end))
+            if path is not None:
+                paths.append(path)
+        return paths or None
+
     def nearest_length(self, start: int, target_km: float, pref: float = 1.0,
                        weights: dict = None):
         """The closest loop length that has any candidate at all, or None.
