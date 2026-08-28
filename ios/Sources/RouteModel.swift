@@ -8,6 +8,19 @@ enum Endpoint {
     case end
 }
 
+/// Which kind of drive the user is planning.
+///
+/// A segmented control in the planning sheet rather than a real tab bar: the two
+/// modes share the map, the sheet and the one navigation session, and differ only
+/// in what goes in the sheet. A `TabView` would have meant two permanent bottom
+/// sheets fighting each other for no gain.
+enum PlanningMode: String, CaseIterable, Identifiable {
+    case directions = "Directions"
+    case loops = "Loop"
+
+    var id: String { rawValue }
+}
+
 /// The single source of truth for the screen: the chosen start/end points, the
 /// scenery preference, and the latest routes from the backend.
 ///
@@ -20,7 +33,15 @@ final class RouteModel {
     /// Owns the user's location. Planning uses it for "My Location" and to bias
     /// search; live navigation streams from the same instance, so permission is
     /// asked for once and the drive starts with a fix already in hand.
-    let locationManager = LocationManager()
+    let locationManager: LocationManager
+
+    /// The loop tab's state. Owned here, and handed this instance's
+    /// `LocationManager`, so the app asks for location permission once and only
+    /// one stream of fixes exists however the drive was planned.
+    let loops: LoopModel
+
+    /// Which half of the planning sheet is showing.
+    var mode: PlanningMode = .directions
 
     var start: CLLocationCoordinate2D?
     var end: CLLocationCoordinate2D?
@@ -71,6 +92,12 @@ final class RouteModel {
     var nav: NavigationModel?
 
     init() {
+        // Built here rather than inline so `loops` can be handed the same
+        // manager without reading a half-initialised `self`.
+        let manager = LocationManager()
+        locationManager = manager
+        loops = LoopModel(locationManager: manager)
+
         // Demo mode (launch with SCENIC_DEMO set) preloads a route via the real
         // search path, so a screenshot doubles as an end-to-end check.
         if ProcessInfo.processInfo.environment["SCENIC_DEMO"] != nil {
@@ -213,6 +240,24 @@ final class RouteModel {
         nav = session
     }
 
+    /// Begin live navigation around a generated loop.
+    ///
+    /// The destination is the origin, which is what a loop means. That is also
+    /// the one thing `NavigationModel` has never been given before, and it
+    /// matters in two places: arrival, which must not latch while the driver is
+    /// still sitting at the start with the whole loop ahead of them; and
+    /// rerouting, which must rejoin the loop rather than take the short way to a
+    /// destination it is already standing on.
+    func startLoopDrive(_ response: LoopResponse) {
+        guard let origin = loops.start else { return }
+        let trace = DriveTrace(origin: origin, destination: origin,
+                               pref: 1.0, weights: weights)
+        let session = NavigationModel(route: response.loop, destination: origin,
+                                      pref: 1.0, weights: weights, trace: trace)
+        locationManager.onFix = { [weak session] location in session?.update(location) }
+        nav = session
+    }
+
     /// Leave navigation and return to route planning.
     func endNavigation() {
         // Flush the trace before dropping the session. Nothing else here needs
@@ -237,6 +282,13 @@ final class RouteModel {
         start = nil
         startQuery = ""
         response = nil
+        // Same reasoning for the loop tab: `startLoopDrive` leaves from
+        // `loops.start` without consulting the current fix, so a finished loop
+        // left armed could be tapped again and replay a drive from wherever it
+        // began, hours and kilometres ago.
+        loops.start = nil
+        loops.startQuery = ""
+        loops.response = nil
     }
 
     /// Ask the backend for the fastest and scenic routes at the current preference.
