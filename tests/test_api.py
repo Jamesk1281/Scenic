@@ -175,3 +175,144 @@ def test_an_unparseable_heading_is_a_bad_request(client):
     bug, and those should be loud."""
     r = client.get(f"/api/route?from={WORCESTER}&to={BOSTON}&heading=abc")
     assert r.status_code == 400
+
+
+# --- /api/loop ---------------------------------------------------------------
+# One endpoint and a length instead of two endpoints. The loop-specific numbers
+# live in `meta`, deliberately, so `RouteFeature` on the phone decodes a loop and
+# a route with the same type — see ios/Sources/Models.swift.
+
+NEEDHAM = "42.2809,-71.2378"
+PETERSHAM = "42.4879,-72.1889"
+
+
+def test_loop_returns_a_closed_route_and_its_metadata(client):
+    body = client.get(f"/api/loop?from={NEEDHAM}&km=40").get_json()
+    assert set(body) == {"loop", "meta", "alternatives", "note"}
+
+    feature = body["loop"]
+    assert feature["geometry"]["type"] == "LineString"
+    # The same properties a point-to-point route carries, so one client type
+    # decodes both.
+    props = feature["properties"]
+    assert {"km", "minutes", "mean_score", "scenery_km", "steps"} <= set(props)
+    assert props["steps"][0]["type"] == "depart"
+    assert props["steps"][-1]["type"] == "arrive"
+
+    # ...and it comes back to where it started.
+    coords = feature["geometry"]["coordinates"]
+    assert abs(coords[0][0] - coords[-1][0]) < 0.001
+    assert abs(coords[0][1] - coords[-1][1]) < 0.001
+
+    meta = body["meta"]
+    assert {"target_km", "km", "minutes", "mean_score", "beautiful_km",
+            "beautiful_score", "repeated_km", "turnaround", "sector"} == set(meta)
+    assert meta["target_km"] == 40.0
+    assert abs(meta["km"] - 40.0) / 40.0 < 0.12
+    assert 0 <= meta["beautiful_km"] <= meta["km"]
+    assert meta["repeated_km"] / meta["km"] < 0.10
+    assert len(meta["turnaround"]) == 2
+    assert body["note"] is None
+
+
+def test_loop_numbers_are_json_and_not_numpy(client):
+    """A numpy float64 in the response is a 500, and it is the kind of 500 that
+    only shows up once a real number lands in a field a test never looked at."""
+    import json
+    body = client.get(f"/api/loop?from={NEEDHAM}&km=20").get_json()
+    json.dumps(body)   # raises TypeError on anything numpy
+    for key, value in body["meta"].items():
+        if key not in ("sector", "turnaround"):
+            assert isinstance(value, (int, float)), f"{key} is {type(value)}"
+
+
+def test_loop_offers_the_directions_that_exist(client):
+    body = client.get(f"/api/loop?from={NEEDHAM}&km=40").get_json()
+    alternatives = body["alternatives"]
+    assert alternatives
+    assert all(set(a) == {"sector", "candidates"} for a in alternatives)
+    assert all(a["candidates"] > 0 for a in alternatives)
+    # Every direction offered has to actually deliver, or the app shows a button
+    # that fails.
+    for alternative in alternatives[:3]:
+        other = client.get(f"/api/loop?from={NEEDHAM}&km=40"
+                           f"&sector={alternative['sector']}").get_json()
+        assert other["meta"]["sector"] == alternative["sector"]
+
+
+def test_regenerate_gives_a_different_drive(client):
+    """The product claim behind the button. Two sectors must not be the same
+    roads with a different label."""
+    body = client.get(f"/api/loop?from={NEEDHAM}&km=40").get_json()
+    sectors = [a["sector"] for a in body["alternatives"]][:2]
+    lines = []
+    for sector in sectors:
+        loop = client.get(f"/api/loop?from={NEEDHAM}&km=40"
+                          f"&sector={sector}").get_json()
+        lines.append({tuple(c) for c in loop["loop"]["geometry"]["coordinates"]})
+    overlap = len(lines[0] & lines[1]) / len(lines[0] | lines[1])
+    assert overlap < 0.5
+
+
+def test_a_loop_too_short_for_the_geography_says_so(client):
+    """A rural start has no good 8 km loop. The answer is the best available
+    plus a note, not an error and not a silent bad loop."""
+    body = client.get(f"/api/loop?from={PETERSHAM}&km=8").get_json()
+    assert body["loop"] is not None
+    assert body["note"] and "doubles back" in body["note"]
+
+
+def test_the_distance_is_clamped_not_rejected(client):
+    for km, expected in ((1, 5.0), (9999, 200.0)):
+        meta = client.get(f"/api/loop?from={NEEDHAM}&km={km}").get_json()["meta"]
+        assert meta["target_km"] == expected
+
+
+@pytest.mark.parametrize("query", [
+    "km=40",                                    # no start
+    f"from={NEEDHAM}&km=abc",                   # unparseable distance
+    f"from={NEEDHAM}&km=40&pref=zzz",           # unparseable preference
+])
+def test_bad_loop_requests_are_rejected(client, query):
+    assert client.get(f"/api/loop?{query}").status_code == 400
+
+
+def test_an_unknown_sector_is_a_bad_request(client):
+    response = client.get(f"/api/loop?from={NEEDHAM}&km=40&sector=NNE")
+    assert response.status_code == 400
+    assert "sector" in response.get_json()["error"]
+
+
+def test_a_loop_start_outside_the_region_is_rejected(client):
+    response = client.get("/api/loop?from=45.5,-73.6&km=40")   # Montreal
+    assert response.status_code == 400
+    assert "outside" in response.get_json()["error"]
+
+
+def test_beauty_weights_reach_the_loop(client):
+    """The tune screen has to mean something here too, or a user who asked for
+    coast gets a loop chosen as though they hadn't."""
+    plain = client.get(f"/api/loop?from={NEEDHAM}&km=40").get_json()
+    coastal = client.get(f"/api/loop?from={NEEDHAM}&km=40"
+                         "&w_coast=4&w_farm=0").get_json()
+    assert (plain["loop"]["geometry"]["coordinates"]
+            != coastal["loop"]["geometry"]["coordinates"])
+
+
+def test_the_index_advertises_the_loop_endpoint(client):
+    body = client.get("/").get_json()
+    assert "/api/loop" in body["endpoints"]
+    assert "NE" in body["loop_sectors"]
+
+
+def test_an_identical_loop_request_is_served_from_memory(client):
+    """Shuffling forward and then back to the one you liked is the common
+    interaction, not an edge case, and it should not rebuild anything."""
+    import time
+    url = f"/api/loop?from={NEEDHAM}&km=35&sector=N"
+    first = client.get(url).get_json()
+    started = time.perf_counter()
+    again = client.get(url).get_json()
+    elapsed = time.perf_counter() - started
+    assert again == first
+    assert elapsed < 0.05, f"a repeat request took {elapsed*1000:.0f} ms"

@@ -4,12 +4,22 @@ Loads the routing graph once at startup and serves:
   GET  /api/route?from=LAT,LON&to=LAT,LON&pref=0.5[&heading=DEG][&w_<type>=...]
                               -> {"fastest": <GeoJSON Feature>,
                                   "scenic":  <GeoJSON Feature>}
+  GET  /api/loop?from=LAT,LON&km=40[&pref=1.0][&sector=NE][&w_<type>=...]
+                              -> {"loop": <GeoJSON Feature>, "meta": {...},
+                                  "alternatives": [...], "note": null|str}
   GET  /api/health
 
 `pref` (0..1) is the overall scenery strength. Each beauty type can also be
 weighted with w_<type> (e.g. w_coast=2&w_town=3&w_farm=0); each defaults to 1.0
 (neutral) and is clamped to a sane range. The tunable types are listed by
 BEAUTY_TYPES in router.py.
+
+`/api/loop` takes one endpoint and a length instead of two endpoints, and
+returns a closed scenic drive of about that length. `sector` (a compass octant)
+is what a regenerate button varies; the populated ones come back in
+`alternatives`, and asking is the point — a coastal start has fewer than eight.
+The loop-specific numbers live in `meta` rather than in the Feature's
+properties, so the same client type decodes a loop and a route.
 
 `heading` (0..360, 0=N, clockwise) is the driver's course over ground, and
 applies to `from` only — a destination has no travel direction. With it, the
@@ -22,6 +32,7 @@ Run:  python server/app.py [processed_dir]   (default: data/processed)
 
 import os
 import sys
+import threading
 from pathlib import Path
 
 from flask import Flask, jsonify, request
@@ -30,11 +41,20 @@ from flask_cors import CORS
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "pipeline"))
+from looper import (BEAUTIFUL_SCORE, MAX_TARGET_KM, MIN_TARGET_KM, SECTORS,
+                    LoopPlanner)  # noqa: E402
 from router import BEAUTY_TYPES, Router  # noqa: E402
 
 # How far a user may push a single beauty type. 0 ignores it; the upper bound
 # keeps one cranked slider from completely swamping the others.
 WEIGHT_MIN, WEIGHT_MAX = 0.0, 4.0
+
+# Above this share of a loop spent re-driving a road already driven, the answer
+# stops being a loop and the response says so instead of pretending. Normal is
+# under 0.06; the cases that trip this are short loops from rural starts, where
+# within a couple of km there is genuinely one road (a 8 km loop from Petersham
+# comes back at 0.35). See looper.Loop.repeated_fraction.
+LOOP_RETRACE_NOTE = 0.15
 
 # Reject a request whose endpoint lies farther than this from any road — it's
 # outside the covered region (currently Massachusetts), and the "nearest" road
@@ -59,6 +79,27 @@ ROUTER = Router(PROCESSED)
 # turn-restriction-expanded index count (~+1.2%), so reporting it here made
 # /api/health disagree with graph_nodes.parquet after a code-only deploy on
 # identical data — a false alarm in the one number a smoke check compares.
+# Loops are served from the same graph. The planner is cheap to construct — it
+# holds a reference and nothing else — but it caches two ~25 MB Dijkstra passes
+# per (start, pref, weights) so that pressing regenerate does not repeat them.
+#
+# One lock around every call, because waitress is threaded and those caches are
+# plain dicts. Serialising is also the right answer on merit: a loop is ~0.7 s of
+# CPU-bound numpy, so two at once would contend for the same cores and finish no
+# sooner, and the second request is almost always the same user pressing the
+# button again.
+LOOPER = LoopPlanner(ROUTER)
+LOOP_LOCK = threading.Lock()
+
+# Built loops, keyed by the whole request. The planner's caches make a *new* loop
+# cost ~0.65 s; this makes an *identical* request cost nothing, which is the
+# common interaction and not an edge case — shuffling forward through the
+# directions and then back to the one you liked is how this button gets used. A
+# cached entry can never go stale: the graph is loaded once for the life of the
+# process, so the same request has the same answer.
+LOOP_RESULTS = {}
+LOOP_RESULTS_MAX = 16
+
 print(f"ready: {len(ROUTER.nodes):,} nodes "
       f"({ROUTER.n:,} routing slots after turn-restriction splits)")
 
@@ -155,6 +196,99 @@ def api_route():
     return jsonify(fastest=fastest.geojson(), scenic=scenic.geojson())
 
 
+@app.get("/api/loop")
+def api_loop():
+    """A closed scenic drive of about `km` from one point, and the directions
+    that hold another one.
+
+    There is no destination to take, which is the whole feature: choosing where
+    to go is the term that decides whether a drive is good, and here the server
+    owns it. See docs/loop-routes-design.md.
+    """
+    try:
+        start_ll = _parse_ll(request.args["from"])
+        target_km = float(request.args.get("km", 40.0))
+        # Loops default to full scenery where routes default to 0.5. With the
+        # length already pinned by the slider, pref has little left to trade,
+        # and the middle of its travel is not monotone for loops — see the
+        # docstring in pipeline/looper.py. Clients should leave this alone.
+        pref = max(0.0, min(1.0, float(request.args.get("pref", 1.0))))
+        weights = _parse_weights(request.args)
+    except (KeyError, ValueError):
+        return jsonify(error="need from=lat,lon[&km=5..200][&pref=0..1]"
+                             "[&sector=N|NE|E|SE|S|SW|W|NW][&w_<type>=...]"), 400
+
+    sector = request.args.get("sector") or None
+    if sector is not None and sector not in SECTORS:
+        return jsonify(error=f"sector must be one of {', '.join(SECTORS)}"), 400
+
+    # A loop is planned from a standstill by definition — the driver is choosing
+    # a drive, not already on one — so no heading, and `snap` takes the nearer
+    # end of the road they are on. No `snap_destination` either: there is no
+    # destination pin to pull out of a car park.
+    start, offset = ROUTER.snap(*start_ll)
+    if offset > SNAP_MAX_M:
+        return jsonify(error="point is outside the covered road network "
+                             "(currently Massachusetts)"), 400
+
+    target_km = max(MIN_TARGET_KM, min(MAX_TARGET_KM, target_km))
+    key = (start, round(target_km, 1), round(pref, 4), sector,
+           tuple(sorted(weights.items())))
+    with LOOP_LOCK:
+        cached = LOOP_RESULTS.pop(key, None)
+        if cached is not None:
+            LOOP_RESULTS[key] = cached          # move to the warm end
+            return jsonify(cached)
+        loop = LOOPER.plan(start, target_km, pref, weights, sector=sector)
+        if loop is None:
+            # Only reachable when the geography has nothing at all in that
+            # direction at that length, since `plan` returns the best available
+            # rather than holding out for a good one.
+            nearest = LOOPER.nearest_length(start, target_km, pref, weights)
+            hint = (f" The nearest loop from here is about {nearest:.0f} km."
+                    if nearest else "")
+            return jsonify(error="no loop of that length from there." + hint), 404
+        available = LOOPER.sectors(start, loop.target_km, pref, weights)
+
+    note = None
+    if loop.repeated_fraction > LOOP_RETRACE_NOTE:
+        share = round(100 * loop.repeated_fraction)
+        note = (f"The roads here don't really make a loop this short — "
+                f"{share}% of this one doubles back. Try a longer distance.")
+
+    body = dict(
+        loop=loop.route.geojson(),
+        meta={
+            "target_km": round(float(loop.target_km), 1),
+            "km": round(float(loop.km), 1),
+            "minutes": round(float(loop.minutes), 1),
+            "mean_score": round(float(loop.mean_score), 2),
+            # The legible number: "16 of your 40 km". Measured to separate a
+            # scenic loop from a fast one of the same length 5-fold, where the
+            # means only manage 5.8 against 5.0.
+            "beautiful_km": round(float(loop.beautiful_km), 1),
+            "beautiful_score": BEAUTIFUL_SCORE,
+            # The loop-specific defect, always reported. It is what tells a
+            # driver their 40 km drive is really a 20 km drive twice.
+            "repeated_km": round(float(loop.repeated_km), 1),
+            "turnaround": [round(loop.turnaround[0], 6),
+                           round(loop.turnaround[1], 6)],
+            "sector": loop.sector,
+        },
+        # Which way else the user could be sent, so the app can offer real
+        # directions instead of a blind shuffle. Free — it falls out of the same
+        # cached passes.
+        alternatives=[{"sector": name, "candidates": count}
+                      for name, count in available.items()],
+        note=note,
+    )
+    with LOOP_LOCK:
+        LOOP_RESULTS[key] = body
+        while len(LOOP_RESULTS) > LOOP_RESULTS_MAX:
+            LOOP_RESULTS.pop(next(iter(LOOP_RESULTS)))
+    return jsonify(body)
+
+
 @app.get("/api/health")
 def health():
     return jsonify(status="ok", nodes=len(ROUTER.nodes),
@@ -178,8 +312,11 @@ def index():
         routing_slots=ROUTER.n,
         endpoints={
             "/api/route": "from=LAT,LON&to=LAT,LON[&pref=0..1][&w_<type>=0..4]",
+            "/api/loop": (f"from=LAT,LON&km={MIN_TARGET_KM:.0f}..{MAX_TARGET_KM:.0f}"
+                          "[&sector=NE][&pref=0..1][&w_<type>=0..4]"),
             "/api/health": "liveness check",
         },
+        loop_sectors=list(SECTORS),
         beauty_types=[name for name, *_ in BEAUTY_TYPES],
         region="Massachusetts",
     )
