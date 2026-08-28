@@ -689,7 +689,7 @@ comparison.
 | Spearman vs shipped | 0.957 | **0.9565** |
 | road-km moving > 1 point | 18.1% | **18.1%** |
 | Maine `c_forest ≥ 0.999` (guard `< 0.35`) | 0.068 | **0.068** |
-| full suite | 294 pass, 0 skipped | 293 pass, **1 fail** (below) |
+| full suite | 294 pass, 0 skipped | **294 pass, 0 skipped** (one test retargeted, below) |
 
 The two pinned-share rows are the only numeric differences, and they are not
 disagreements: 3.01% / 0.25% is exactly what the peer review measured for
@@ -732,17 +732,26 @@ which is what the review said it was.
    there is no guard on forest of the kind `test_town_is_not_most_of_the_state`
    puts on `c_urban`. Not retuned; flagged.
 
-3. **One test fails, and it is a wart that moved rather than a regression.**
-   `test_loops.py::test_the_middle_of_the_pref_slider_is_not_monotone` asserts
-   that a Needham 40 km loop at `pref` 0.25 comes back *worse* than at 0.0 — a
-   defect in `looper.py` deliberately pinned so that fixing it fails loudly.
-   Under `c_forest` it no longer does (4.76 → 5.41). The wart itself is **not**
-   fixed: sweeping `pref` over 0.0–1.0 at three starts shows the shipped build
-   is already non-monotone at Concord (5.50 → 5.09 at pref 0.5) and already
-   monotone at Worcester, and the `c_forest` build is still non-monotone at
-   Concord (5.86 → 4.99). The test samples one start; this change moved that one
-   start. Retargeting it means asserting a new coincidence, so it is left
-   failing for `looper.py`'s owner rather than rewritten here.
+3. **One test had to be retargeted: a wart that moved rather than a fix.**
+   `test_loops.py::test_the_middle_of_the_pref_slider_is_not_monotone` pinned a
+   `looper.py` defect — a Needham 40 km loop at `pref` 0.25 scoring *worse* than
+   at 0.0 — deliberately, so that fixing it would fail loudly. Under `c_forest`
+   Needham no longer dips (4.76 → 5.41 at 0.25). **The wart is not fixed.**
+   Sweeping `pref` over 0.0–1.0 from three starts: the shipped build is already
+   non-monotone at Concord (5.50 → 5.09 at pref 0.5) and already monotone at
+   Worcester, and the `c_forest` build still dips at Concord (5.86 → 4.99). The
+   test was sampling one start, and this change moved that one start. It now
+   pins Concord at pref 0.5, which dips on *both* scorings, and both the test
+   and `looper.py`'s sweep table say explicitly that which `pref` dips is a
+   property of the start rather than of the slider. `looper.py` is otherwise
+   untouched; it never reads a component column, only `score`.
+
+   The measured numbers in `test_a_scenic_loop_beats_a_fast_one_at_the_same_length`
+   were refreshed at the same time. Its inline comment (15.8 km against 3.2 km)
+   was current for the shipped build and is now 8.7 against 2.3; its docstring
+   header (6.12 against 4.98) was **already stale before this change** — the
+   shipped build measures 5.84 against 5.00 — and now reads 5.74 against 4.76.
+   Both assertions passed throughout.
 
 ### What is still open
 

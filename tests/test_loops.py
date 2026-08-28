@@ -24,6 +24,7 @@ from looper import (BEAUTIFUL_SCORE, CANDIDATE_TOLERANCE, MAX_TARGET_KM,
 # to span the geography: dense, suburban, and rural where the retrace problem is
 # at its worst.
 NEEDHAM = (42.2809, -71.2378)
+CONCORD = (42.4604, -71.3489)
 PETERSHAM = (42.4879, -72.1889)
 BOSTON = (42.3554, -71.0640)
 
@@ -282,8 +283,8 @@ class TestQualityNumbers:
         assert loop.beautiful_km == pytest.approx(expected)
 
     def test_a_scenic_loop_beats_a_fast_one_at_the_same_length(self, router, planner):
-        """Measured 6.12 against 4.98 at a Needham 40 km target, and 11.6 km on
-        roads scoring 7+ against 3.2 km. If this ever narrows, the feature has
+        """Measured 5.74 against 4.76 at a Needham 40 km target, and 8.7 km on
+        roads scoring 7+ against 2.3 km. If this ever narrows, the feature has
         stopped doing its job.
 
         The gap is narrower than the 6.03-against-1.94 in the design doc, and
@@ -298,33 +299,43 @@ class TestQualityNumbers:
         scenic = planner.plan(start, 40.0, pref=1.0)
         fast = planner.plan(start, 40.0, pref=0.0)
         assert scenic.mean_score > fast.mean_score + 0.5
-        # The stronger signal, and the one the app should show: 15.8 km of
-        # properly beautiful road against 3.2 km.
+        # The stronger signal, and the one the app should show: 8.7 km of
+        # properly beautiful road against 2.3 km.
         assert scenic.beautiful_km > 2.5 * fast.beautiful_km
 
     def test_the_middle_of_the_pref_slider_is_not_monotone(self, router, planner):
         """A wart, asserted so that fixing it fails loudly rather than silently.
 
-        pref 0.25 comes back *worse* than pref 0.0 — 3.58 against 5.00 at a
-        Needham 40 km target. Two things combine: `plan` ranks candidate
-        turnarounds by scenery no matter what pref is, so a small non-zero pref
-        picks a different turnaround than pref 0 without gaining the routing to
+        pref 0.5 comes back *worse* than pref 0.0 — 4.99 against 5.86 at a
+        Concord 40 km target. Two things combine: `plan` ranks candidate
+        turnarounds by scenery no matter what pref is, so a middling pref picks
+        a different turnaround than pref 0 without gaining the routing to
         justify it; and the final choice among built loops is on distance and
         repeated road with no scenery term, which at pref 1.0 is harmless
-        (every candidate is pretty) and at low pref is not.
+        (every candidate is pretty) and below it is not.
+
+        Concord rather than Needham because *which* pref dips is a property of
+        the start, not of the slider. This test used to pin Needham at pref
+        0.25, which dipped 5.00 → 3.58 under the old designation-only `c_green`
+        and does not dip at all now that forest is half measured tree cover.
+        Concord dips at 0.5 on both scorings, so it is the more durable sample —
+        but it is still a sample, and a failure here means the dip has moved
+        again, not necessarily that it is fixed. Sweep the other starts before
+        concluding anything.
 
         The endpoints are what matter and they behave. Until someone sweeps this
         properly, the loop tab should pin pref at 1.0 rather than offer a slider
         — which is also what the field cache wants, since pref is the one
         parameter that invalidates it.
         """
-        start, _ = router.snap(*NEEDHAM)
+        start, _ = router.snap(*CONCORD)
         scores = {pref: planner.plan(start, 40.0, pref=pref).mean_score
-                  for pref in (0.0, 0.25, 1.0)}
+                  for pref in (0.0, 0.5, 1.0)}
         assert scores[1.0] > scores[0.0]
-        assert scores[0.25] < scores[0.0], \
-            "the dip at the bottom of the slider is gone — update this test " \
-            "and the note in looper.py's docstring"
+        assert scores[0.5] < scores[0.0], \
+            "the dip in the middle of the slider has moved or gone — sweep " \
+            "pref from several starts, then update this test and the table in " \
+            "looper.py's docstring"
 
     def test_the_reported_numbers_describe_the_drawn_line(self, router, planner):
         """One instrument, not two: km/minutes/mean_score come off the route
