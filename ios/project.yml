@@ -50,6 +50,13 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.scenic.demo
+        # Here rather than picked in Xcode, because Scenic.xcodeproj is a
+        # gitignored build output: every `xcodegen generate` rewrites it, and a
+        # team set through the UI is wiped each time. That regeneration is not
+        # optional — a pull brings new Swift files and never the project that
+        # lists them, so adding a source file and forgetting to regenerate is
+        # "Cannot find type X in scope" with the file plainly on disk.
+        DEVELOPMENT_TEAM: 28ZU5P5GC3
         MARKETING_VERSION: "0.1"
         CURRENT_PROJECT_VERSION: "1"
         TARGETED_DEVICE_FAMILY: "1"
