@@ -1,7 +1,9 @@
 """Extract drivable roads and scenic-relevant features from an OSM PBF.
 
 Reads a Geofabrik state extract and writes GeoParquet layers:
-  roads          - drivable ways (LineString) with highway/name/ref/scenic/surface
+  roads          - drivable ways (LineString) with highway/name/ref/scenic/surface,
+                   where `scenic` is scenic=yes OR membership of a designated
+                   scenic-byway route relation (see BYWAY_NETWORKS)
   access_ways    - highway=service (parking aisles, driveways) with a component id
   access_entries - where each of those components meets the drivable network
   water_areas    - lakes, reservoirs, bays (MultiPolygon)
@@ -63,6 +65,54 @@ URBAN_LANDUSE = {"retail", "commercial"}
 ACCESS = "service"
 
 
+# Scenic byways live in OSM as route *relations*, not as way tags. The
+# `scenic=yes` way tag read below is nearly dead data — 28 ways in all six New
+# England states (MA 0, VT 0, RI 0, NH 3, ME 3, CT 22) — while the relations
+# admitted below carry 38 designated routes, 4,510 drivable member ways and
+# 3,235 km: VT 1,461, MA 738, NH 639, ME 283, CT 54.
+#
+# A relation is admitted when it is a *road* route and is *designated* scenic:
+#
+#   route=road  AND  (network in BYWAY_NETWORKS  OR  scenic=yes on the relation)
+#
+# Both halves of that OR are load-bearing. Not one of the 14 `US:MA:Scenic`
+# relations carries `scenic=yes`, so without the network clause the home state
+# goes to zero. And New Hampshire, Maine, Rhode Island and Connecticut have no
+# byway network at all: their byways — Kancamagus, Acadia All-American Road,
+# Old Canada Road, Rangeley Lakes, Schoodic, Connecticut Route 169, White
+# Mountain Trail — are network-less relations tagged `scenic=yes`, so without
+# the tag clause four of the six states go dark.
+#
+# `route=road` is what keeps footpaths off the roads, and it is not cosmetic.
+# Four hiking routes and two cycle routes carry "scenic" in their names, and
+# where they road-walk they share ways with the drivable network: 206 ways and
+# 91 km of ordinary road, 132 ways of it under the New England National Scenic
+# Trail alone. Selecting on the word "scenic" would flag every one of them.
+# The same clause drops three railway/train routes ("Conway Branch",
+# "Milford & Bennington Railroad", "Winnipesaukee Railway").
+#
+# Networks are allowlisted by name rather than pattern-matched because three of
+# the networks containing a scenic-sounding relation are general
+# numbered-highway systems: US:US (56 relations, 18,692 ways), US:ME (187 /
+# 7,523) and US:RI (62 / 3,300). Allowlisting those would designate every US
+# and state highway in the region a scenic byway. Their three candidates are
+# rejected individually and on their own evidence: both Rhode Island Route 1A
+# relations hedge in their own tags ("sometimes signed with 'SCENIC' in the
+# shield", "sometimes bannered as scenic, and sometimes not"), and Maine SR 11
+# is merely *named* "Aroostock Scenic Highway" — 615 ways and 655 km, the
+# largest single candidate in the region, carrying no scenic designation tag.
+#
+# Counts are from the 2026-08-25 New England extract; see
+# docs/byway-relations-brief.md.
+BYWAY_NETWORKS = {
+    "US:MA:Scenic",                 # 14 relations, every one a designated byway
+    "US:VT:byway",                  # 9
+    "US:AB:NSB:Connecticut River",  # 2 — America's Byways / National Scenic Byway
+    "US:NY:Scenic",                 # 1 — Lakes to Locks Passage, over the NY line
+    "CA:NB:scenic",                 # 2 — New Brunswick, in the extract's border overlap
+}
+
+
 class Handler(osmium.SimpleHandler):
     def __init__(self):
         super().__init__()
@@ -83,6 +133,9 @@ class Handler(osmium.SimpleHandler):
         self.green_areas = []
         self.farm_areas = []
         self.urban_areas = []
+        # Member way ids of every designated scenic byway route.
+        self.byway_ways = set()
+        self.byway_rels = set()
         self.errors = 0
 
     def _add_access(self, w, tags):
@@ -147,6 +200,24 @@ class Handler(osmium.SimpleHandler):
                 self.water_lines.append({"wkb": WKB.create_linestring(w)})
             except Exception:
                 self.errors += 1
+
+    def relation(self, r):
+        """Collect the member ways of designated scenic byway routes.
+
+        Relations sort last in a PBF, so `byway_ways` is complete by the time
+        main() builds the frame; and because it is a set, the second pass
+        pyosmium makes for area assembly only re-adds ids it already holds.
+        Membership is applied to `roads` in main() rather than in way() for
+        that ordering reason — when way() runs, this set is still empty.
+        """
+        tags = r.tags
+        if tags.get("type") != "route" or tags.get("route") != "road":
+            return
+        if (tags.get("network") not in BYWAY_NETWORKS
+                and tags.get("scenic") != "yes"):
+            return
+        self.byway_rels.add(r.id)
+        self.byway_ways.update(m.ref for m in r.members if m.type == "w")
 
     def area(self, a):
         tags = a.tags
@@ -236,6 +307,17 @@ def main(pbf_path: str, out_dir: str):
     # Area assembly makes pyosmium read the file twice; flex_mem holds node locations in RAM.
     h.apply_file(pbf_path, locations=True, idx="flex_mem")
     print(f"parsed PBF in {time.time() - t0:.0f}s ({h.errors} geometry errors skipped)")
+
+    # `scenic` is the union of the way tag with byway route membership. It is
+    # applied here and not in way() because relations sort after ways in a PBF,
+    # so byway_ways is only complete now.
+    tagged = sum(r["scenic"] for r in h.roads)
+    for r in h.roads:
+        r["scenic"] = r["scenic"] or r["way_id"] in h.byway_ways
+    scenic = sum(r["scenic"] for r in h.roads)
+    print(f"byways: {len(h.byway_rels):,} designated route relations, "
+          f"{len(h.byway_ways):,} member ways, of which {scenic - tagged:,} are "
+          f"drivable and new; scenic=yes tagged {tagged:,} -> {scenic:,} total")
 
     layers = {
         "roads": h.roads,
