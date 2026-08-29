@@ -9,7 +9,7 @@ Scoring components (the per-segment "beauty vector"):
   relief  - local terrain relief from elevation.py (hills, valleys, overlooks)
   farm    - adjacency to farmland/orchards/meadows
   views   - proximity to mapped viewpoints
-  scenic  - explicit scenic=yes tag
+  scenic  - designated scenic byway (OSM route relation, or scenic=yes)
   urban   - proximity to town/village centers and retail/commercial districts
 
 The relief component is read from data/processed/relief.tif if present
@@ -87,11 +87,6 @@ CLASS_ADJ = {
 }
 UNPAVED = {"unpaved", "dirt", "gravel", "ground", "grass", "sand", "earth", "mud", "fine_gravel"}
 UNPAVED_ADJ = -0.25
-
-# Official MA scenic byways that OSM doesn't tag scenic=yes — matched by road
-# name (case-insensitive substring). Treated like an OSM scenic designation.
-# Names are distinctive enough to avoid false positives statewide.
-BYWAY_NAMES = ["mohawk trail", "jacob's ladder trail", "jacobs ladder trail"]
 
 
 def load_layer(d: Path, name: str) -> gpd.GeoDataFrame:
@@ -329,9 +324,7 @@ def main(processed_dir: str):
     chunks["c_forest"] = 0.5 * green + 0.5 * tree
     chunks["c_farm"] = near_flags(farm_tree, geoms, DIST["farm"]).astype(float)
     chunks["c_views"] = near_flags(view_tree, geoms, DIST["view"]).astype(float)
-    name_l = chunks["name"].str.lower()
-    is_byway = name_l.apply(lambda s: any(b in s for b in BYWAY_NAMES))
-    chunks["c_scenic_tag"] = (chunks["scenic"] | is_byway).astype(float)
+    chunks["c_scenic_tag"] = chunks["scenic"].astype(float)
     chunks["c_relief"] = sample_relief(chunks, d / "relief.tif")
 
     # Townscape: full credit inside a retail/commercial district or close to a
@@ -418,7 +411,11 @@ def calibration_report(chunks: gpd.GeoDataFrame):
     print("benchmarks (scenic roads should sit far above the interstates):")
     for label, mask in [
         ("Greylock Notch/Rockwell", name.str.contains("notch road|rockwell road")),
-        ("Jacob's Ladder Trail", name.str.contains("jacob")),
+        # "jacob" alone matched 80 ways, 66 of them streets named after
+        # people (Jacob Cobb Lane, Jacob Amsden Road) and only 14 the byway.
+        # OSM names it "Jacobs Ladder Road", which is also why the old
+        # BYWAY_NAMES entry "jacob's ladder trail" never matched a way.
+        ("Jacob's Ladder Road", name.str.contains("jacob'?s ladder")),
         ("Mohawk Trail", name.str.contains("mohawk trail")),
         ("Route 6A (Old King's Hwy)", ref.str.contains("6A", na=False)),
         ("I-90 (Mass Pike)", ref.str.fullmatch("I 90", na=False)),
