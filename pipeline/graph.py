@@ -579,6 +579,14 @@ def attach_scores(edges: gpd.GeoDataFrame, chunks: gpd.GeoDataFrame,
         edges[c] = mean_of(chunks[c].to_numpy())
     edges["score_adj"] = mean_of(chunks["score_adj"].to_numpy())
 
+    # Share of this edge's length that is unpaved, 0..1. Averaged like a
+    # component rather than folded into `score_adj`, because it is not part of
+    # the beauty claim: `router.py` prices it in minutes, outside the scenery
+    # term. A graph built before 2026-08-29 has no such column and the router
+    # recovers the same number from `score_adj` instead — see
+    # `Router._load_unpaved`.
+    edges["unpaved_frac"] = mean_of(chunks["unpaved"].to_numpy())
+
     edges["score"] = composite(blend(edges[component_cols]).to_numpy(),
                                edges["score_adj"].to_numpy())
     return component_cols

@@ -85,8 +85,37 @@ CLASS_ADJ = {
     "tertiary": 0.0, "tertiary_link": -0.05, "unclassified": 0.0,
     "residential": -0.05, "living_street": -0.08,
 }
-UNPAVED = {"unpaved", "dirt", "gravel", "ground", "grass", "sand", "earth", "mud", "fine_gravel"}
-UNPAVED_ADJ = -0.25
+# OSM's "unpaved" family, taken whole from the `surface` wiki page rather than
+# hand-picked, so a value that is rare in New England but common elsewhere is
+# already handled. The hand-picked list this replaces omitted `compacted` —
+# crushed stone, and not pavement — which let **2,258 km** escape, skewed
+# exactly the wrong way: 1,125 km of it in Maine (1.88% of that state's network)
+# against 88 km in Massachusetts. Excluded on purpose: `chipseal`, `sett`,
+# `paving_stones`, `cobblestone` and `block` are *sealed or laid* surfaces. They
+# can be rough, but roughness is not what this measures.
+UNPAVED = {
+    "unpaved", "compacted", "fine_gravel", "gravel", "shells", "rock",
+    "pebblestone", "ground", "dirt", "earth", "grass", "grass_paver", "mud",
+    "sand", "woodchips", "snow", "ice", "salt",
+}
+
+# The surface values a *pre-2026-08-29* build knew about, and so the only ones
+# `Router._load_unpaved` can recover from such a graph. It is `UNPAVED` minus
+# `compacted` and the rarer members, which means that until each deployed graph
+# is rebuilt its `compacted` roads are scored right (they never were penalised)
+# but not *avoided* — 2,258 km region-wide, 1,125 km of it in Maine. That is the
+# one thing the restart-only migration cannot buy, and it is a strict
+# improvement on the old behaviour either way.
+LEGACY_UNPAVED = {"unpaved", "dirt", "gravel", "ground", "grass", "sand",
+                  "earth", "mud", "fine_gravel"}
+
+# What a *pre-2026-08-29* build folded into `score_adj` for an unpaved chunk.
+# Nothing writes this any more — see the block above `chunks["unpaved"]` below
+# for why surface left the beauty score. It survives for exactly one reader:
+# `Router._load_unpaved`, which subtracts it back out of a graph built before
+# the change, so the serving box gets the fix on a restart instead of a 364 MB
+# redeploy. Delete both once every deployed graph carries `unpaved_frac`.
+LEGACY_UNPAVED_ADJ = -0.25
 
 
 def load_layer(d: Path, name: str) -> gpd.GeoDataFrame:
@@ -343,13 +372,36 @@ def main(processed_dir: str):
     # router's live re-blend. A component with no WEIGHTS entry is a KeyError
     # rather than a term quietly missing from the score.
     raw = blend(chunks)
-    class_adj = chunks["highway"].map(CLASS_ADJ).fillna(0.0)
-    unpaved_adj = np.where(chunks["surface"].isin(UNPAVED), UNPAVED_ADJ, 0.0)
-    # Store the road-class/surface adjustment separately from the composite. The
-    # router needs it to re-blend a per-user score live: it recombines the raw
-    # component vector with the user's beauty-type weights, then re-applies this
-    # same adjustment so highways/unpaved roads stay penalized.
-    chunks["score_adj"] = class_adj + unpaved_adj
+    # Store the road-class adjustment separately from the composite. The router
+    # needs it to re-blend a per-user score live: it recombines the raw component
+    # vector with the user's beauty-type weights, then re-applies this same
+    # adjustment so highways stay penalized.
+    chunks["score_adj"] = chunks["highway"].map(CLASS_ADJ).fillna(0.0)
+
+    # Surface is carried as a *fact about the road*, not as a claim about how it
+    # looks. It used to be a flat -0.25 on the score, and that was wrong three
+    # ways (docs/unpaved-and-urban-verdict.md):
+    #
+    # 1. It contradicted this file's own measurements. In all six New England
+    #    states unpaved chunks score *higher* raw beauty than the rest, and it
+    #    holds within road class — Massachusetts, where the -0.25 was
+    #    calibrated, runs +0.063 raw (about +0.76 points after STRETCH) and was
+    #    then docked 2.5. The blend above already says these roads are pretty.
+    # 2. It measured mapping diligence. The penalty can only fire where somebody
+    #    tagged `surface`, and coverage runs from Vermont's 90.1% down to
+    #    Maine's 35.9% — so Maine, whose true unpaved share is an estimated
+    #    35.4%, was charged for 12.8% and kept 0.57 points that Vermont could
+    #    not. Same defect as `c_green` measuring land designation.
+    # 3. Sitting in the score put it inside the router's cost function, scaled
+    #    by `pref**PREF_CURVE` — so wanting *more beauty* bought *more dirt
+    #    avoidance*. See UNPAVED_AVOID_MIN_PER_KM in router.py, which is where
+    #    the preference lives now.
+    #
+    # A driver who does not want dirt roads is expressing a real preference and
+    # still gets one; it is a slider, and it is no longer a statement about
+    # scenery. Kept as a 0/1 float rather than a bool because graph.py
+    # length-averages it into a per-edge fraction.
+    chunks["unpaved"] = chunks["surface"].isin(UNPAVED).astype(float)
     chunks["raw"] = raw
     chunks["score"] = composite(raw, chunks["score_adj"])
 

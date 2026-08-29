@@ -1,10 +1,12 @@
 # Verdict: surface is a preference, not a scenery measurement
 
-**Status: measured 2026-08-29. NO CODE CHANGED.** `UNPAVED_ADJ` is still -0.25
-(`score.py:89`), `WEIGHTS["urban"]` still 0.14 (`score.py:52`). Test suite green
-at baseline: **294 passed, 0 skipped** (`SCENIC_DATA=data/processed-ne`, 400 s).
-All measurements are on the live build `data/processed-ne` (942,448 chunks,
-998,252 graph edges) via throwaway scripts outside the repo.
+**Status: measured, then implemented, 2026-08-29.** The measurement was done first with no
+source file touched; the recommendation below was then implemented in the same
+branch. `WEIGHTS["urban"]` is **unchanged** at 0.14 (`score.py`) — see the
+`c_urban` section for why. All measurements are on the live build
+`data/processed-ne` (942,448 chunks, 998,252 graph edges).
+
+**What shipped is recorded in "Implementation" at the end of this file.**
 
 Answers `docs/unpaved-and-urban-brief.md`. Reading order: that file first.
 
@@ -437,3 +439,111 @@ memory:
 Intermediates left at `/tmp/loops.csv`, `/tmp/avoid.csv`, `/tmp/r1.csv`,
 `/tmp/r2.csv`. No scratch build was made, so there is nothing to delete from
 `data/`.
+
+---
+
+## Implementation
+
+Shipped in the same branch as this document, after the measurements above.
+
+| | before | after |
+|---|---|---|
+| surface in the 0-10 score | `UNPAVED_ADJ = -0.25` inside `score_adj` | nothing |
+| surface in the cost function | `pref**2 * BETA * 0.25` min/km (0.00 to 2.00) | `avoid_unpaved * 1.0` min/km, flat |
+| user control | none | `avoid_unpaved=0..2`, default 1.0 |
+| `WEIGHTS["urban"]` | 0.14 | 0.14, unchanged |
+
+- **`score.py`** — `score_adj` is road class alone. `UNPAVED` is now OSM's
+  unpaved family taken whole rather than hand-picked, which adds `compacted`
+  (the 2,258 km of Finding 4). Chunks carry `unpaved` as a 0/1 column.
+- **`graph.py`** — edges carry `unpaved_frac`, length-averaged like a component.
+- **`router.py`** — `UNPAVED_AVOID_MIN_PER_KM = 1.0`, added in `_weights`
+  outside the `pref**PREF_CURVE` term; `MAX_AVOID_UNPAVED = 2.0`.
+- **`looper.py`** — `avoid_unpaved` threaded through `plan`/`sectors`/`resume`/
+  `nearest_length` **and into both cache keys**, since it moves every edge
+  weight.
+- **`server/app.py`** — `avoid_unpaved` on `/api/route` and `/api/loop`,
+  clamped, and in the loop result cache key. Not a `w_<type>`: those six are
+  renormalised against each other, so an avoidance among them would quietly
+  turn every attraction down.
+- **iOS is untouched.** The server defaults to 1.0, so the current app keeps
+  working and gets the fix; exposing the slider is a separate client release.
+
+### It did not need a rebuild
+
+As predicted in the cost section, and this is the part worth keeping:
+`Router._load_unpaved` recovers per-edge surface from a legacy graph exactly,
+undoes the baked-in penalty, and rewrites the in-memory `score` column so every
+reader stays on one scale. Verified against the live build: the recovered
+fraction is **identical** to the independent measurement (29,242 km), the
+migrated `score_adj` equals the class table to 3e-15, and the live re-blend
+still matches the stored column exactly.
+
+**The one thing the restart cannot buy:** a legacy graph can only give back the
+surfaces that were penalised when it was built, so `compacted` is invisible to
+the recovery until a rebuild (1.0 pp of residential km). Recorded as
+`LEGACY_UNPAVED` in `score.py` and pinned by
+`test_a_legacy_graph_cannot_see_compacted`.
+
+### Measured on the shipped code
+
+Vermont 40 km loops, dirt as a share of loop km — the prediction the 1.0
+default was chosen against, and what the code actually does:
+
+| | pref 0.5 | pref 1.0 | mean | loop score | minutes |
+|---|---|---|---|---|---|
+| before (penalty in the score) | 23.7% | 8.2% | 15.98% | 6.71 | 48.9 |
+| **after, `avoid_unpaved=1`** | **15.0%** | **17.2%** | **16.11%** | **7.21** | **48.0** |
+| after, `avoid_unpaved=0` | 26.9% | 26.7% | 26.80% | 7.10 | 51.3 |
+| after, `avoid_unpaved=2` | 10.1% | 13.3% | 11.68% | 7.05 | 48.9 |
+
+Same average dirt exposure (16.11% against 15.98%) and the same driving time,
+but flat across `pref` instead of collapsing by two thirds. The reported score
+rises 6.71 -> 7.21 because it has stopped docking roads for their surface.
+
+### `BETA` was re-swept and deliberately not changed
+
+Full reasoning is in the comment under `BETA` in `router.py`. In short: on
+Massachusetts routes the change moves the slider's shape by **nothing**,
+identically to two decimals; the shift (bottom 0.21 -> 0.14) is confined to
+routes with dirt on them, and BETA is a global instrument that would re-shape
+six states to compensate for two. Also worth knowing before anyone tries:
+**`router.py`'s own 0.32/0.15 sweep target does not reproduce on this build even
+before the change** — that table was fitted on a Massachusetts build several
+rebuilds ago. Re-derive it before re-fitting against it.
+
+### Tests
+
+`SCENIC_DATA=data/processed-ne .venv/bin/python -m pytest tests/` — **325 pass,
+0 skipped**, up from 294. The new coverage is deliberately shaped so the
+original defect cannot come back quietly:
+
+- `TestSurfaceAvoidanceIsNotAScenerySetting` asserts the per-km charge is
+  **identical at pref 0, 0.25, 0.5, 0.75 and 1.0**. Putting the constant back
+  inside the scenery term collapses the pref-0 charge to zero and fails it.
+- Ratios, not imported constants, wherever the calibrated value could drift —
+  `test_the_multiplier_scales_the_charge_linearly` holds whatever the default
+  is, and the pref-0 charge is asserted `> 0` so zeroing the constant fails.
+- `test_pref_curve_shapes_the_scenery_cost` now passes `avoid_unpaved=0` to
+  isolate what it names, and `test_the_surface_cost_is_what_lifts_the_ratio`
+  pins the other half. It failed honestly when first run — `_weights` minus
+  travel time is no longer purely the scenery term — which is the change
+  showing up exactly where it should.
+- `TestSurfaceAvoidanceReachesTheLoops` covers the cache-key trap on both the
+  cost and field caches.
+
+### Still open, in priority order
+
+1. **The drive marks in section "What cannot be settled".** The 1.0 default is
+   set to preserve behaviour, not because anyone has evidence about what
+   drivers want on dirt. This is the only measurement that can move it.
+2. **A rebuild**, whenever one is convenient — it makes `unpaved_frac` a real
+   column, lets the `_load_unpaved` legacy branch and `LEGACY_UNPAVED` be
+   deleted, and brings `compacted` into the avoidance.
+3. **The untagged-road imputation** (Finding 3's rates), so the avoidance stops
+   under-firing in Maine. Deliberately not shipped here: it applies a
+   preference to a probability, which is defensible, but it needs a product
+   decision and per-region rates the pipeline does not currently carry.
+4. **Expose the slider in the iOS client.**
+5. **`SPEED_FACTOR` makes no surface distinction.** Unmeasured; needs a traced
+   drive on unpaved road.

@@ -2,6 +2,7 @@
 
 Loads the routing graph once at startup and serves:
   GET  /api/route?from=LAT,LON&to=LAT,LON&pref=0.5[&heading=DEG][&via=LAT,LON]
+                                            [&avoid_unpaved=0..2]
                  [&w_<type>=...]
                               -> {"fastest": <GeoJSON Feature>,
                                   "scenic":  <GeoJSON Feature>}
@@ -50,7 +51,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "pipeline"))
 from looper import (BEAUTIFUL_SCORE, MAX_TARGET_KM, MIN_TARGET_KM, SECTORS,
                     LoopPlanner)  # noqa: E402
-from router import BEAUTY_TYPES, Router  # noqa: E402
+from router import (BEAUTY_TYPES, MAX_AVOID_UNPAVED, Router)  # noqa: E402
 
 # How far a user may push a single beauty type. 0 ignores it; the upper bound
 # keeps one cranked slider from completely swamping the others.
@@ -156,6 +157,21 @@ def _parse_heading(args):
     return value % 360.0
 
 
+def _parse_avoid_unpaved(args):
+    """How hard to steer around dirt roads, as a multiple of the calibrated
+    default (`router.UNPAVED_AVOID_MIN_PER_KM`). 0 accepts them freely, 1.0 is
+    the default, `MAX_AVOID_UNPAVED` is as hard as the old fixed penalty ever
+    pushed.
+
+    Separate from `w_<type>` on purpose. Those six compete for a fixed pot of
+    scenery weight and are renormalised against each other, so an avoidance
+    jammed in among them would quietly turn every attraction down. This one is
+    priced in minutes and does not touch the beauty blend at all.
+    """
+    value = float(args.get("avoid_unpaved", 1.0))
+    return max(0.0, min(MAX_AVOID_UNPAVED, value))
+
+
 def _parse_weights(args):
     """Read the per-beauty-type weights (w_<type>) from the query string. Each
     defaults to 1.0 (neutral) and is clamped to [WEIGHT_MIN, WEIGHT_MAX]."""
@@ -172,6 +188,7 @@ def api_route():
         a = _parse_ll(request.args["from"])
         b = _parse_ll(request.args["to"])
         pref = float(request.args.get("pref", 0.5))
+        avoid_unpaved = _parse_avoid_unpaved(request.args)
         heading = _parse_heading(request.args)
         weights = _parse_weights(request.args)
         raw_via = request.args.get("via")
@@ -216,9 +233,10 @@ def api_route():
         # Under the loop planner's lock: `resume` reads the same cached cost
         # models that `/api/loop` fills, and they are plain dicts.
         with LOOP_LOCK:
-            fastest = LOOPER.resume(s, w, t, 0.0, weights)
+            fastest = LOOPER.resume(s, w, t, 0.0, weights, avoid_unpaved)
             scenic = (fastest if pref == 0.0
-                      else LOOPER.resume(s, w, t, pref, weights))
+                      else LOOPER.resume(s, w, t, pref, weights,
+                                         avoid_unpaved))
         # `heading` is deliberately dropped here. It picks which end of the
         # driver's road to leave from, and this caller is mid-drive, so it
         # matters — but honouring it would mean starting the search from a
@@ -229,9 +247,11 @@ def api_route():
             return jsonify(error="no route found through that waypoint"), 404
         return jsonify(fastest=fastest.geojson(), scenic=scenic.geojson())
 
-    fastest = ROUTER.route(s, t, 0.0, weights, heading=heading)
+    fastest = ROUTER.route(s, t, 0.0, weights, heading=heading,
+                           avoid_unpaved=avoid_unpaved)
     scenic = (fastest if pref == 0.0
-              else ROUTER.route(s, t, pref, weights, heading=heading))
+              else ROUTER.route(s, t, pref, weights, heading=heading,
+                                avoid_unpaved=avoid_unpaved))
     if fastest is None or scenic is None:
         return jsonify(error="no route found between those points"), 404
     return jsonify(fastest=fastest.geojson(), scenic=scenic.geojson())
@@ -255,6 +275,7 @@ def api_loop():
         # docstring in pipeline/looper.py. Clients should leave this alone.
         pref = max(0.0, min(1.0, float(request.args.get("pref", 1.0))))
         weights = _parse_weights(request.args)
+        avoid_unpaved = _parse_avoid_unpaved(request.args)
     except (KeyError, ValueError):
         return jsonify(error="need from=lat,lon[&km=5..200][&pref=0..1]"
                              "[&sector=N|NE|E|SE|S|SW|W|NW][&w_<type>=...]"), 400
@@ -274,22 +295,25 @@ def api_loop():
 
     target_km = max(MIN_TARGET_KM, min(MAX_TARGET_KM, target_km))
     key = (start, round(target_km, 1), round(pref, 4), sector,
-           tuple(sorted(weights.items())))
+           tuple(sorted(weights.items())), round(avoid_unpaved, 4))
     with LOOP_LOCK:
         cached = LOOP_RESULTS.pop(key, None)
         if cached is not None:
             LOOP_RESULTS[key] = cached          # move to the warm end
             return jsonify(cached)
-        loop = LOOPER.plan(start, target_km, pref, weights, sector=sector)
+        loop = LOOPER.plan(start, target_km, pref, weights, sector=sector,
+                           avoid_unpaved=avoid_unpaved)
         if loop is None:
             # Only reachable when the geography has nothing at all in that
             # direction at that length, since `plan` returns the best available
             # rather than holding out for a good one.
-            nearest = LOOPER.nearest_length(start, target_km, pref, weights)
+            nearest = LOOPER.nearest_length(start, target_km, pref, weights,
+                                            avoid_unpaved)
             hint = (f" The nearest loop from here is about {nearest:.0f} km."
                     if nearest else "")
             return jsonify(error="no loop of that length from there." + hint), 404
-        available = LOOPER.sectors(start, loop.target_km, pref, weights)
+        available = LOOPER.sectors(start, loop.target_km, pref, weights,
+                                   avoid_unpaved)
 
     note = None
     if loop.repeated_fraction > LOOP_RETRACE_NOTE:
@@ -353,9 +377,11 @@ def index():
         routing_slots=ROUTER.n,
         endpoints={
             "/api/route": ("from=LAT,LON&to=LAT,LON[&pref=0..1][&via=LAT,LON]"
+                           "[&avoid_unpaved=0..2]"
                            "[&w_<type>=0..4]"),
             "/api/loop": (f"from=LAT,LON&km={MIN_TARGET_KM:.0f}..{MAX_TARGET_KM:.0f}"
-                          "[&sector=NE][&pref=0..1][&w_<type>=0..4]"),
+                          "[&sector=NE][&pref=0..1][&w_<type>=0..4]"
+                          "[&avoid_unpaved=0..2]"),
             "/api/health": "liveness check",
         },
         loop_sectors=list(SECTORS),

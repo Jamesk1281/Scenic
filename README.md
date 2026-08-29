@@ -126,7 +126,7 @@ To *host* it (spare laptop or VPS, with a production server + tunnel), see
 `GET /` returns a short description of the service and its endpoints, which
 doubles as a liveness check you can open in a browser.
 
-The iOS app (`ios/`, open in Xcode) calls `GET /api/route?from=LAT,LON&to=LAT,LON&pref=0..1`
+The iOS app (`ios/`, open in Xcode) calls `GET /api/route?from=LAT,LON&to=LAT,LON&pref=0..1[&avoid_unpaved=0..2]`
 and renders the fastest vs scenic routes. It reads the backend URL from the
 `ScenicAPIBaseURL` Info.plist key set in `ios/project.yml`, overridable at
 runtime with a `SCENIC_API` environment variable. Command-line equivalent:
@@ -144,9 +144,21 @@ measured tree cover from ESA WorldCover (`landcover.py`), because OSM's polygons
 record land *designation* rather than vegetation and are three times more
 complete in Rhode Island than in Maine — see
 [`docs/geodata-sources-findings.md`](docs/geodata-sources-findings.md). A weighted blend (tunable constants at the top of `score.py`)
-produces a 0–10 composite, with penalties for highways and unpaved surfaces.
+produces a 0–10 composite, with a penalty for highways.
 The router charges a minutes-equivalent penalty per km of *unscenic* road, so the
 preference knob trades extra time for scenery.
+
+Road *surface* is deliberately not part of that composite. A flat -0.25 for
+unpaved used to be, and it measured mapping diligence rather than beauty —
+surface tagging runs from Vermont's 90% down to Maine's 36%, so Vermont's dirt
+roads were nearly all found and penalised while most of Maine's escaped, and the
+model's own components rate unpaved roads *above* paved ones in all six states.
+Worse, sitting in the score put it inside the router's `pref` term, so asking
+for more scenery bought more dirt-avoidance. It is now a separate preference
+priced in minutes — `avoid_unpaved=0..2` on both endpoints, defaulting to the
+calibrated 1.0 min/km, which preserves the old average behaviour without the
+coupling. See
+[`docs/unpaved-and-urban-verdict.md`](docs/unpaved-and-urban-verdict.md).
 
 Every constant in that blend is fitted to the *distribution* it produces, not
 guessed, because a single number silently reshapes 66,000 km of road. `score.py`
