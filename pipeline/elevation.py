@@ -63,6 +63,30 @@ RELIEF_REF_LAT = 42.05
 # relief, which score.py then happily turns into scenery.
 MIN_COVERAGE = 0.98
 
+# Terrarium's own tiles carry corrupt pixels: short horizontal runs that decode
+# to the ends of the encoding range — RGB(0,0,0) is -32768 m and RGB(255,255,0)
+# is +32767 m — sitting inside otherwise clean terrain. Re-fetching returns
+# byte-identical bytes with a valid signature, IEND and Content-Length, so the
+# corruption is upstream and retrying does not help. MIN_COVERAGE cannot see it
+# either: it counts tiles that failed to *fetch*, and these fetch perfectly.
+# Measured 2026-08-29 over New England: 320 pixels across 9 of 2,120 tiles.
+#
+# The positive side is the one that costs anything. The ocean clamp below
+# already flattens every negative to sea level, so garbage bathymetry is free,
+# but nothing caps the top: a single +32767 m pixel sets max - min for its whole
+# window, and score.py's clip(vals / RELIEF_FULL, 0, 1) turns that into a
+# maximal terrain score. Massachusetts escaped for years only because both of
+# its corrupt pixels happen to be negative.
+#
+# The band is physical rather than fitted — Everest is 8,849 m and Challenger
+# Deep is -10,935 m, so no real ground falls outside it. Over New England the
+# positive side is unambiguous: the highest real pixel is Mount Washington at
+# 1,917 m and the next one up is 32,767 m, with nothing in between. The negative
+# side has no such gap, so mid-range garbage bathymetry survives the band; it is
+# harmless because the clamp flattens it, and elevation.tif has no reader.
+ELEV_MAX_M = 9000.0
+ELEV_MIN_M = -11000.0
+
 TILE_PX = 256
 R = 6378137.0  # web mercator radius
 
@@ -154,6 +178,26 @@ def main(out_dir: str, zoom: int = 11):
             if done % 100 == 0:
                 print(f"  {done}/{len(jobs)} tiles")
 
+    # Drop corrupt source pixels into the same hole mask as unfetched tiles, so
+    # that coverage is judged on pixels that are actually usable and one check
+    # covers both ways the mosaic can be short of real data.
+    corrupt = ~np.isnan(elev) & ((elev > ELEV_MAX_M) | (elev < ELEV_MIN_M))
+    n_corrupt = int(corrupt.sum())
+    if n_corrupt:
+        # Per-tile counts straight off the mask, so the summary costs the same
+        # whether nine pixels are corrupt or nine million.
+        per_tile = corrupt.reshape(len(ty), TILE_PX, len(tx), TILE_PX).sum(axis=(1, 3))
+        bad_ty, bad_tx = np.nonzero(per_tile)
+        print(f"WARNING: {n_corrupt} pixel(s) across {len(bad_ty)} tile(s) decode "
+              f"outside {ELEV_MIN_M:.0f}..{ELEV_MAX_M:.0f} m; the source tiles are "
+              f"corrupt, not missing, so re-running will not fix them")
+        for r, c in zip(bad_ty[:10], bad_tx[:10]):
+            print(f"    z{zoom}/{x0 + c}/{y0 + r}: {per_tile[r, c]} px")
+        if len(bad_ty) > 10:
+            print(f"    ... and {len(bad_ty) - 10} more")
+        elev[corrupt] = np.nan
+    del corrupt
+
     valid = ~np.isnan(elev)
     coverage = float(valid.mean())
     if missing:
@@ -186,13 +230,27 @@ def main(out_dir: str, zoom: int = 11):
           f"{RELIEF_REF_LAT:.2f}N); relief window {win}px (~{win * px_ground:.0f} m)")
     # Clamp ocean bathymetry (Terrarium encodes sea floor as deep negatives) to
     # sea level so coastal roads don't get spuriously huge land relief.
-    land = np.clip(np.where(np.isnan(elev), 0.0, elev), 0.0, None)
-    relief = (maximum_filter(land, size=win) - minimum_filter(land, size=win))
-    # A hole is not flat ground. `elev` is NaN where no tile was fetched, and
-    # the substitution above turned that into 0 m so the filters would run;
-    # putting the NaN back is what lets a reader tell "no terrain here" from
-    # "terrain, and it is level" — see the nodata= on the write below.
-    relief = np.where(np.isnan(elev), np.nan, relief).astype(np.float32)
+    land = np.clip(elev, 0.0, None)
+    # A hole is not flat ground, and it is not only its own pixel that suffers.
+    # Substituting 0 m so the filters can run let a gap set the minimum for
+    # every pixel within win // 2 of it, inventing relief equal to the
+    # surrounding ground and ringing the hole with the cliff this whole module
+    # is trying to avoid. Feeding the filters a sentinel that loses to every
+    # real neighbour instead — -inf into the maximum, +inf into the minimum —
+    # makes a gap invisible rather than flat, so it costs its own pixel and
+    # nothing around it. `land` is reused for both passes to keep the peak down.
+    gap = np.isnan(land)
+    np.copyto(land, -np.inf, where=gap)
+    relief = maximum_filter(land, size=win)
+    np.copyto(land, np.inf, where=gap)
+    relief -= minimum_filter(land, size=win)
+    del land
+    # Gap pixels themselves, and any window that was nothing but gaps (where
+    # both filters kept their sentinel and the difference came out -inf), are
+    # nodata: that is what lets a reader tell "no terrain here" from "terrain,
+    # and it is level" — see the nodata= on the write below.
+    relief = np.where(gap | ~np.isfinite(relief), np.nan, relief).astype(np.float32)
+    del gap
 
     prof = dict(
         driver="GTiff", height=H, width=W, count=1, dtype="float32",
