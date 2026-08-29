@@ -63,9 +63,18 @@ WEIGHT_MIN, WEIGHT_MAX = 0.0, 4.0
 # comes back at 0.35). See looper.Loop.repeated_fraction.
 LOOP_RETRACE_NOTE = 0.15
 
+# What the built graph actually covers, named in one place because it appears in
+# three error messages and in the index response. It must be changed with the
+# parquets, not with the code: a server telling a driver in Vermont that the
+# region is Massachusetts is wrong in the one direction that costs a bug report,
+# and it was wrong that way from the moment the New England graph was copied
+# over. Read from the environment so a rollback to a different region's parquets
+# does not need a code change to stay honest.
+REGION = os.environ.get("SCENIC_REGION", "New England")
+
 # Reject a request whose endpoint lies farther than this from any road — it's
-# outside the covered region (currently Massachusetts), and the "nearest" road
-# would be in an arbitrary border town, yielding a nonsense route.
+# outside the covered region (see REGION), and the "nearest" road would be in an
+# arbitrary border town, yielding a nonsense route.
 SNAP_MAX_M = 5000.0
 
 # Where the prebuilt graph lives. An env var (not a CLI arg) so it works
@@ -180,7 +189,7 @@ def api_route():
     t, t_off = ROUTER.snap_destination(*b)
     if max(s_off, t_off) > SNAP_MAX_M:
         return jsonify(error="point is outside the covered road network "
-                             "(currently Massachusetts)"), 400
+                             f"(currently {REGION})"), 400
     if s == t:
         return jsonify(error="those points are too close together — "
                              "they sit on the same stretch of road"), 400
@@ -203,7 +212,7 @@ def api_route():
         w, w_off = ROUTER.snap(*via)
         if w_off > SNAP_MAX_M:
             return jsonify(error="that waypoint is outside the covered road "
-                                 "network (currently Massachusetts)"), 400
+                                 f"network (currently {REGION})"), 400
         # Under the loop planner's lock: `resume` reads the same cached cost
         # models that `/api/loop` fills, and they are plain dicts.
         with LOOP_LOCK:
@@ -261,7 +270,7 @@ def api_loop():
     start, offset = ROUTER.snap(*start_ll)
     if offset > SNAP_MAX_M:
         return jsonify(error="point is outside the covered road network "
-                             "(currently Massachusetts)"), 400
+                             f"(currently {REGION})"), 400
 
     target_km = max(MIN_TARGET_KM, min(MAX_TARGET_KM, target_km))
     key = (start, round(target_km, 1), round(pref, 4), sector,
@@ -351,7 +360,7 @@ def index():
         },
         loop_sectors=list(SECTORS),
         beauty_types=[name for name, *_ in BEAUTY_TYPES],
-        region="Massachusetts",
+        region=REGION,
     )
 
 
