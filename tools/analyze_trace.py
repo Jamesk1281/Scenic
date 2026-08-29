@@ -399,7 +399,13 @@ def steps(fixes):
         "lat": f["lat"].to_numpy()[:-1],
         "lon": f["lon"].to_numpy()[:-1],
         "acc": np.maximum(f["acc"].to_numpy()[:-1], f["acc"].to_numpy()[1:]),
-        "off_m": f["off"].to_numpy()[:-1],
+        # Both ends, for the same reason `acc` takes both: a step is only as
+        # trustworthy as its worse end. Reading `off` from the first fix alone
+        # kept the step *into* a bad match and dropped the step back out of it,
+        # so a fix matched 240 m up a parallel corridor contributed its whole
+        # forward jump and none of the correction — 340 m reported for 120 m
+        # driven. One-sided inflation is worse than no filter at all.
+        "off_m": np.maximum(f["off"].to_numpy()[:-1], f["off"].to_numpy()[1:]),
     })
     # Gaps are dropped but not forgotten. A dropout is the one exclusion that can
     # quietly delete the thing being measured: if the phone stops reporting while
@@ -1060,7 +1066,10 @@ def report(paths, edges, control=None):
             print(f"  predicted{h['predicted_min']:5.1f} min for the "
                   f"{h['matched_km']:.1f} km that snapped to a road"
                   f"  (drove {h['matched_min']:.1f} min of it)"
-                  f"  →  {h['matched_min'] / h['predicted_min'] - 1:+.0%}")
+                  # error against *actual*, the one denominator
+                  # docs/junction-timing-plan.md settles on — the same one the
+                  # ALL DRIVES line below uses, so the two cannot disagree.
+                  f"  →  {1 - h['predicted_min'] / h['matched_min']:+.0%}")
 
         parked = drive_stops[drive_stops.parked] if not drive_stops.empty \
             else drive_stops
@@ -1111,7 +1120,13 @@ def report(paths, edges, control=None):
             # trace whose route record is missing. Without carrying them up, all
             # three arrive at the report indistinguishable from a marked stretch
             # that genuinely wasn't near a road.
-            mark_drops.update(scored_marks.attrs)
+            # `.attrs` survives the `copy()`/`assign()` inside
+            # `attach_scenery`, so re-adding the whole dict would count every
+            # `dropped_*` reason from `marks()` twice — and `thrown` below
+            # reads these same totals. Add only what `attach_scenery` itself
+            # contributed.
+            mark_drops.update({k: v for k, v in scored_marks.attrs.items()
+                               if k not in drive_marks.attrs})
             all_marks.append(scored_marks)
             for width in alternates:
                 alternates[width].append(

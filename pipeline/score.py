@@ -116,10 +116,15 @@ def chunk_roads(roads: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
                 out_idx.append(i)
     chunks = roads.iloc[out_idx].drop(columns="geometry").reset_index(drop=True)
     chunks = gpd.GeoDataFrame(chunks, geometry=gpd.GeoSeries(out_geoms, crs=CRS_METERS))
+    # The length of the way this piece was cut from. `curvature_deg_per_km`
+    # floors its denominator to protect short *roads*, and after chunking a
+    # piece's own length no longer says whether its road was short.
+    chunks["road_len_m"] = np.asarray(lengths)[out_idx]
     return chunks
 
 
-def curvature_deg_per_km(geoms: np.ndarray) -> np.ndarray:
+def curvature_deg_per_km(geoms: np.ndarray,
+                         road_lengths: np.ndarray | None = None) -> np.ndarray:
     """Sustained heading change per km — twistiness as a driver actually feels it.
 
     Samples each line every CURVE_D metres and sums the heading change between
@@ -130,6 +135,9 @@ def curvature_deg_per_km(geoms: np.ndarray) -> np.ndarray:
     its way to thousands of deg/km.
     """
     lengths = shapely.length(geoms)
+    # Defaults to the geometry's own length, which is right whenever the caller
+    # is passing whole roads.
+    road_lengths = lengths if road_lengths is None else np.asarray(road_lengths)
     n_steps = int(np.ceil(lengths.max() / CURVE_D)) + 1
 
     # Point k sits CURVE_D * k along the line (clamped to its end).
@@ -152,7 +160,15 @@ def curvature_deg_per_km(geoms: np.ndarray) -> np.ndarray:
     turn = np.where(chord_ok[1:] & chord_ok[:-1],
                     np.minimum(np.abs(dh), CURVE_CAP), 0.0).sum(axis=0)
 
-    return turn / (np.maximum(lengths, CURVE_MIN_LEN) / 1000.0)
+    # The floor exists to stop a 25 m stub dividing one bend into thousands of
+    # deg/km, so it keys on the *road*: a 401 m way is cut into two 200.5 m
+    # chunks, and dividing each of those by a floored 300 m understated a road
+    # curving at CURVE_FULL as 0.53 (of 1.0) — a 0.53-point score swing decided
+    # by whether OSM digitised the way at 400 m or 401 m. Short roads keep the
+    # protection; chunks of long ones are measured over the length they have.
+    denom = np.where(road_lengths >= CURVE_MIN_LEN,
+                     lengths, np.maximum(lengths, CURVE_MIN_LEN))
+    return turn / (denom / 1000.0)
 
 
 def near_flags(tree: STRtree | None, geoms: np.ndarray, dist: float) -> np.ndarray:
@@ -176,6 +192,15 @@ def sample_relief(chunks: gpd.GeoDataFrame, relief_path: Path) -> np.ndarray:
         vals = np.fromiter(
             (v[0] for v in src.sample(coords)), dtype=float, count=len(coords)
         )
+    # Reachable again now that relief.tif carries nodata: NaN here means the
+    # chunk sits outside the mosaic (a PBF wider than elevation.py's BBOX) or in
+    # one of the holes MIN_COVERAGE tolerates. Scoring those as 0 is still the
+    # only option, but it is worth one line rather than nothing at all.
+    void = np.isnan(vals)
+    if void.any():
+        print(f"NOTE: {void.sum():,} of {len(vals):,} chunks "
+              f"({100 * void.mean():.1f}%) have no elevation coverage; "
+              f"relief = 0 for those (widen BBOX in elevation.py and re-run)")
     vals = np.nan_to_num(vals, nan=0.0)
     return np.clip(vals / RELIEF_FULL, 0, 1)
 
@@ -231,7 +256,7 @@ def main(processed_dir: str):
     geoms = chunks.geometry.values
 
     # Component: curvature
-    curv = curvature_deg_per_km(geoms)
+    curv = curvature_deg_per_km(geoms, chunks["road_len_m"].to_numpy())
     chunks["c_curves"] = np.clip(curv / CURVE_FULL, 0, 1)
 
     # Components: proximity to scenic features

@@ -398,6 +398,18 @@ def resolve_restrictions(edges, restrictions):
         # never have made the U-turn anyway.
         if kind == "no_u_turn" and frm == to:
             continue
+        # OSM's convention is that the from-way *ends* at the via node. When it
+        # does not, `build_edges` has split it and `touching` returns both
+        # halves — two opposite approaches, only one of which the mapper meant.
+        # Banning from both forbids a legal movement (a no-left-turn applied to
+        # the driver coming the other way, for whom it is a right), and the
+        # router detours them around the block. Under-banning is the safer of
+        # the two errors, so leave it unresolved where it can be counted.
+        # Measured at 0 of 4,218 resolvable MA restrictions; other regions
+        # follow the convention less reliably.
+        if len(from_rows) > 1:
+            unresolved += 1
+            continue
         for f in from_rows:
             if kind in NO_TURN:
                 # A pure backtrack is unreachable by a shortest path, so saying
@@ -479,6 +491,13 @@ def main(pbf_path: str, processed_dir: str):
 # quarter of score.py's CHUNK_LEN, so every chunk an edge crosses is hit.
 SAMPLE_STEP_M = 100.0
 
+# How far a sample may sit from the chunk it takes its score from. A chunk is at
+# most CHUNK_LEN long and sampling runs along the edge itself, so a correct join
+# is metres; 150 m is slack for geometry that moved between extract and score.
+MAX_CHUNK_SNAP_M = 150.0
+# Above this share of strays the two files are not describing the same roads.
+MAX_CHUNK_SNAP_SHARE = 0.005
+
 
 def sample_offsets(lengths: np.ndarray, step: float):
     """Split each length into equal pieces of <= `step` and return, per piece,
@@ -525,6 +544,27 @@ def attach_scores(edges: gpd.GeoDataFrame, chunks: gpd.GeoDataFrame,
     nearest = tree.query_nearest(pts, all_matches=False)
     # query_nearest returns indices aligned to input order
     idx = nearest if nearest.ndim == 1 else nearest[1]
+
+    # How far each sample actually had to reach for its chunk. Unbounded, this
+    # join is silent when it is wrong: an edge with no chunk of its own (a way
+    # `extract.py` dropped for a missing node but `graph.py` kept) takes the
+    # nearest chunk at any distance, so a residential street beside I-90 can
+    # inherit the interstate's components and its score_adj with nothing said.
+    # A handful of strays is normal; a large share means these chunks were not
+    # built from this PBF, which mis-scores the whole graph.
+    gap = shapely.distance(pts, np.asarray(chunks.geometry.values)[idx])
+    far = gap > MAX_CHUNK_SNAP_M
+    if far.any():
+        share = far.mean()
+        detail = (f"{far.sum():,} of {len(pts):,} samples ({100 * share:.2f}%) "
+                  f"are more than {MAX_CHUNK_SNAP_M:.0f} m from any scored chunk "
+                  f"(worst {gap.max():,.0f} m)")
+        if share > MAX_CHUNK_SNAP_SHARE:
+            raise RuntimeError(
+                f"{detail}. scored_chunks.parquet does not match this graph — "
+                f"re-run score.py against the same PBF before attaching scores."
+            )
+        print(f"NOTE: {detail}; those edges take their nearest chunk's score.")
 
     n = len(edges)
     total = np.bincount(row, weights=piece, minlength=n)

@@ -175,25 +175,49 @@ final class LoopRerouteTests: XCTestCase {
 
     // MARK: - Arrival
 
+    /// A drive around a loop whose line actually closes.
+    ///
+    /// `loopRoute()` above is a straight line and is right for the reroute
+    /// tests, which only care about distance along it and proximity to the far
+    /// point. It is the wrong fixture for arrival: its last point is 10 km from
+    /// its first, so a fix at the start leaves the whole route remaining
+    /// however the match lands, and the assertion cannot fail.
+    private func closedLoopDrive() -> NavigationModel {
+        NavigationModel(route: Fixture.closedLoopRoute(), destination: origin,
+                        pref: 1.0, weights: [:], trace: nil,
+                        turnaround: Fixture.closedLoopTurnaround())
+    }
+
+    func test_the_closed_loop_fixture_really_closes() {
+        // Guarding the guard: everything below is vacuous if it does not.
+        let line = Fixture.closedLoopRoute().coordinates
+        XCTAssertEqual(line.first!.latitude, line.last!.latitude, accuracy: 1e-12)
+        XCTAssertEqual(line.first!.longitude, line.last!.longitude, accuracy: 1e-12)
+    }
+
     func test_a_loop_does_not_announce_arrival_while_sitting_at_the_start() {
         // The case that makes a loop different: the driver begins the drive
         // within a few metres of the destination, with the whole loop ahead.
-        let nav = NavigationModel(route: loopRoute(), destination: origin,
-                                  pref: 1.0, weights: [:], trace: nil,
-                                  turnaround: turnaround)
-        nav.update(Fixture.fixAt(0))
-        nav.update(Fixture.fixAt(20))
+        // These fixes sit on the *return* leg — nearer the closing segment than
+        // the opening one — which is what a car parked at the kerb looks like
+        // and what used to match at 7,991 m of an 8,000 m loop.
+        let nav = closedLoopDrive()
+        nav.update(Fixture.fix(Fixture.offset(east: 8, north: 0)))
+        nav.update(Fixture.fix(Fixture.offset(east: 3, north: 0)))
         XCTAssertFalse(nav.arrived, "arrival must be having driven the line, "
                        + "not standing next to the pin")
+        XCTAssertFalse(nav.passedTurnaround, "the far point is 2 km away and the "
+                       + "car has not moved")
     }
 
     func test_a_loop_announces_arrival_once_it_is_actually_driven() {
-        let nav = NavigationModel(route: loopRoute(), destination: origin,
-                                  pref: 1.0, weights: [:], trace: nil,
-                                  turnaround: turnaround)
-        nav.update(Fixture.fixAt(100))
-        nav.update(Fixture.fixAt(5_000))
-        nav.update(Fixture.fixAt(9_990))
+        let nav = closedLoopDrive()
+        nav.update(Fixture.fix(Fixture.offset(east: 0, north: 100)))
+        nav.update(Fixture.fix(Fixture.offset(east: 0, north: 2_000)))
+        nav.update(Fixture.fix(Fixture.offset(east: 2_000, north: 2_000)))
+        XCTAssertTrue(nav.passedTurnaround, "the far point has been driven through")
+        nav.update(Fixture.fix(Fixture.offset(east: 2_000, north: 0)))
+        nav.update(Fixture.fix(Fixture.offset(east: 20, north: 0)))
         XCTAssertTrue(nav.arrived)
     }
 }

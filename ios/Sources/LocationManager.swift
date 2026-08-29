@@ -224,7 +224,16 @@ final class LocationManager: NSObject, CLLocationManagerDelegate {
         // A one-shot holds out for an accurate fix, but keeps the best it has
         // seen so a timeout can still answer with something.
         if let pending = pendingFix {
-            if pending.best.map({ newest.horizontalAccuracy < $0.horizontalAccuracy }) ?? true {
+            // Valid first, then better. An invalid fix carries a *negative*
+            // accuracy — the case `isUsable` was written for — so on a bare `<`
+            // it outranks every real fix and `?? true` accepts it outright when
+            // nothing is held yet. The timeout below then answers with a
+            // coordinate CoreLocation has already called meaningless, in
+            // practice (0, 0), which `useMyLocation` plans a trip from without
+            // complaint. Coarse-but-real fixes are still kept: they are what
+            // this fallback exists to provide.
+            if newest.horizontalAccuracy > 0,
+               pending.best.map({ newest.horizontalAccuracy < $0.horizontalAccuracy }) ?? true {
                 pending.best = newest
             }
             if Self.isUsable(newest) {
