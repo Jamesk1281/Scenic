@@ -141,6 +141,22 @@ CANDIDATE_TOLERANCE = 0.10
 # (measured +5% to -19% on one Petersham target).
 SPAN_PICKS = 5
 
+# How many candidates a compass direction needs before it is worth offering.
+#
+# `SPAN_PICKS`, and not a round number, because that is the count `plan` needs to
+# do its job: `_spread` takes one candidate from each of `SPAN_PICKS` slices
+# across the band, so a direction holding fewer than that cannot fill the slices
+# and silently degrades toward the picks=1 row of the table above — +21% on the
+# requested distance — while the app advertises it like any other direction.
+#
+# At the extreme it is worse than inaccurate. Measured on the New England graph,
+# a Boston start at 20 km has candidate counts of 1,422 north and **1**
+# south-east: the harbour leaves exactly one loop that way, so `regenerate`
+# offers a whole direction that returns the same drive every time. Massachusetts
+# alone had zero there and the direction was correctly hidden; the wider graph
+# turned "none" into "one", which reads as a real option and is not.
+MIN_SECTOR_CANDIDATES = SPAN_PICKS
+
 # A turnaround closer than this makes a loop that leaves and returns along the
 # same few metres of road, which no penalty can fix because there is nothing else
 # there yet.
@@ -299,12 +315,17 @@ class LoopPlanner:
                 weights: dict = None):
         """Which compass directions actually hold a loop of about this length.
 
-        Returns `{sector: candidate count}` for the populated ones only, which is
+        Returns `{sector: candidate count}` for the ones worth offering, which is
         what lets the app offer real directions instead of a blind shuffle. It
         must be asked rather than assumed: a Boston start has **zero** candidates
         due east at 20 km and zero north-east at 40 km — that is the harbour and
         the ocean — and a Petersham start has 9 south-west against 289
         north-west. Costs nothing beyond the cached passes.
+
+        Thin directions are dropped, not just empty ones — see
+        `MIN_SECTOR_CANDIDATES`. A direction holding one candidate is a button
+        that returns the same drive on every press, and it cannot honour the
+        distance slider either.
         """
         fields = self._fields(start, pref, weights)
         idx = self.candidates(fields, target_km)
@@ -312,7 +333,8 @@ class LoopPlanner:
             return {}
         codes = self._sector_codes(fields.start, idx)
         counts = np.bincount(codes, minlength=len(SECTORS))
-        return {SECTORS[i]: int(c) for i, c in enumerate(counts) if c}
+        return {SECTORS[i]: int(c) for i, c in enumerate(counts)
+                if c >= MIN_SECTOR_CANDIDATES}
 
     def candidates(self, fields: _Fields, target_km: float,
                    tolerance: float = CANDIDATE_TOLERANCE,

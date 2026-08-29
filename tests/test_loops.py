@@ -206,14 +206,27 @@ class TestRegenerate:
         available = planner.sectors(start, 20.0)
         assert available
         assert set(available) <= set(SECTORS)
-        # A coastal start cannot offer all eight: some of them are the harbour
-        # and the ocean. Which one is missing depends on the octant boundaries,
-        # so this asserts the fact and not the compass letter.
-        assert len(available) < len(SECTORS)
         # Every direction offered has to actually produce a loop, or the app
         # shows the user a button that fails.
         for name in available:
             assert planner.plan(start, 20.0, sector=name) is not None
+        # ...and hold enough candidates to be a direction rather than a single
+        # drive wearing one. This used to assert that a coastal start could not
+        # fill all eight octants, which was true of the Massachusetts graph and
+        # is an accident of where that extract was clipped: on New England,
+        # Boston fills all eight, south-east with exactly **one** candidate that
+        # does route. So the emptiness was never the property worth guarding —
+        # sufficiency is.
+        #
+        # 5 written out rather than imported from `looper`, deliberately. It is
+        # `SPAN_PICKS`, the number of band slices `plan` fills, so a direction
+        # holding fewer cannot honour the distance slider — but a test that
+        # imports the constant it asserts against passes at any value, including
+        # the 1 this exists to reject.
+        for name, count in available.items():
+            assert count >= 5, (
+                f"{name} offered on {count} candidate(s); regenerate would "
+                "return the same drive every press")
 
     def test_different_sectors_are_different_drives(self, router, planner):
         """The product claim behind the regenerate button: eight loops from one
