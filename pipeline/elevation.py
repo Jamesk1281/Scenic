@@ -45,6 +45,18 @@ TILE_URL = "https://elevation-tiles-prod.s3.amazonaws.com/terrarium/{z}/{x}/{y}.
 # (13 px either way), now stated in the units it is measured in.
 RELIEF_WINDOW_M = 750.0
 
+# The latitude the window is sized at. Fixed, rather than the mid-point of
+# whatever BBOX happens to be, because `win` is one integer for the whole
+# mosaic: derive it from the extent and widening the box silently rescores
+# every region already inside it. Pointing BBOX at New England moved the
+# mid-latitude from 42.05 to 44.20 and the window from 13 px to 15 px, which
+# back at Massachusetts' own latitude is 851 m of ground instead of 738 m —
+# 15% wider than the window score.py's RELIEF_FULL was fitted against, applied
+# to every MA road, with nothing in the output saying so. 42.05 is that fitted
+# latitude, so MA's numbers stay put and a second region is measured with the
+# same constant meaning the same distance.
+RELIEF_REF_LAT = 42.05
+
 # Below this share of the mosaic covered by real data, stop rather than write a
 # raster. Missing tiles are filled as sea level, so a hole does not read as
 # "no data" downstream — it reads as a flat plain ringed by a cliff of maximal
@@ -168,10 +180,10 @@ def main(out_dir: str, zoom: int = 11):
     # in ground meters, so the mercator scale factor at this region's latitude
     # has to come out first — see RELIEF_WINDOW_M.
     px_m = (right - left) / W                       # mercator meters per pixel
-    px_ground = px_m * math.cos(math.radians((s + n) / 2))
+    px_ground = px_m * math.cos(math.radians(RELIEF_REF_LAT))
     win = max(3, int(round(RELIEF_WINDOW_M / px_ground)) | 1)  # odd
-    print(f"pixel ~{px_m:.0f} mercator m (~{px_ground:.0f} m on the ground); "
-          f"relief window {win}px (~{win * px_ground:.0f} m)")
+    print(f"pixel ~{px_m:.0f} mercator m (~{px_ground:.0f} m on the ground at "
+          f"{RELIEF_REF_LAT:.2f}N); relief window {win}px (~{win * px_ground:.0f} m)")
     # Clamp ocean bathymetry (Terrarium encodes sea floor as deep negatives) to
     # sea level so coastal roads don't get spuriously huge land relief.
     land = np.clip(np.where(np.isnan(elev), 0.0, elev), 0.0, None)
