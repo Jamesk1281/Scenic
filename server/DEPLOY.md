@@ -19,7 +19,20 @@ the pipeline scripts:
   `access_ways.parquet` + `access_entries.parquet` (~59 MB, and **optional** —
   see the 2026-08-23 note below).
 - **Code**: `server/app.py`, and `pipeline/router.py` + `common.py` + `score.py`
-  (router imports the latter two for shared constants and the scoring weights).
+  + `looper.py` (router imports `common` and `score` for shared constants and
+  the scoring weights; `app.py` imports `looper` for `/api/loop`).
+
+> Prefer `git pull` over copying these by hand. The list above has been wrong
+> before — `looper.py` shipped with the loop endpoint and was not added here,
+> and a missing module is an `ImportError` at startup, which the tunnel reports
+> as a **502**. If you do copy by hand, copy the whole `pipeline/` directory.
+>
+> And a `git pull` only helps if the commit is actually on the remote. On
+> 2026-08-29 the merges were made locally and not pushed, so pulling on the
+> serving box fetched the *old* code, which then met the *new* parquets and
+> died with `KeyError: 'c_green'` — a 502 that looked exactly like a bad copy.
+> Check `git log --oneline -1` on both ends and confirm they match before
+> debugging anything else.
 
 Regenerate the graph locally with the pipeline (see the top-level README) when
 the scoring changes, then copy all three parquet files over.
