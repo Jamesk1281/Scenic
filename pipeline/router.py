@@ -164,7 +164,7 @@ PREF_CURVE = 2.0
 BEAUTY_TYPES = [
     ("water",  "water",       "c_water",  WEIGHTS["water"]),
     ("coast",  "coast",       "c_coast",  WEIGHTS["coast"]),
-    ("forest", "forest/park", "c_green",  WEIGHTS["green"]),
+    ("forest", "forest/park", "c_forest", WEIGHTS["forest"]),
     ("hills",  "hills",       "c_relief", WEIGHTS["relief"]),
     ("farm",   "farmland",    "c_farm",   WEIGHTS["farm"]),
     ("town",   "town",        "c_urban",  WEIGHTS["urban"]),
@@ -201,9 +201,26 @@ BASELINE = [
 # a DIST band in score.py is ever retuned below this.
 BREAKDOWN_MIN = 0.4
 
+# `c_forest` is blended, not banded: 0.5 * (OSM green polygon) + 0.5 * (measured
+# tree fraction). An OSM polygon on its own scores 0.5 and still clears
+# BREAKDOWN_MIN, so nothing that counted as green before stops counting — but a
+# road through genuinely wooded land that OSM never drew a polygon around needed
+# a tree fraction of 0.8 to clear 0.4, while the router was already steering
+# toward it from 0.0 upward through the continuous pref_matrix. 27% of
+# Massachusetts road-km has no polygon at all, so that gap showed as
+# "forest/park: 0 mi" on routes picked partly *for* their forest — the same
+# complaint d9ea612 fixed for water and town. 0.25 is "no polygon, but the
+# ~100 m box around the road is majority canopy", which is what the credit is for.
+FOREST_BREAKDOWN_MIN = 0.25
+
+# Per-column cuts for the components that are continuous rather than banded, for
+# which BREAKDOWN_MIN — the lowest partial *band* — is not a meaningful boundary.
+BREAKDOWN_OVERRIDE = {"c_forest": FOREST_BREAKDOWN_MIN}
+
 # The route-summary breakdown: km of road passing each beauty type. Derived from
 # BEAUTY_TYPES so the two never drift.
-SCENERY_BREAKDOWN = [(label, col, BREAKDOWN_MIN) for _, label, col, _ in BEAUTY_TYPES]
+SCENERY_BREAKDOWN = [(label, col, BREAKDOWN_OVERRIDE.get(col, BREAKDOWN_MIN))
+                     for _, label, col, _ in BEAUTY_TYPES]
 
 _TO_M = Transformer.from_crs(4326, CRS_METERS, always_xy=True)
 

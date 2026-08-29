@@ -57,20 +57,27 @@ five failed hard and all five worked at x3.
 
 What `pref` does here, and why the tab should not offer it
 ----------------------------------------------------------
-Less than it does point-to-point, and not monotonically. Measured at a Needham
-40 km target:
+Less than it does point-to-point, and not monotonically. Measured at 40 km
+targets from two starts:
 
-    pref     0.00   0.25   0.50   1.00
-    score    5.00   3.58   5.43   5.84
-    km >= 7   3.2    4.7   10.5   15.8
+    pref      0.00   0.25   0.50   0.75   1.00
+    Needham   4.76   5.41   5.67   5.73   5.74     score
+              2.3    4.1    7.0    8.7    8.7      km >= 7
+    Concord   5.86   5.86   4.99   6.15   6.19     score
+              9.2    9.2    7.6   11.3    9.9      km >= 7
 
 The endpoints behave — pref 1.0 is clearly better than pref 0.0, on both
-measures. The dip at 0.25 is real and has two causes, both structural rather
-than a bug to chase: candidate turnarounds are ranked by scenery whatever `pref`
-is, so a small non-zero pref moves the choice of *where to go* without buying
-the routing that would justify it; and the final choice among the built loops is
-made on distance and repeated road with no scenery term (see `_miss`), which is
-harmless at pref 1.0 where every candidate is pretty and is not at low pref.
+measures, from both starts. The dip in the middle is real, and *which* pref
+dips depends on the start: Concord loses 0.87 at pref 0.5, and Needham used to
+lose 1.42 at pref 0.25 before the forest component was rebuilt on measured tree
+cover (it read 5.00 / 3.58 / 5.43 / 5.84 under the old `c_green`). Do not read
+the dip as living at a particular slider position. It has two causes, both
+structural rather than a bug to chase: candidate turnarounds are ranked by
+scenery whatever `pref` is, so a middling pref moves the choice of *where to go*
+without buying the routing that would justify it; and the final choice among the
+built loops is made on distance and repeated road with no scenery term (see
+`_miss`), which is harmless at pref 1.0 where every candidate is pretty and is
+not below it.
 
 There is also a cache reason: `pref` is the one parameter that invalidates the
 two cached passes, where the distance slider does not. So the loop tab should

@@ -106,6 +106,7 @@ curl -L -o data/raw/massachusetts-latest.osm.pbf \
 # 2. features + score
 .venv/bin/python pipeline/extract.py   data/raw/massachusetts-latest.osm.pbf data/processed
 .venv/bin/python pipeline/elevation.py data/processed 11      # terrain relief raster
+.venv/bin/python pipeline/landcover.py data/processed         # WorldCover tree cover
 .venv/bin/python pipeline/score.py     data/processed         # scenic score per chunk
 .venv/bin/python pipeline/render.py    data/processed out     # heatmap + regional maps
 
@@ -138,7 +139,11 @@ runtime with a `SCENIC_API` environment variable. Command-line equivalent:
 
 Each ~400 m road chunk gets component scores in `[0,1]` for proximity to water,
 coastline, forest/parks, farmland and viewpoints, plus road curvature and local
-terrain relief. A weighted blend (tunable constants at the top of `score.py`)
+terrain relief. The forest component is half OSM's mapped woods/parks and half
+measured tree cover from ESA WorldCover (`landcover.py`), because OSM's polygons
+record land *designation* rather than vegetation and are three times more
+complete in Rhode Island than in Maine — see
+[`docs/geodata-sources-findings.md`](docs/geodata-sources-findings.md). A weighted blend (tunable constants at the top of `score.py`)
 produces a 0–10 composite, with penalties for highways and unpaved surfaces.
 The router charges a minutes-equivalent penalty per km of *unscenic* road, so the
 preference knob trades extra time for scenery.
@@ -146,8 +151,8 @@ preference knob trades extra time for scenery.
 Every constant in that blend is fitted to the *distribution* it produces, not
 guessed, because a single number silently reshapes 66,000 km of road. `score.py`
 prints a calibration report on each run — scale percentiles, per-component
-coverage, and benchmark roads — and the current numbers are: median road 4.0,
-p90 6.8, p99 9.2, with Greylock's Notch Road at 6.6 and the Mass Pike at 0.6.
+coverage, and benchmark roads — and the current numbers are: median road 4.4,
+p90 6.9, p99 9.1, with Greylock's Notch Road at 6.6 and the Mass Pike at 0.6.
 Three things that report is specifically there to catch, all of which were live
 at some point:
 
