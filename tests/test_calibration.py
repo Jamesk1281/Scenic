@@ -101,13 +101,23 @@ class TestBreakdownThreshold:
         """
         from router import BREAKDOWN_MIN, SCENERY_BREAKDOWN
 
+        # Only the banded components can be checked this way; a continuous
+        # measure's threshold is a genuine "how much counts" judgement rather
+        # than a band boundary. Exempted *by name*, because exempting whatever
+        # happens to take many values means a component that quietly becomes
+        # continuous — c_forest, once measured tree cover was blended into the
+        # OSM green flag — stops being checked without anyone noticing, which is
+        # exactly how the defect below gets back in.
+        continuous = {"c_relief", "c_forest"}
+
         for label, column, threshold in SCENERY_BREAKDOWN:
             values = np.unique(chunks[column].to_numpy())
-            # Only the banded components can be checked this way; relief is a
-            # continuous measure whose threshold is a genuine "how hilly counts"
-            # judgement rather than a band boundary.
-            if len(values) > 5:
+            if column in continuous:
                 continue
+            assert len(values) <= 5, (
+                f"{label}: {column} takes {len(values)} distinct values, so it "
+                f"is no longer banded. Give it a cut of its own in "
+                f"BREAKDOWN_OVERRIDE and name it in `continuous` here")
             bands = values[values > 1e-9]
             assert bands.min() >= threshold, (
                 f"{label}: score.py awards {column}={bands.min()} but the "
