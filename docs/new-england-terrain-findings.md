@@ -7,8 +7,10 @@ from the main checkout:
 .venv/bin/python pipeline/elevation.py data/processed-ne 11
 ```
 
-Exit 0. No source file changed, no constant changed. `data/processed` was not
-written to. Test suite after the run: **294 passed, 0 skipped** (128.6 s).
+Exit 0. `data/processed` was not written to, and no constant was changed. The
+first pass changed no source at all; `elevation.py` was then patched to fix the
+corrupt-pixel defect it turned up (Finding 1), and New England rebuilt off the
+warm cache. Test suite: **294 passed, 0 skipped**, before and after the patch.
 
 ## Verdict: the fix works, and the match is better than asked for
 
@@ -43,6 +45,11 @@ The numbers the fix exists to protect held:
 | area ≥ `RELIEF_FULL` (100 m) | 7.157% | 7.166% | 9.15% |
 
 The residual 0.008 m of median shift is entirely the border ring.
+
+(Those figures are from the first pass, before `elevation.py` was patched. After
+the fix the interior is bit-identical over 20,074,638 pixels rather than
+20,074,640: the two remaining are the corrupt Cape Cod pixels, now nodata. See
+"The fix".)
 
 ### One caveat that had to be cleared first
 
@@ -122,13 +129,72 @@ terrain score at weight 0.16** for any chunk midpoint landing in one of those
 blocks. Exactly the failure mode the brief anticipated from missing tiles,
 arriving instead through a door `MIN_COVERAGE` does not watch.
 
-Not fixed here — the brief scopes this task to build-and-verify, and any
-sanitisation changes relief values and needs its own verification. Suggested
-fix, for whoever takes it: reject physically impossible elevations before the
-filters, e.g. treat `elev > 9000` or `elev < -11000` as `NaN` alongside the
-existing hole handling, and report the count the way missing tiles are reported.
-That is a no-op for Massachusetts (its two bad pixels are negative and already
-clamped), so it would not disturb the live baseline.
+**Fixed** — see "The fix" below. It was reported rather than fixed on the first
+pass because the brief scoped that run to build-and-verify; fixing it was asked
+for afterwards.
+
+## The fix
+
+Two changes in `elevation.py`, no constant touched:
+
+**1. A physical sanity band, folded into the existing hole mask.**
+`ELEV_MAX_M = 9000.0` / `ELEV_MIN_M = -11000.0` — Everest is 8,849 m and
+Challenger Deep is −10,935 m, so nothing real falls outside. Out-of-band pixels
+become `NaN` *before* coverage is computed, so `MIN_COVERAGE` now guards this
+failure mode too, and they are reported per tile the way missing tiles are:
+
+```
+WARNING: 321 pixel(s) across 9 tile(s) decode outside -11000..9000 m; the source
+tiles are corrupt, not missing, so re-running will not fix them
+    z11/631/734: 23 px
+    z11/619/751: 210 px
+    ...
+elevation: -10722..1916 m (100.0% covered)
+```
+
+The band is unambiguous on the side that matters: the highest real pixel in New
+England is Mount Washington at 1,915.7 m and the next value up is 32,767, with
+nothing in between. It is deliberately *not* unambiguous on the negative side —
+there is no gap there, so the surviving `−10722` above is garbage bathymetry the
+band cannot distinguish from real sea floor. That costs nothing: the ocean clamp
+flattens every negative to 0 before the filters, and `elevation.tif` has no
+reader in the codebase (only `relief.tif` is consumed, by `score.py:335`).
+
+**2. Gaps are now invisible to the filters rather than substituted with 0 m.**
+This is the halo weakness listed as a minor note on the first pass, and fixing
+it is what makes the sanity band actually sufficient. The old code substituted
+`0.0` at every hole so the filters could run, which let a gap set the *minimum*
+for every pixel within `win // 2` of it — inventing relief equal to the
+surrounding ground, exactly the cliff the module exists to avoid. Now the
+maximum filter sees `-inf` at gaps and the minimum filter sees `+inf`, so a gap
+loses to every real neighbour in both passes and costs its own pixel and nothing
+around it. `land` is reused across both passes to hold the peak down.
+
+### Verified
+
+| | before | after |
+|---|---|---|
+| elevation range | −32768 … 32767 m | **−10722 … 1916 m** |
+| relief max | 32,767 m | **1,453 m** (White Mountains, plausible) |
+| relief px > 2,000 m | 2,281 | **0** |
+| NE relief median / p95 | 23.00 / 137.54 m | 23.00 / **137.51** m |
+
+- **Changes are confined to the defect.** 2,312 of 138,936,320 pixels changed
+  (0.0017%): 321 became nodata, 1,991 decreased, **none increased**, and
+  **zero changed pixels lie outside `win // 2` of a dropped pixel** — checked
+  with a dilation of the newly-nodata mask, which is the assertion that says the
+  fix touched the corruption and nothing else.
+- **Massachusetts is unmoved.** All **20,074,638** interior pixels that are
+  finite in both rasters are **bit-identical** to the live `relief.tif`. The
+  only difference in the whole MA footprint is the 2 corrupt Cape Cod pixels,
+  which used to report 3.996 m and 3.824 m of relief and are now nodata — both
+  in open water. Median stays 24.80 m and area ≥100 m stays 7.166%. Promoting
+  this would not rescore a single road.
+- **Cost.** Peak RSS 5.19 → **5.31 GB** (+2.4%, the extra boolean gap mask);
+  peak memory *footprint* fell 5.23 → 4.79 GB. 97.9 s wall off the warm cache.
+
+Verified against a copy of the pre-fix raster; the before/after comparison and
+the MA check are both measured, not inferred.
 
 ## Finding 2 — `docs/new-england-rollout.md` §0a is stale and contradicts the code
 
@@ -197,11 +263,9 @@ rediscovering a plan that exists rather than proposing a new one.
   `<out>/../raw/terrain` but nothing makes `<out>`, so `rasterio.open(out / ...)`
   would fail on a fresh path. Invisible in normal use because `data/processed`
   already exists. `mkdir -p data/processed-ne` was run first here.
-- `elevation.py:195` restores `NaN` only *at* a hole, not in the `win//2` halo
-  around it. Neighbouring pixels still filtered against the 0.0 substitute, so a
-  hole's rim keeps inflated relief rather than being marked unknown. No holes in
-  this run, so it did not bite — but it weakens the defence the comment above it
-  claims.
+- ~~`elevation.py:195` restores `NaN` only *at* a hole, not in the `win//2` halo
+  around it.~~ **Fixed** as part of the corrupt-pixel work above — gaps now lose
+  to every real neighbour in both filters instead of being substituted with 0 m.
 - Nothing was found in `pipeline/extract.py` or `pipeline/score.py`; neither was
   opened for editing. `score.py` was read only, to confirm how relief is consumed.
 
