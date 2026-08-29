@@ -29,8 +29,13 @@ final class LiveDriveTests: XCTestCase {
         do {
             let (data, _) = try await URLSession(configuration: configuration).data(from: url)
             return try JSONDecoder().decode(RouteResponse.self, from: data)
-        } catch {
-            throw XCTSkip("no Scenic API at \(Self.baseURL) — start server/serve.py")
+        } catch let error as URLError {
+            // `URLError` only. A decode failure means the server answered and
+            // the two sides disagree about the shape — which is the one thing
+            // these tests exist to catch, and which a blanket `catch` reported
+            // as a green skip indistinguishable from "no server running".
+            throw XCTSkip("no Scenic API at \(Self.baseURL) — start "
+                          + "server/serve.py (\(error.code))")
         }
     }
 

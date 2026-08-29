@@ -111,6 +111,49 @@ enum Fixture {
                               }))
     }
 
+    /// A point `east`/`north` metres from the fixture origin.
+    static func offset(east: Double, north: Double) -> CLLocationCoordinate2D {
+        let metersPerDegLon = metersPerDegLat * cos(origin.latitude * .pi / 180)
+        return CLLocationCoordinate2D(latitude: origin.latitude + north / metersPerDegLat,
+                                      longitude: origin.longitude + east / metersPerDegLon)
+    }
+
+    /// A loop that actually closes: north, east, south, west, back to the
+    /// coordinate it set off from, so `coordinates.last == coordinates.first`.
+    ///
+    /// This is the one property that makes a loop different from a route, and
+    /// `straightRoute` cannot express it — its last point is a whole route
+    /// length from its first, so a fix at the start is nowhere near the end and
+    /// nothing about arrival can be tested there. On a real loop those two are
+    /// the same place, and a fix beside the start node is as close to the
+    /// closing segment as to the opening one.
+    ///
+    /// The far point is the opposite corner, `2 * sideMeters` along.
+    static func closedLoopRoute(sideMeters: Double = 2_000,
+                                spacing: Double = 100) -> RouteFeature {
+        var points: [[Double]] = []
+        func add(_ east: Double, _ north: Double) {
+            let c = offset(east: east, north: north)
+            points.append([c.longitude, c.latitude])
+        }
+        for n in stride(from: 0.0, through: sideMeters, by: spacing) { add(0, n) }
+        for e in stride(from: spacing, through: sideMeters, by: spacing) { add(e, sideMeters) }
+        for n in stride(from: sideMeters - spacing, through: 0.0, by: -spacing) { add(sideMeters, n) }
+        for e in stride(from: sideMeters - spacing, through: 0.0, by: -spacing) { add(e, 0) }
+        let steps: [(CLLocationCoordinate2D, String, String?)] = [
+            (offset(east: 0, north: 0), "Head north on Test Road", "Test Road"),
+            (offset(east: sideMeters, north: sideMeters), "Turn right onto Far Road", "Far Road"),
+            (offset(east: 0, north: 0), "Arrive back where you started", ""),
+        ]
+        return decode(feature(coordinates: points, km: 4 * sideMeters / 1000,
+                              minutes: 8, steps: steps))
+    }
+
+    /// The far point of `closedLoopRoute`.
+    static func closedLoopTurnaround(sideMeters: Double = 2_000) -> CLLocationCoordinate2D {
+        offset(east: sideMeters, north: sideMeters)
+    }
+
     /// A route that runs 3 km north, turns around, and comes back to 500 m —
     /// so it passes close to a destination pin placed near the start long
     /// before the drive is over.

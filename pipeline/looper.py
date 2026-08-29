@@ -628,7 +628,14 @@ class LoopPlanner:
         # the road Dijkstra actually priced rather than an arbitrary parallel one.
         best = np.full(r.n_pairs, -1, dtype=np.int64)
         winners = np.where(w_slot == pair_w[r.slot_pair])[0]
-        best[r.slot_pair[winners]] = winners
+        # Written descending so the *lowest* slot index survives, because
+        # `Router._collect` settles the same tie with `argmin`, which also takes
+        # the lowest. Two parallel ways between one pair of junctions can carry
+        # bit-identical weights — `_apply_turn_restrictions` copies `d_minutes`
+        # verbatim when it duplicates a slot — and when the two disagreed, this
+        # module reported one road's km while `route()` drew the other's, and
+        # the retrace penalty landed on the edge the return leg was not using.
+        best[r.slot_pair[winners[::-1]]] = winners[::-1]
         edge = r.eidx[best]
         model = _CostModel(scores=scores, w_slot=w_slot, pair_w=pair_w,
                            pair_km=r.km[edge],

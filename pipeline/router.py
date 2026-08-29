@@ -207,6 +207,16 @@ SCENERY_BREAKDOWN = [(label, col, BREAKDOWN_MIN) for _, label, col, _ in BEAUTY_
 
 _TO_M = Transformer.from_crs(4326, CRS_METERS, always_xy=True)
 
+# How much further than the nearest road `snap` will look when it has a
+# heading to judge with. Wide enough to reach the carriageway above or below
+# at a grade separation, narrow enough that a well-aligned road across the
+# street can never win.
+SNAP_HEADING_SLACK_M = 20.0
+# How far a road may run from the driver's heading and still be the road they
+# are on. Compared without direction (a road carries traffic both ways), so
+# this is measured on 0..90.
+SNAP_HEADING_DEG = 40.0
+
 
 class Router:
     # Columns the maneuver generator needs, and the graph build that writes
@@ -917,15 +927,63 @@ class Router:
         """
         x, y = _TO_M.transform(lon, lat)
         point = shapely.Point(x, y)
+        aiming = heading if heading is not None and 0.0 <= heading < 360.0 else None
         e = int(self._edge_tree.nearest(point))
+        if aiming is not None:
+            e = self._aligned_edge(point, e, aiming)
         u, v = int(self.edge_u_idx[e]), int(self.edge_v_idx[e])
-        if heading is None or not 0.0 <= heading < 360.0:
+        if aiming is None:
             du = (self._nx[u] - x) ** 2 + (self._ny[u] - y) ** 2
             dv = (self._nx[v] - x) ** 2 + (self._ny[v] - y) ** 2
             node = u if du <= dv else v
         else:
-            node = self._forward_end(self._edge_geom_m[e], point, u, v, heading)
+            node = self._forward_end(self._edge_geom_m[e], point, u, v, aiming)
         return node, float(self._edge_geom_m[e].distance(point))
+
+    def _aligned_edge(self, point, nearest: int, heading: float) -> int:
+        """Which road the driver is on, among the ones they may be standing over.
+
+        `nearest` is picked in plan view from centrelines carrying no z and no
+        layer test, so at a grade separation it can name the road *underneath*:
+        a driver on I-93 crossing above Albany Street snaps to Albany Street
+        whenever its centreline is the closer of the two in plan view. Their
+        heading tells the two apart cleanly — the bearings differ by about 90
+        degrees — and it is already in hand, so `route` no longer plans from a
+        node on a road the car is not on.
+
+        Deliberately conservative in both directions. Only edges within
+        `SNAP_HEADING_SLACK_M` of the nearest are looked at, so a well-aligned
+        road further away can never win; and the nearest edge is kept unless it
+        is *itself* misaligned, so an ordinary snap on an ordinary street does
+        not change at all.
+        """
+        off = self._misalignment(nearest, point, heading)
+        if off <= SNAP_HEADING_DEG:
+            return nearest
+        reach = self._edge_geom_m[nearest].distance(point) + SNAP_HEADING_SLACK_M
+        best, best_off = nearest, off
+        for c in self._edge_tree.query(point.buffer(reach)):
+            c = int(c)
+            if c == nearest or self._edge_geom_m[c].distance(point) > reach:
+                continue
+            c_off = self._misalignment(c, point, heading)
+            if c_off < best_off:
+                best, best_off = c, c_off
+        return best if best_off <= SNAP_HEADING_DEG else nearest
+
+    def _misalignment(self, e: int, point, heading: float) -> float:
+        """How far edge `e` runs from `heading` where the driver stands, 0..90.
+
+        Undirected: a road carries traffic both ways, so a tangent 180 degrees
+        from the heading is the same road driven the other way. A geometry with
+        no tangent to take scores as maximally misaligned rather than winning
+        by default.
+        """
+        bearing = _tangent_at(self._edge_geom_m[e], point)
+        if bearing is None:
+            return 90.0
+        delta = abs(_turn_delta(heading, bearing))
+        return min(delta, 180.0 - delta)
 
     def _forward_end(self, line, point, u: int, v: int,
                      heading: float) -> int:
@@ -947,21 +1005,11 @@ class Router:
         Massachusetts, against a decision that is 180 degrees wide. The
         approximation is nowhere near the margin.
         """
-        coords = shapely.get_coordinates(line)
-        if len(coords) < 2:
+        tangent = _tangent_at(line, point)
+        if tangent is None:
             return u
-        # The vertex pair the driver is standing between. `project` gives the
-        # distance along the line to their nearest point on it.
-        step = np.hypot(np.diff(coords[:, 0]), np.diff(coords[:, 1]))
-        along = np.concatenate([[0.0], np.cumsum(step)])
-        k = int(np.searchsorted(along, line.project(point), side="right")) - 1
-        k = min(max(k, 0), len(coords) - 2)
-        dx, dy = coords[k + 1] - coords[k]
-        if dx == 0.0 and dy == 0.0:
-            return u
-        # Easting/northing, so a compass bearing is atan2(east, north). The
-        # geometry runs u -> v, so agreeing with the tangent means heading for v.
-        tangent = math.degrees(math.atan2(dx, dy)) % 360.0
+        # The geometry runs u -> v, so agreeing with the tangent means heading
+        # for v.
         return v if abs(_turn_delta(heading, tangent)) <= 90.0 else u
 
     def route(self, src_idx: int, dst_idx: int, pref: float, weights: dict = None,
@@ -1096,6 +1144,27 @@ def _bearing(p, q):
 def _compass(bearing):
     """Nearest of the 8 compass directions for a bearing."""
     return _COMPASS[int((bearing + 22.5) % 360 // 45)]
+
+
+def _tangent_at(line, point):
+    """Bearing of `line` where `point` sits on it, or None if it has none.
+
+    The vertex pair the driver is standing between, in projected metres:
+    easting/northing, so a compass bearing is atan2(east, north). `CRS_METERS`
+    is a conformal conic, so a grid bearing differs from a true one by under
+    1.5 degrees anywhere in Massachusetts.
+    """
+    coords = shapely.get_coordinates(line)
+    if len(coords) < 2:
+        return None
+    step = np.hypot(np.diff(coords[:, 0]), np.diff(coords[:, 1]))
+    along = np.concatenate([[0.0], np.cumsum(step)])
+    k = int(np.searchsorted(along, line.project(point), side="right")) - 1
+    k = min(max(k, 0), len(coords) - 2)
+    dx, dy = coords[k + 1] - coords[k]
+    if dx == 0.0 and dy == 0.0:
+        return None
+    return math.degrees(math.atan2(dx, dy)) % 360.0
 
 
 def _turn_delta(bearing_in, bearing_out):

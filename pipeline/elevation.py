@@ -173,13 +173,21 @@ def main(out_dir: str, zoom: int = 11):
     # sea level so coastal roads don't get spuriously huge land relief.
     land = np.clip(np.where(np.isnan(elev), 0.0, elev), 0.0, None)
     relief = (maximum_filter(land, size=win) - minimum_filter(land, size=win))
-    relief = relief.astype(np.float32)
+    # A hole is not flat ground. `elev` is NaN where no tile was fetched, and
+    # the substitution above turned that into 0 m so the filters would run;
+    # putting the NaN back is what lets a reader tell "no terrain here" from
+    # "terrain, and it is level" — see the nodata= on the write below.
+    relief = np.where(np.isnan(elev), np.nan, relief).astype(np.float32)
 
     prof = dict(
         driver="GTiff", height=H, width=W, count=1, dtype="float32",
         crs="EPSG:3857", transform=transform, compress="deflate", predictor=2,
     )
-    with rasterio.open(out / "relief.tif", "w", **prof) as dst:
+    # nodata, like elevation.tif below. Without it rasterio's `sample` hands a
+    # point outside the raster back as 0.0 — genuine flat terrain — so a run
+    # against a PBF this mosaic does not cover scored every road's relief as
+    # zero and said nothing, and `score.py`'s np.nan_to_num had no NaN to catch.
+    with rasterio.open(out / "relief.tif", "w", nodata=float("nan"), **prof) as dst:
         dst.write(relief, 1)
     with rasterio.open(out / "elevation.tif", "w", nodata=float("nan"), **prof) as dst:
         dst.write(elev.astype(np.float32), 1)

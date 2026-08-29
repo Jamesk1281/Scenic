@@ -86,6 +86,26 @@ final class NavigationModel {
     /// One threshold rather than two: joining is a latch, so it can't chatter.
     private static let offRouteMeters: Double = 60
 
+    /// How many consecutive fixes must read off-route before a reroute is asked
+    /// for, when the reading is close enough to the threshold to be in doubt.
+    /// `LocationManager` accepts a fix of up to 65 m stated error, which is
+    /// *looser* than the 60 m above, so one marginal sample could read off-route
+    /// on its own error alone — and that discarded a route the driver had never
+    /// left, resetting the banner to its first instruction and freezing step
+    /// advance for up to `joinGraceSeconds`. Every other transition in this file
+    /// demands persistence; this one used to fire on a single sample.
+    private static let offRouteFixesToReroute = 3
+
+    /// Past this, one fix is enough. No plausible GPS error puts a car 200 m
+    /// from the road it is driving on, so a reading this far out is a driver who
+    /// has genuinely turned off — and making them wait three fixes for a reroute
+    /// they obviously need would be its own defect. Hysteresis is for the
+    /// ambiguous band just past `offRouteMeters`, not for leaving the route.
+    private static let offRouteCertainMeters: Double = 200
+
+    /// Fixes in a row that have read off-route — see `offRouteFixesToReroute`.
+    private var consecutiveOffRouteFixes = 0
+
     /// How close counts as arriving.
     private static let arrivalMeters: Double = 40
 
@@ -197,6 +217,16 @@ final class NavigationModel {
     /// Latches once the driver has driven past the loop's far point, after which
     /// a loop reroutes like any other trip — home.
     private(set) var passedTurnaround = false
+
+    /// Whether a fix has yet matched on the near side of the loop's far point.
+    ///
+    /// A loop's line ends at the coordinate it starts from, so at the start a
+    /// fix is as close to the *closing* segment as to the opening one — and
+    /// `progress` is free to pick either, since nothing is known well enough to
+    /// give it a floor. Picking the closing one reads as a finished drive.
+    /// Until the driver has been seen before the far point, a match beyond it
+    /// is that ambiguity rather than progress.
+    private var seenBeforeTurnaround = false
 
     /// The waypoint a replacement route has to be pinned through, or nil when
     /// there is none to pin through.
@@ -694,6 +724,24 @@ final class NavigationModel {
                                   at: location)
         lastProgress = here
 
+        // A loop cannot begin already finished. Measured on a closed 8 km loop,
+        // a first fix 3-8 m from the start node — ordinary GPS error, or a car
+        // parked on the return road — matches the closing segment at 7,991 m
+        // along with 8 m remaining, which is inside `arrivalMeters`: the drive
+        // latched `arrived` from the driveway, `arrived` never un-latches, and
+        // the whole loop went unrecorded. Discard that match rather than take
+        // any state from it; the next fix, once the car is on the outbound leg,
+        // matches where it should. Proximity to the far point still releases
+        // this, so a driver who rejoins beyond it is not stuck here.
+        if let loop = loopTurnaround, !passedTurnaround, !seenBeforeTurnaround {
+            guard here.travelled <= loop.along else {
+                trace?.fix(location, progress: here,
+                           joined: hasJoinedRoute, step: currentStep)
+                return
+            }
+            seenBeforeTurnaround = true
+        }
+
         if !hasJoinedRoute {
             if here.offRoute <= Self.offRouteMeters {
                 hasJoinedRoute = true
@@ -749,6 +797,20 @@ final class NavigationModel {
         settleAwaitingJoin(here)
         trackSettling(here)
 
+        // How much evidence there is that the driver has actually left the road.
+        // An unambiguous excursion counts for the whole streak at once, so a
+        // genuine wrong turn still reroutes on the fix that reveals it. Nearer
+        // the threshold it takes persistence — and a fix whose stated error is
+        // itself comparable to the threshold says nothing either way, so it
+        // neither builds the streak nor clears it.
+        if here.offRoute > Self.offRouteCertainMeters {
+            consecutiveOffRouteFixes = Self.offRouteFixesToReroute
+        } else if location.horizontalAccuracy < Self.offRouteMeters {
+            consecutiveOffRouteFixes = here.offRoute > Self.offRouteMeters
+                ? consecutiveOffRouteFixes + 1
+                : 0
+        }
+
         // Strayed well off the line — re-route from here, keeping the same
         // scenic intent (or fastest, if that's what we're already following).
         // Every clause guards a different way this loop has actually run away:
@@ -764,7 +826,8 @@ final class NavigationModel {
            here.remaining > Self.noRerouteWithinMeters,
            now().timeIntervalSince(lastRerouteAttempt) > rerouteCooldown,
            hasMovedSinceLastReroute(location),
-           here.offRoute > Self.offRouteMeters {
+           here.offRoute > Self.offRouteMeters,
+           consecutiveOffRouteFixes >= Self.offRouteFixesToReroute {
             Task { await reroute(from: location, reason: "offroute") }
         }
     }
@@ -1197,5 +1260,7 @@ final class NavigationModel {
         // triggers its own replacement on the very next fix.
         awaitingJoin = true
         awaitingJoinSince = now()
+        // Evidence about the *old* line says nothing about this one.
+        consecutiveOffRouteFixes = 0
     }
 }
