@@ -48,7 +48,7 @@ struct TuneView: View {
             HStack {
                 Text(type.label).font(.subheadline.weight(.medium))
                 Spacer()
-                Text(emphasis(for: type.apiName))
+                Text(emphasis(for: type))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
@@ -62,20 +62,30 @@ struct TuneView: View {
                 .tint(.scenic)
                 Image(systemName: "plus").font(.caption2).foregroundStyle(.tertiary)
             }
+            // Only `town` carries one. A slider that starts pinned to the left
+            // with no explanation reads as a bug, not as a decision.
+            if let note = type.note {
+                Text(note).font(.caption2).foregroundStyle(.tertiary)
+            }
         }
     }
 
     /// A binding into the model's weight dictionary for one type.
     private func binding(for type: BeautyType) -> Binding<Double> {
         Binding(
-            get: { model.weights[type.apiName] ?? BeautyType.neutralWeight },
+            get: { model.weights[type.apiName] ?? type.defaultWeight },
             set: { model.weights[type.apiName] = $0 }
         )
     }
 
     /// A one-word hint of where a slider sits relative to neutral.
-    private func emphasis(for apiName: String) -> String {
-        let weight = model.weights[apiName] ?? BeautyType.neutralWeight
+    ///
+    /// Against `neutralWeight` and not against the type's own default, because
+    /// this describes the slider the user is looking at — town parked at zero
+    /// really does mean "less", and saying nothing there would be a worse
+    /// answer than saying so.
+    private func emphasis(for type: BeautyType) -> String {
+        let weight = model.weights[type.apiName] ?? type.defaultWeight
         if weight > BeautyType.neutralWeight + 0.05 { return "more" }
         if weight < BeautyType.neutralWeight - 0.05 { return "less" }
         return ""

@@ -9,6 +9,7 @@ import sys
 import pytest
 
 from conftest import DATA, ROOT, ROUTER_DATA
+from router import BEAUTIFUL_SCORE
 
 
 @pytest.fixture(scope="session")
@@ -53,10 +54,30 @@ def test_route_returns_both_options(client):
     for feature in body.values():
         assert feature["geometry"]["type"] == "LineString"
         props = feature["properties"]
-        assert {"km", "minutes", "mean_score", "scenery_km", "steps"} <= set(props)
+        assert {"km", "minutes", "mean_score", "beautiful_km", "beautiful_score",
+                "scenery_km", "steps"} <= set(props)
         assert props["km"] > 0 and props["minutes"] > 0
         assert 0 <= props["mean_score"] <= 10
         assert props["steps"][-1]["instruction"] == "Arrive at your destination"
+
+
+def test_a_route_reports_its_beautiful_km(client):
+    """The headline the app leads with, in place of the 0-10 mean.
+
+    A loop has carried this number since the loop tab shipped; a point-to-point
+    route now carries the same one, computed the same way and against the same
+    threshold, so "31 of your 50 miles" means one thing across both tabs.
+    """
+    body = client.get(f"/api/route?from={WORCESTER}&to={BOSTON}&pref=1.0").get_json()
+    for feature in body.values():
+        props = feature["properties"]
+        assert 0 <= props["beautiful_km"] <= props["km"]
+        # Travels with the number so the client never hardcodes the bar.
+        assert props["beautiful_score"] == BEAUTIFUL_SCORE
+        # A numpy float here is a 500 that only appears once a real number
+        # lands in a field nothing looked at.
+        assert isinstance(props["beautiful_km"], float)
+        assert isinstance(props["beautiful_score"], float)
 
 
 def test_scenic_trades_time_for_scenery(client):
@@ -66,6 +87,9 @@ def test_scenic_trades_time_for_scenery(client):
     fast, scenic = props["fastest"]["properties"], props["scenic"]["properties"]
     assert scenic["minutes"] > fast["minutes"]
     assert scenic["mean_score"] > fast["mean_score"]
+    # The legible half of the same trade, and the one the app now shows. Both
+    # arms are scored with the caller's weights, so the pair is on one scale.
+    assert scenic["beautiful_km"] > fast["beautiful_km"]
 
 
 def test_pref_zero_reuses_the_fastest_route(client):

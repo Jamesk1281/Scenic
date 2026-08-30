@@ -166,11 +166,11 @@ MIN_LEG_KM = 0.5
 # Needham, 622 km from Petersham — but the range where the answer is a drive.
 MIN_TARGET_KM, MAX_TARGET_KM = 5.0, 200.0
 
-# The score at or above which a road counts as properly beautiful, for the
-# headline "19 of your 40 km" number. Chosen because it separates a scenic loop
-# from a fast one 188-fold (18.8 km against 0.1 km at a Needham 40 km target)
-# where the means only manage 6.03 against 1.94.
-BEAUTIFUL_SCORE = 7.0
+# The score at or above which a road counts as properly beautiful — see
+# `router.BEAUTIFUL_SCORE`, which is where it now lives because point-to-point
+# routes report the same number. Re-exported rather than moved outright, so
+# `from looper import BEAUTIFUL_SCORE` keeps working for server/app.py.
+from router import BEAUTIFUL_SCORE  # noqa: E402,F401
 
 
 @dataclass
@@ -555,7 +555,7 @@ class LoopPlanner:
                                                   np.array([turnaround]))[0])],
             target_km=0.0,          # set by `plan`, which knows what was asked
             repeated_km=_repeated_km(route),
-            beautiful_km=_beautiful_km(route),
+            beautiful_km=route.beautiful_km,
         )
 
     def _path_edges(self, cost, path):
@@ -778,14 +778,6 @@ def _repeated_km(route):
     if not repeats.any():
         return 0.0
     return float(route.edges["length_m"].to_numpy()[repeats].sum() / 1000.0)
-
-
-def _beautiful_km(route):
-    """Kilometres of a loop on roads scoring `BEAUTIFUL_SCORE` or better."""
-    scores = (route.edges["score"].to_numpy() if route.scores is None
-              else np.asarray(route.scores))
-    length = route.edges["length_m"].to_numpy()
-    return float(length[scores >= BEAUTIFUL_SCORE].sum() / 1000.0)
 
 
 def _weights_key(weights):

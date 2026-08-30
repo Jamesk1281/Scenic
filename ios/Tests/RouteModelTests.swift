@@ -109,4 +109,43 @@ final class RouteModelTests: XCTestCase {
         XCTAssertNil(model.errorText, "computeRoute should not have reached the network at all")
         XCTAssertFalse(model.isLoading)
     }
+
+    // MARK: - Beauty weights out of the box
+
+    func test_a_fresh_model_starts_every_type_at_its_own_default() {
+        let model = RouteModel()
+        for type in BeautyType.all {
+            XCTAssertEqual(model.weights[type.apiName], type.defaultWeight,
+                           "\(type.apiName) did not start at its default")
+        }
+        // The one that matters: this is what puts `w_town=0` on the wire.
+        XCTAssertEqual(model.weights["town"], 0.0)
+    }
+
+    func test_an_untouched_model_does_not_claim_to_be_tuned() {
+        // `isTuned` lights the Tune button. Measured against neutral rather
+        // than against each type's default, shipping `town` at zero would light
+        // it on every launch and the highlight would stop meaning anything.
+        XCTAssertFalse(RouteModel().isTuned)
+    }
+
+    func test_moving_a_slider_marks_the_model_tuned() {
+        let model = RouteModel()
+        model.weights["town"] = BeautyType.neutralWeight
+        XCTAssertTrue(model.isTuned, "asking for town back is a tuning")
+    }
+
+    func test_reset_restores_the_defaults_and_not_neutral() {
+        // Reset means "undo my tuning". Resetting town to 1.0 would quietly
+        // switch on the one type the app deliberately ships off.
+        let model = RouteModel()
+        model.weights["town"] = 2.0
+        model.weights["coast"] = 0.0
+
+        model.resetWeights()
+
+        XCTAssertEqual(model.weights["town"], 0.0)
+        XCTAssertEqual(model.weights["coast"], BeautyType.neutralWeight)
+        XCTAssertFalse(model.isTuned)
+    }
 }
