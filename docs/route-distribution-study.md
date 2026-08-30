@@ -1,7 +1,7 @@
 # What the router actually offers, across a thousand routes
 
-**Status: run.** 983 town-to-town trips on the shipping graph — 4,232 routes —
-four questions answered, one of them only partly. Everything below is measured
+**Status: run.** 983 town-to-town trips on the shipping graph — 5,192 routes —
+all four questions answered. Everything below is measured
 unless it says otherwise. No production code was touched: this study adds
 `tools/route_census.py` and the three files in `docs/route-census/`, and nothing
 in `pipeline/`, `server/` or `ios/` moved. `pytest tests/ -q` is 294 passed.
@@ -15,10 +15,11 @@ measured before it; that rebuild has already moved published separations once.
 **Reproduce it:**
 
 ```bash
-.venv/bin/python tools/route_census.py --processed data/processed-ne
+.venv/bin/python tools/route_census.py --processed data/processed-ne \
+    --sweep-pairs 252
 ```
 
-19.5 minutes, one process, seed 20260829 recorded in the output. Both
+21 minutes, one process, seed 20260829 recorded in the output. Both
 directories live in the main checkout, not in a worktree; run it from there or
 pass absolute paths. Re-cut any
 threshold from the CSVs without re-routing:
@@ -74,7 +75,8 @@ weight clamps, and the geometry nobody reads — but it buys control, not speed.
 What actually sets the cost is graph size: `scipy.sparse.csgraph.dijkstra` is
 single-source-to-every-node with no early exit, so a 15 km trip and a 190 km
 trip cost the same, and moving from Massachusetts to New England (2.6x the
-nodes) took a route from 0.087 s to **0.277 s**. Budget by graph, not by trip.
+nodes) took a route from 0.087 s to **0.25–0.28 s** (0.2765 and 0.2463 on the
+two full runs). Budget by graph, not by trip.
 
 **3. The islands fail earlier than expected, and never as "no path".**
 `pipeline/graph.py` keeps only the largest strongly connected component, so
@@ -95,8 +97,13 @@ landed in the ocean and over-sampled the empty north; that trap was called in
 the brief and avoided.
 
 Each pair was routed four times at pref 0.5 — fastest and scenic, under shipped
-weights and under town-off — and 60 of them (15 per band) got a five-point pref
-sweep as well. 4,232 routes, 1,170 s.
+weights and under town-off — and 252 of them (63 per band) got a five-point pref
+sweep as well. 5,192 routes, 1,279 s.
+
+The sweep was widened from 60 pairs to 252 in a second full run, which re-routed
+everything from the same seed. All 4,232 routes of the first run came back
+**byte-identical** — 0 rows changed, 960 added — so the tool is deterministic
+and the numbers below are not a lucky draw.
 
 **Coverage**
 
@@ -296,81 +303,98 @@ and misses 27 of the 30 strictly-worse ones. Extending the warning beyond
 
 ## Q3 — is `pref` monotone, and is 0.50 a sensible default?
 
-60 pairs, 15 per band, sweeping pref ∈ {0, 0.25, 0.50, 0.75, 1.00} at shipped
+252 pairs, 63 per band, sweeping pref ∈ {0, 0.25, 0.50, 0.75, 1.00} at shipped
 weights. Comparing across pref is valid: pref enters the edge cost, not the
 score blend, so all five routes of a pair are measured with one ruler.
 
-- **Minutes are monotone: 0 violations of 60** (CI 0.0–6.0).
-- **Beautiful-km is not: 5 of 60** go backwards somewhere (8.3%, CI 3.6–18.1).
-- 7 of 60 (11.7%) return the *same route* at pref 0 and pref 0.5.
+- **Minutes are monotone: 0 violations of 252** (CI 0.0–1.5).
+- **Beautiful-km is not: 37 of 252** dip somewhere (**14.7%**, CI 10.8–19.6).
+- 28 of 252 (11.1%) return the *same route* at pref 0 and pref 0.5.
 
-The split is exactly what the cost function predicts and is worth stating as
-theory, because it says which of the two results is a fact about the router and
-which is a fact about the metric. Dijkstra minimises
-`minutes + pref² · BETA · Σ km(1 − score/10)`. By the standard parametric
-argument, raising the multiplier cannot lower the chosen route's time or raise
-its penalty — so **monotone minutes is guaranteed**, and the 0/60 is a passed
-self-check rather than a discovery. Beautiful-km is a *threshold* functional
-(km scoring ≥ 7.0), which the objective never optimises, so nothing guarantees
-it and 8.3% is the real measurement.
+The split is what the cost function predicts, and the theory says which result
+is a fact about the router and which is a fact about the metric. Dijkstra
+minimises `minutes + pref² · BETA · Σ km(1 − score/10)`. By the standard
+parametric argument, raising the multiplier cannot lower the chosen route's time
+or raise its penalty — so **monotone minutes is guaranteed**, and 0 of 252 is a
+passed self-check, now with a tight bound on it. Beautiful-km is a *threshold*
+functional (km scoring ≥ 7.0) that the objective never optimises, so nothing
+guarantees it, and 14.7% is the real measurement.
 
-| pair | pref 0 | pref 0.25 | pref 0.5 | pref 0.75 | pref 1 |
-|---|---|---|---|---|---|
-| 25-50:0012 | 1.35 | **0.83** | 4.31 | 4.31 | 4.78 |
-| 50-100:0012 | 2.07 | 2.07 | 20.83 | **18.30** | 19.33 |
-| 50-100:0014 | 11.71 | 11.71 | 32.90 | **32.54** | 33.26 |
-| 100-200:0010 | 8.85 | **7.66** | 40.03 | 48.42 | 67.71 |
-| 100-200:0012 | 23.03 | **19.03** | 43.61 | 43.61 | 46.55 |
+**The 60-pair estimate was low, and its shape was wrong.** The first pass put
+this at 8.3% (CI 3.6–18.1) and reported that the dips concentrated at the bottom
+of the slider. At 252 pairs the rate is 14.7% — inside the old interval, but in
+its upper half — and the dips are spread across the whole travel and all four
+bands:
 
-Three of the five dip at **0 → 0.25**: a small non-zero pref moves the route
-without buying enough to pay for the move. That is the same symptom
-`docs/loop-routes-design.md` §5 records for loops, arriving by a different
-route — there is no turnaround ranking here, just a threshold metric that the
-objective does not track. The endpoints behave in all five cases, as they do
-for loops.
+| where the dip happens | 0 → 0.25 | 0.25 → 0.5 | 0.5 → 0.75 | 0.75 → 1 |
+|---|---|---|---|---|
+| dips | 14 | 5 | 13 | 8 |
+
+| pairs with a dip, by band | 10–25 km | 25–50 km | 50–100 km | 100–200 km |
+|---|---|---|---|---|
+| | 8/63 | 13/63 | 7/63 | 9/63 |
+
+That is the correction the wider sample bought. "The bottom of the slider is
+where it misbehaves" was an artifact of 60 pairs; `0.5 → 0.75` is very nearly as
+common as `0 → 0.25`. It also lines the finding up with
+`docs/loop-routes-design.md` §5, which records a mid-slider dip for loops whose
+position depends on the start (Needham at 0.25, Concord at 0.5) — a spread
+across the middle, not a bottom-end defect. The loop mechanism (turnarounds
+ranked by scenery whatever pref is) does not exist here, so this is the same
+symptom reached by a different road.
+
+**But the dips are mostly small, and mostly recover.** Across the 40 dips the
+median loss is **0.34 beautiful miles**; 9 exceed 1 mile and 2 exceed 5 (worst
+8.92). Of the 37 pairs that dip, pref 1.0 is still that pair's best setting on
+20 of them, and the median shortfall of pref 1.0 against the pair's own best is
+0.04 miles. Most importantly:
+
+> **Only 2 of 252 pairs (0.8%) end up with fewer beautiful miles at pref 1.0
+> than at pref 0.** The endpoints behave; the middle wobbles.
+
+So the slider keeps the promise a user actually reads off it — right is more
+scenic than left — while not being strictly ordered in between. That matters
+only if something is built on strict ordering (a "more scenery" stepper, a
+binary search over pref, a test asserting monotonicity). Nothing today is.
 
 **What the slider is worth**
 
 | step | strength (pref²) | cum. extra min (p50) | cum. beautiful mi (p50) | marginal mi/min (p50) | step changes nothing |
 |---|---|---|---|---|---|
 | 0 (definitional) | 0.00 | 0.0 | 0.00 | — | — |
-| 0 → 0.25 | 0.06 | **0.1** | **0.03** | 0.01 | 33% |
-| 0.25 → 0.5 | 0.25 | 20.0 | 5.24 | 0.25 | 17% |
-| 0.5 → 0.75 | 0.56 | 24.4 | 6.88 | 0.24 | 25% |
-| 0.75 → 1 | 1.00 | 25.6 | 9.32 | 0.27 | 30% |
+| 0 → 0.25 | 0.06 | **0.5** | **0.20** | 0.09 | 33% |
+| 0.25 → 0.5 | 0.25 | 16.5 | 5.06 | 0.21 | 16% |
+| 0.5 → 0.75 | 0.56 | 24.5 | 7.01 | 0.23 | 22% |
+| 0.75 → 1 | 1.00 | 28.1 | 9.20 | 0.27 | 28% |
 
 | span | extra min (p50) | beautiful mi (p50) | per-pair mi/min (p50) | aggregate mi/min |
 |---|---|---|---|---|
-| pref 0 → 0.5 | 20.0 | 5.24 | 0.33 | 0.35 |
-| pref 0.5 → 1 | 5.6 | 2.26 | 0.35 | **0.44** |
-| pref 0 → 1 | 25.6 | 9.32 | 0.38 | 0.38 |
+| pref 0 → 0.5 | 16.5 | 5.06 | 0.27 | 0.34 |
+| pref 0.5 → 1 | 7.3 | 2.33 | 0.36 | **0.41** |
+| pref 0 → 1 | 28.1 | 9.20 | 0.35 | 0.36 |
 
-**The bottom quarter of the slider is dead.** The control is linear —
-`Slider(value: $model.pref, in: 0...1)`, `ios/Sources/RoutePanel.swift:376` —
+**The bottom quarter of the slider does almost nothing.** The control is linear
+— `Slider(value: $model.pref, in: 0...1)`, `ios/Sources/RoutePanel.swift:376` —
 but `PREF_CURVE = 2.0`, so strength is pref², and pref 0.25 is 6% strength:
-median 0.1 extra minutes and 0.03 extra beautiful miles over pref 0, with a
-third of pairs returning an identical route. A user who nudges the slider off
-zero gets nothing, and three of the five non-monotonicities live there.
+median 0.5 extra minutes and 0.20 extra beautiful miles over pref 0, with a
+third of pairs returning an identical route. The first quarter of the travel
+buys 2% of what the whole slider buys.
 
-**0.50 is defensible, and it is not the efficient point.** It takes **71%** of
-what pref 1.0 gains for **75%** of what pref 1.0 spends — very slightly worse
-than pro-rata. The top half of the travel is the cheaper half (aggregate 0.44
-mi/min against 0.35 for the bottom half), because most of the time cost is paid
-crossing 0.25 → 0.5 and the route has largely settled by 0.5. So: nothing here
-argues 0.50 is *wrong*, and it lands just past the expensive step; but "the
-midpoint is the balanced choice" is not what the numbers say, and the usable
-range is really 0.25–1.0 rather than 0–1.
+**0.50 is defensible, and it is not the efficient point.** It takes **67%** of
+what pref 1.0 gains for **71%** of what pref 1.0 spends — slightly worse than
+pro-rata. The top half of the travel is the cheaper half (aggregate 0.41 mi/min
+against 0.34 for the bottom half), because most of the time cost is paid
+crossing 0.25 → 0.5 and the route has largely settled by 0.5. Nothing here
+argues 0.50 is *wrong*: it sits just past the expensive step and delivers two
+thirds of the available scenery. But "the midpoint is the balanced choice" is
+not what the numbers say, and the usable range is really 0.25–1.0, not 0–1.
 
-**This is the question the sample cannot fully settle.** 60 pairs puts the
-beautiful-km violation rate at 8.3% with a CI of **3.6–18.1%** — wide enough to
-cover "rare curiosity" and "one trip in six". It is enough to say the direction
-of the effect (dips concentrate at the bottom of the slider, endpoints behave)
-and enough to have found five concrete examples. It is not enough to quote a
-rate. **250 sweep pairs would bring the CI to about ±3.5 points** at this
-estimate, and costs 250 × 5 ≈ 1,250 routes ≈ 6 minutes: cheap, and worth doing
-before anything is changed on the strength of the 8.3%.
-
----
+**Q3 is now settled.** The first pass said it was inconclusive at 60 pairs and
+predicted 250 would close the interval to about ±3.5 points; the actual
+half-width is ±4.4, because the true rate turned out higher than the 8.3% the
+prediction was sized on. Either way the question no longer turns on the
+interval: 0/252 on minutes and 2/252 on the endpoints are the two numbers a
+decision would rest on, and both are tight.
 
 ## Q4 — does turning `town` off hold up beyond three pairs?
 
@@ -445,8 +469,11 @@ have cost the two most useful sections here.
 
 ## What this cannot settle
 
-1. **Q3's non-monotonicity rate.** 8.3% with a CI of 3.6–18.1 at 60 pairs. Fix
-   with 250 sweep pairs (~6 minutes); see Q3.
+1. **Why the 37 pairs dip.** Q3 now measures the rate (14.7%) and bounds the
+   consequence (2/252 endpoints), but not the cause. Each dip is one pair whose
+   chosen path changes; reading a few of the 9 dips larger than a mile off the
+   map would say whether they share a mechanism or are just the threshold at
+   7.0 slicing a continuum. The pair IDs are in the CSV.
 2. **Whether any of these warnings should exist.** The census gives fire-rates
    for a stated rule. It cannot say what a driver does when warned, or what
    fraction of a "little to offer" trip the driver was going to take anyway.
@@ -467,7 +494,7 @@ have cost the two most useful sections here.
   re-analyses without re-routing.
 - `docs/route-census/census-pairs.csv` — 1,000 rows: the sample, snap offsets,
   status, sweep membership.
-- `docs/route-census/census-routes.csv` — 4,232 rows: one per route, with km,
+- `docs/route-census/census-routes.csv` — 5,192 rows: one per route, with km,
   minutes, `mean_score`, beautiful-km and the six `scenery_km` columns.
 - `docs/route-census/census-summary.json` — build dir, build date, seed,
   weight sets, status counts, timings.

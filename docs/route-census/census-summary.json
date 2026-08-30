@@ -4,7 +4,7 @@
   "place_points": 5421,
   "seed": 20260829,
   "per_band": 250,
-  "sweep_pairs_per_band": 15,
+  "sweep_pairs_per_band": 63,
   "beautiful_score": 7.0,
   "default_pref": 0.5,
   "weight_sets": {
@@ -66,9 +66,9 @@
     }
   },
   "fastest_path_differs_across_weights": 0,
-  "routes": 4232,
-  "routes_attempted": 4232,
-  "router_load_s": 25.7,
-  "elapsed_s": 1170.1,
-  "s_per_route": 0.2765
+  "routes": 5192,
+  "routes_attempted": 5192,
+  "router_load_s": 22.7,
+  "elapsed_s": 1279.0,
+  "s_per_route": 0.2463
 }
