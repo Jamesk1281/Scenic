@@ -592,6 +592,38 @@ final class NavigationModel {
         }
     }
 
+    /// A message about something the driver just *tried to do*, cleared after a
+    /// few seconds.
+    ///
+    /// Deliberately not `recordingProblem`. That one is a standing condition of
+    /// the drive — it is true until the trace starts working again, and it is
+    /// how the screen avoids looking normal while recording nothing. This one is
+    /// a reply to a tap. Folding a refused switch into the recording banner
+    /// would make it look like the trace had broken, and would then be cleared
+    /// by the next fix arriving.
+    private(set) var actionProblem: String?
+
+    /// Clears `actionProblem` on its own. Cancelled and replaced by the next
+    /// message, so two taps in a row don't leave the first one's timer to wipe
+    /// the second one's text.
+    private var actionProblemTask: Task<Void, Never>?
+
+    /// Say something to the driver about the tap they just made, and take it
+    /// back down again.
+    private func report(_ message: String) {
+        actionProblem = message
+        actionProblemTask?.cancel()
+        actionProblemTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(Self.actionProblemSeconds))
+            guard !Task.isCancelled else { return }
+            self?.actionProblem = nil
+        }
+    }
+
+    /// Long enough to read at a glance while driving, short enough not to sit
+    /// under the trip stats for the rest of the trip.
+    private static let actionProblemSeconds: TimeInterval = 6
+
     /// Why this drive isn't being recorded, or nil if it is.
     ///
     /// Surfaced on the nav screen. A test drive is expensive and unrepeatable —
@@ -1042,7 +1074,28 @@ final class NavigationModel {
     // MARK: - Re-routing
 
     /// Abandon the scenic route and head straight there the quick way.
-    func switchToFastest(from location: CLLocation) async {
+    ///
+    /// Takes an *optional* location so the refusal lives here rather than in the
+    /// view. `NavView` used to wrap the call in `if let here =
+    /// locationManager.location` with no `else`, and `location` is nil until a
+    /// fix passes `isUsable` — a cold start in a garage, an urban canyon,
+    /// location denied. So the driver read "This gives up the scenic route for
+    /// the rest of the drive", confirmed it, and nothing happened: same green
+    /// line, same button, no message. This is the control someone reaches for
+    /// when the scenic route has gone wrong, which makes a silent no-op the
+    /// worst of the available outcomes.
+    ///
+    /// It refuses rather than falling back to the last known fix. `switchToFastest`
+    /// reroutes *from* what it is handed, and a stale Wi-Fi-derived location puts
+    /// the driver a street or two from where they are — which is the entire
+    /// reason `LocationManager.isUsable` exists. A reroute from the wrong street
+    /// is worse than no reroute, because it looks like it worked.
+    func switchToFastest(from location: CLLocation?) async {
+        guard let location else {
+            report("Can't switch yet — waiting for a GPS fix.")
+            return
+        }
+        actionProblem = nil
         let previousPref = pref
         let previousReroutes = consecutiveReroutes
         let previousOnRouteSince = onRouteSince

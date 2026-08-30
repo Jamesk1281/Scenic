@@ -96,10 +96,12 @@ struct NavView: View {
         .confirmationDialog("Switch to the fastest route?",
                             isPresented: $confirmingFastest,
                             titleVisibility: .visible) {
+            // No `if let` around this. There used to be one, with no `else`, so
+            // confirming the switch with no usable fix in hand did nothing at
+            // all and said nothing about it. `switchToFastest` takes the
+            // optional now and answers for itself.
             Button("Switch to fastest", role: .destructive) {
-                if let here = locationManager.location {
-                    Task { await nav.switchToFastest(from: here) }
-                }
+                Task { await nav.switchToFastest(from: locationManager.location) }
             }
             Button("Keep the scenic route", role: .cancel) {}
         } message: {
@@ -191,10 +193,23 @@ struct NavView: View {
                         .foregroundStyle(.orange)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
+                // The reply to a tap, which is a different thing from the state
+                // of the recording above it — a refused "switch to fastest"
+                // must not read as a broken trace. Same place, because it is
+                // the same question ("did that do anything?"), and same rule:
+                // never above the maneuver the driver is about to miss.
+                if let problem = nav.actionProblem {
+                    Label(problem, systemImage: "exclamationmark.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .transition(.opacity)
+                }
             }
             .padding(.horizontal)
             .padding(.vertical, 10)
             .background(.ultraThinMaterial)
+            .animation(.snappy, value: nav.actionProblem)
         }
     }
 
@@ -285,14 +300,29 @@ struct NavView: View {
             UINotificationFeedbackGenerator()
                 .notificationOccurred(verdict == .nice ? .success : .warning)
         } label: {
-            Image(systemName: symbol)
-                .font(.title3)
+            // The words, not only the glyph. A thumbs-down on a map is as
+            // easily read as "hide this" or "worse route" as "dull road", and
+            // the two sentences these buttons actually mean lived only in an
+            // `accessibilityLabel` — visible to VoiceOver and to nobody else.
+            Label(label, systemImage: symbol)
+                .font(.subheadline.weight(.semibold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
                 .foregroundStyle(tint)
                 // Tall, and as wide as half the screen. The generous frame *is*
                 // the feature: this has to be hittable without aiming.
                 .frame(maxWidth: .infinity)
                 .frame(height: verdictHeight)
-                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+                // `.ultraThinMaterial` over a `Map` is not a background, it is a
+                // tint: mid-drive over light tiles the POI labels underneath
+                // ("Beth Israel", "Needham Coin and…") read straight through
+                // both buttons, which made the only control on this screen that
+                // collects data the hardest one on it to see. `.regularMaterial`
+                // is opaque enough to stop that, and the stroke gives each
+                // button an edge over a map whose own colours it cannot predict.
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+                .overlay(RoundedRectangle(cornerRadius: 14)
+                    .stroke(tint.opacity(0.55), lineWidth: 1))
         }
         .buttonStyle(.plain)
         .accessibilityLabel(label)

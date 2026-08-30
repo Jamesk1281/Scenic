@@ -147,7 +147,7 @@ final class RouteModel {
                 return
             }
             let coordinate = match.placemark.coordinate
-            let name = displayName(for: match, fallback: label)
+            let name = PlaceNaming.displayName(for: match, fallback: label)
             switch role {
             case .start: start = coordinate; startQuery = name
             case .end:   end = coordinate;   endQuery = name
@@ -187,18 +187,13 @@ final class RouteModel {
     }
 
     /// Put a street name on the "My Location" start once reverse geocoding
-    /// answers. Worth the extra call: "My Location" on its own gives the driver
-    /// no way to notice we've placed them on the wrong road.
+    /// answers. See `PlaceNaming`, which the loop tab shares.
     private func nameCurrentLocation(_ fix: CLLocation) async {
-        guard let placemark = try? await CLGeocoder().reverseGeocodeLocation(fix).first
-        else { return }
+        guard let label = await PlaceNaming.currentLocationLabel(for: fix) else { return }
         // The user may have changed the start while we were waiting.
-        guard startQuery == "My Location", start?.matches(fix.coordinate) == true else { return }
-
-        let here = [placemark.thoroughfare, placemark.locality]
-            .compactMap { $0 }
-            .joined(separator: ", ")
-        if !here.isEmpty { startQuery = "My Location · \(here)" }
+        guard startQuery == PlaceNaming.myLocation,
+              start?.matches(fix.coordinate) == true else { return }
+        startQuery = label
     }
 
     // MARK: - Editing the trip
@@ -324,19 +319,4 @@ final class RouteModel {
         }
         isLoading = false
     }
-}
-
-/// A label a human would recognise for a search result.
-///
-/// `MKMapItem.name` on its own is often bare to the point of being wrong-looking
-/// — "Main Street", "Post Office", a bare house number — so we append the town
-/// unless the name already carries it. The field's text is the only confirmation
-/// the user gets that we resolved the place they actually meant.
-private func displayName(for item: MKMapItem, fallback: String) -> String {
-    let placemark = item.placemark
-    let name = item.name ?? placemark.name ?? fallback
-    guard let town = placemark.locality, !name.localizedCaseInsensitiveContains(town) else {
-        return name
-    }
-    return "\(name), \(town)"
 }

@@ -84,6 +84,83 @@ final class LocationManagerTests: XCTestCase {
         XCTAssertNil(model.locationManager.onFix)
     }
 
+    // MARK: - Two taps must not strand a task
+
+    func test_two_callers_waiting_on_the_permission_prompt_both_resume() async {
+        // The defect. `pendingAuth` was one continuation, and a second caller
+        // overwrote it without resuming the first — so that first task hung for
+        // the life of the process (`SWIFT TASK CONTINUATION MISUSE`) with its
+        // spinner still turning in the start field. Two callers is ordinary:
+        // "My Location" is both a button in the field and a row in the
+        // suggestion list, and `isLocatingUser` is set inside the `Task` body
+        // rather than at tap time, so two quick taps both get through.
+        let manager = LocationManager()
+        // CoreLocation delivers one authorization callback of its own when a
+        // manager is created. Let it land before the waiters register, so this
+        // test answers the prompt rather than racing that callback.
+        try? await Task.sleep(for: .milliseconds(100))
+
+        let answered = expectation(description: "both callers resume")
+        answered.expectedFulfillmentCount = 2
+        let statuses = Answers()
+        for _ in 0..<2 {
+            Task { @MainActor in
+                statuses.received.append(await manager.authorizationDecision())
+                answered.fulfill()
+            }
+        }
+
+        // Both have to be parked before the prompt is answered — that overlap
+        // is the whole bug, and a test that answered first would pass on the
+        // broken code too.
+        var spins = 0
+        while manager.waitingOnAuthorization < 2 && spins < 1_000 {
+            await Task.yield()
+            spins += 1
+        }
+        XCTAssertEqual(manager.waitingOnAuthorization, 2, "both should be waiting")
+
+        manager.authorizationResolved(.authorizedWhenInUse)
+
+        await fulfillment(of: [answered], timeout: 2)
+        XCTAssertEqual(statuses.received, [.authorizedWhenInUse, .authorizedWhenInUse])
+        XCTAssertEqual(manager.waitingOnAuthorization, 0)
+    }
+
+    func test_nobody_is_released_on_notDetermined() async {
+        // `.notDetermined` is the state *before* the prompt is answered, so it
+        // is not an answer. Waking a caller on it is the tempting wrong fix: it
+        // resumes, fails the authorization guard in `currentLocation()`, and
+        // puts "Couldn't get a location fix. Try again in a moment." on screen
+        // over the system prompt the driver is still being asked to answer.
+        let manager = LocationManager()
+        try? await Task.sleep(for: .milliseconds(100))
+
+        let answered = expectation(description: "the caller resumes")
+        Task { @MainActor in
+            _ = await manager.authorizationDecision()
+            answered.fulfill()
+        }
+        var spins = 0
+        while manager.waitingOnAuthorization < 1 && spins < 1_000 {
+            await Task.yield()
+            spins += 1
+        }
+
+        manager.authorizationResolved(.notDetermined)
+        XCTAssertEqual(manager.waitingOnAuthorization, 1, "still waiting for a real answer")
+
+        // Released properly, so the task doesn't outlive the test.
+        manager.authorizationResolved(.denied)
+        await fulfillment(of: [answered], timeout: 2)
+    }
+
+    /// A box for what the concurrent waiters came back with. `Task` closures are
+    /// `@Sendable`, so they cannot write to a local `var`.
+    @MainActor private final class Answers {
+        var received: [CLAuthorizationStatus] = []
+    }
+
     func test_traces_can_be_taken_off_the_phone() {
         // The whole export path. Without this key the traces are real, correct,
         // and unreachable behind the app sandbox — every drive recorded and no

@@ -67,8 +67,18 @@ final class LocationManager: NSObject, CLLocationManagerDelegate {
 
     /// A `currentLocation()` call waiting for a fix good enough to answer with.
     private var pendingFix: PendingFix?
-    /// A `currentLocation()` call waiting for the permission prompt to resolve.
-    private var pendingAuth: CheckedContinuation<CLAuthorizationStatus, Never>?
+    /// Every `currentLocation()` call waiting for the permission prompt to
+    /// resolve — an array, because there can be more than one.
+    ///
+    /// This used to be a single continuation, overwritten by the second caller
+    /// with no attempt to resume the first, which left that first task
+    /// suspended for the life of the process (`SWIFT TASK CONTINUATION MISUSE`)
+    /// and its spinner turning in the start field. Two callers is not exotic:
+    /// `RoutePanel` offers "My Location" as both a button in the field and a row
+    /// in the suggestion list, and `isLocatingUser` — which drives the button's
+    /// `.disabled` — is set inside the `Task` body rather than at tap time, so
+    /// two quick taps both get through.
+    private var pendingAuth: [CheckedContinuation<CLAuthorizationStatus, Never>] = []
 
     /// One in-flight one-shot request: who to answer, and the best fix seen so
     /// far in case we time out before an accurate one arrives.
@@ -205,11 +215,38 @@ final class LocationManager: NSObject, CLLocationManagerDelegate {
     /// Ask for permission and wait for the user to answer the system prompt.
     @MainActor
     private func requestAuthorization() async -> CLAuthorizationStatus {
-        await withCheckedContinuation { continuation in
-            pendingAuth = continuation
-            manager.requestWhenInUseAuthorization()
+        manager.requestWhenInUseAuthorization()
+        // If there was nothing to prompt for, no callback is coming and parking
+        // below would never end.
+        guard manager.authorizationStatus == .notDetermined else {
+            return manager.authorizationStatus
         }
+        return await authorizationDecision()
     }
+
+    /// Park until the prompt is answered, however many callers are parked.
+    ///
+    /// Note what this deliberately does *not* do: resume the caller it joins,
+    /// the way `PendingFix.finish` resumes the request it supersedes. At this
+    /// instant the status is still `.notDetermined`, so an early resume sends
+    /// the first caller straight into the guard in `currentLocation()`, out
+    /// with nil, and up to the driver as "Couldn't get a location fix" —
+    /// printed over the system prompt they are still being asked to answer.
+    /// There is one answer coming and it belongs to all of them, so they all
+    /// wait for it.
+    ///
+    /// Split from `requestAuthorization` so the overlap has a test: registering
+    /// two waiters is the whole defect, and going through
+    /// `requestWhenInUseAuthorization` would put the simulator's process-wide
+    /// grant in the middle of it.
+    @MainActor
+    func authorizationDecision() async -> CLAuthorizationStatus {
+        await withCheckedContinuation { pendingAuth.append($0) }
+    }
+
+    /// How many callers are parked on the prompt. For the overlap test, which
+    /// has to know both have registered before it answers.
+    var waitingOnAuthorization: Int { pendingAuth.count }
 
     /// Switch the GPS back off if a one-shot turned it on outside navigation.
     private func settleAfterOneShot() {
@@ -253,13 +290,27 @@ final class LocationManager: NSObject, CLLocationManagerDelegate {
     }
 
     func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
-        authorization = manager.authorizationStatus
+        // Same isolation as `didUpdateLocations` above, and for the same reason:
+        // CoreLocation calls its delegate on the run loop the manager was
+        // created on, which for this app is main.
+        MainActor.assumeIsolated { authorizationResolved(manager.authorizationStatus) }
+    }
+
+    /// The prompt has an answer: publish it and release everyone waiting.
+    ///
+    /// Separate from the delegate callback so a test can supply a status. The
+    /// callback reads the process-wide grant, which a unit test can neither set
+    /// nor predict — and this is the one place a stranded waiter is fixed, so it
+    /// is the one place worth being able to drive directly.
+    @MainActor
+    func authorizationResolved(_ status: CLAuthorizationStatus) {
+        authorization = status
         // `.notDetermined` is the state *before* the prompt is answered, so it
         // isn't an answer — keep waiting.
-        if manager.authorizationStatus != .notDetermined, let waiting = pendingAuth {
-            pendingAuth = nil
-            waiting.resume(returning: manager.authorizationStatus)
-        }
+        guard status != .notDetermined else { return }
+        let waiting = pendingAuth
+        pendingAuth = []
+        for continuation in waiting { continuation.resume(returning: status) }
     }
 
     func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {

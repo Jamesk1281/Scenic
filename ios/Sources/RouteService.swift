@@ -32,14 +32,38 @@ enum RouteService {
         return "http://127.0.0.1:5057"
     }()
 
-    /// An error carrying the backend's own message (e.g. "no route found").
+    /// Why a request didn't produce a route, in the words the driver sees.
+    ///
+    /// Four cases because they call for four different things from whoever is
+    /// reading them, and telling them apart is the whole point: retry, wait,
+    /// check the phone, or move the pin. A driver who was shown `HTTP 530` —
+    /// which is what a Cloudflare tunnel with nothing behind it answers, and
+    /// what this used to surface verbatim — could act on none of them.
     enum ServiceError: LocalizedError {
+        /// The backend answered with its own `{"error": ...}`. Passed through
+        /// untouched: these are written for the driver ("point is outside the
+        /// covered road network", "no route found between those points") and
+        /// say the one thing a generic message can't, which is what to change.
         case server(String)
+        /// Something answered, but not with anything this app can read — a
+        /// 502/503/530, or the HTML page a tunnel or a proxy serves when the
+        /// backend behind it is down. The status is worth carrying for a bug
+        /// report and worth nothing to the driver, so it goes in a parenthesis.
+        case unreachable(Int)
+        /// The request never reached a server at all. Different advice, so a
+        /// different case: nothing about the routing service will fix it.
+        case offline
+        /// A 200 whose body didn't decode.
         case badResponse
 
         var errorDescription: String? {
             switch self {
             case let .server(message): return message
+            case let .unreachable(status):
+                return "The routing service isn't reachable right now. "
+                    + "Try again in a moment. (HTTP \(status))"
+            case .offline:
+                return "No connection to the routing service. Check your network."
             // A decode failure otherwise surfaces as Foundation's "The data
             // couldn't be read because it isn't in the correct format", which
             // tells a driver nothing about what to do.
@@ -120,21 +144,7 @@ enum RouteService {
             [URLQueryItem(name: "via", value: "\($0.latitude),\($0.longitude)")]
         } ?? [])
 
-        let (data, response) = try await session.data(from: components.url!)
-
-        // On an error status, surface the backend's JSON {"error": "..."} message.
-        if let http = response as? HTTPURLResponse, http.statusCode != 200 {
-            let body = try? JSONDecoder().decode([String: String].self, from: data)
-            // A rate limiter or a tunnel answers in HTML, not our JSON shape,
-            // so there is often no message to lift.
-            throw ServiceError.server(body?["error"] ?? "HTTP \(http.statusCode)")
-        }
-
-        do {
-            return try JSONDecoder().decode(RouteResponse.self, from: data)
-        } catch {
-            throw ServiceError.badResponse
-        }
+        return try await get(components.url!)
     }
 
     /// Request one scenic loop from a start point, of about `km`.
@@ -179,15 +189,36 @@ enum RouteService {
             URLQueryItem(name: "w_\(type)", value: String(format: "%.2f", weight))
         } + (sector.map { [URLQueryItem(name: "sector", value: $0)] } ?? [])
 
-        let (data, response) = try await session.data(from: components.url!)
+        return try await get(components.url!)
+    }
+
+    /// One GET, decoded — with every way it can fail turned into a
+    /// `ServiceError` whose text is worth showing a driver.
+    ///
+    /// Shared because `route` and `loop` carried the same status-check block
+    /// verbatim, and it was wrong in both.
+    private static func get<T: Decodable>(_ url: URL) async throws -> T {
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(from: url)
+        } catch is URLError {
+            // Thrown before any status code exists, so nothing answered.
+            throw ServiceError.offline
+        }
 
         if let http = response as? HTTPURLResponse, http.statusCode != 200 {
-            let body = try? JSONDecoder().decode([String: String].self, from: data)
-            throw ServiceError.server(body?["error"] ?? "HTTP \(http.statusCode)")
+            // The backend's own message whenever there is one to lift. A rate
+            // limiter or a tunnel answers in HTML, not our JSON shape, and that
+            // is the case the status code alone used to leak into the sheet.
+            if let message = try? JSONDecoder().decode([String: String].self, from: data)["error"] {
+                throw ServiceError.server(message)
+            }
+            throw ServiceError.unreachable(http.statusCode)
         }
 
         do {
-            return try JSONDecoder().decode(LoopResponse.self, from: data)
+            return try JSONDecoder().decode(T.self, from: data)
         } catch {
             throw ServiceError.badResponse
         }
