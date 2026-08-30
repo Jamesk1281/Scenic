@@ -222,6 +222,18 @@ BREAKDOWN_OVERRIDE = {"c_forest": FOREST_BREAKDOWN_MIN}
 SCENERY_BREAKDOWN = [(label, col, BREAKDOWN_OVERRIDE.get(col, BREAKDOWN_MIN))
                      for _, label, col, _ in BEAUTY_TYPES]
 
+# The score at or above which a road counts as properly beautiful, for the
+# headline "19 of your 40 km" number. Chosen because it separates a scenic loop
+# from a fast one 188-fold (18.8 km against 0.1 km at a Needham 40 km target)
+# where the means only manage 6.03 against 1.94.
+#
+# Lives here rather than in looper.py — where it was defined, and is still
+# importable from, for `server/app.py` — because point-to-point routes report
+# the same number now. One definition, because two would drift and the whole
+# point of the threshold is that a loop's "beautiful km" and a route's mean the
+# same thing.
+BEAUTIFUL_SCORE = 7.0
+
 _TO_M = Transformer.from_crs(4326, CRS_METERS, always_xy=True)
 
 # How much further than the nearest road `snap` will look when it has a
@@ -1475,6 +1487,31 @@ class RouteResult:
         s = self.edges["score"].to_numpy() if self.scores is None else self.scores
         return float((s * L).sum() / max(L.sum(), 1))
 
+    @cached_property
+    def beautiful_km(self):
+        """Kilometres of this route on roads scoring `BEAUTIFUL_SCORE` or better.
+
+        The legible half of the pair. `mean_score` is length-weighted across the
+        whole trip, so the unavoidable arterial at each end drags a genuinely
+        lovely middle down and a driver cannot tell 4.2 from 5.1; this counts
+        the road that is actually worth driving and leaves the rest out of it.
+        Measured on loops, it separates a scenic drive from a fast one of the
+        same length 188-fold where the means manage about 3-fold.
+
+        Read off the *user-weighted* scores when there are any, exactly as
+        `mean_score` is, so the fastest and scenic arms of one response are on
+        one scale — `server/app.py` scores both with the caller's weights for
+        precisely this reason. The corollary is that this is not comparable
+        across different weight settings: turning a beauty type off moves the
+        scale, so a rise here between two settings is not evidence of a better
+        route. Compare `scenery_km`, which is thresholded on raw components, or
+        the clock.
+        """
+        L = self.edges["length_m"].to_numpy()
+        s = (self.edges["score"].to_numpy() if self.scores is None
+             else np.asarray(self.scores))
+        return float(L[s >= BEAUTIFUL_SCORE].sum() / 1000.0)
+
     def scenery_km(self):
         """Kilometers of this route that pass each kind of scenery (the labels
         in SCENERY_BREAKDOWN), for the breakdown bars in the app."""
@@ -1895,6 +1932,13 @@ class RouteResult:
             "properties": {
                 "km": round(self.km, 1), "minutes": round(self.minutes, 1),
                 "mean_score": round(self.mean_score, 2),
+                # The headline the app leads with: "31 of your 50 miles". A
+                # 0-10 mean is a number nobody has a feel for, and the two arms
+                # of one response are scored on one scale, so the pair reads as
+                # a plain comparison. `beautiful_score` travels with it so the
+                # client can say what the bar was without hardcoding 7.0.
+                "beautiful_km": round(self.beautiful_km, 1),
+                "beautiful_score": BEAUTIFUL_SCORE,
                 "scenery_km": {k: round(v, 1) for k, v in self.scenery_km().items()},
                 "steps": self.steps(),
             },
