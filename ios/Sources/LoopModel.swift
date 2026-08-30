@@ -101,7 +101,7 @@ final class LoopModel {
                 return
             }
             start = match.placemark.coordinate
-            startQuery = match.name ?? label
+            startQuery = PlaceNaming.displayName(for: match, fallback: label)
             errorText = nil
             await generate()
         } catch {
@@ -128,10 +128,28 @@ final class LoopModel {
             return
         }
         start = fix.coordinate
-        startQuery = "My Location"
+        startQuery = PlaceNaming.myLocation
         searchRegion = .around(fix.coordinate)
         errorText = nil
         await generate()
+        // After the loop, not before: the geocode is a courtesy and the drive
+        // is the point, so it must not stand between the tap and the map.
+        await nameCurrentLocation(fix)
+    }
+
+    /// Put a street name on the "My Location" start once reverse geocoding
+    /// answers, the way the directions tab does — see `PlaceNaming`.
+    ///
+    /// The guards are not optional. This suspends for as long as the geocoder
+    /// takes, and in that time the user can have typed an address, tapped
+    /// "My Location" again from somewhere else, or cleared the field; writing
+    /// the answer back unconditionally would label whatever is there now with
+    /// where they used to be.
+    private func nameCurrentLocation(_ fix: CLLocation) async {
+        guard let label = await PlaceNaming.currentLocationLabel(for: fix) else { return }
+        guard startQuery == PlaceNaming.myLocation,
+              start?.matches(fix.coordinate) == true else { return }
+        startQuery = label
     }
 
     func clear() {

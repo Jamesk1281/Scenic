@@ -92,13 +92,13 @@ struct ContentView: View {
         // right street is how you catch a bad fix before pulling away.
         .onChange(of: model.start?.latitude) {
             guard model.response == nil, let start = model.start else { return }
-            withAnimation { camera = .region(.around(start, meters: 1_200)) }
+            frame(around: start)
         }
         // The same for a loop start, which is the only pin that tab has, so
         // seeing it land on the right street matters just as much.
         .onChange(of: model.loops.start?.latitude) {
             guard model.loops.response == nil, let start = model.loops.start else { return }
-            withAnimation { camera = .region(.around(start, meters: 1_200)) }
+            frame(around: start)
         }
         .sheet(isPresented: .constant(true)) {
             RoutePanel(model: model, detent: $sheetHeight)
@@ -122,6 +122,37 @@ struct ContentView: View {
         case .directions: frame(model.response?.scenic.coordinates)
         case .loops:      frame(model.loops.response?.loop.coordinates)
         }
+    }
+
+    /// Frame a single pin so it lands *above* the sheet instead of behind it.
+    ///
+    /// Centring it in the map — which is all `MKCoordinateRegion.around` can do
+    /// — put the pin under a sheet that covers the bottom of the screen: clipped
+    /// against its top edge at the compact height, gone entirely at `.medium`,
+    /// which is where the panel rests once the user has engaged with it. That
+    /// defeats the only reason the camera moves for a lone start pin at all,
+    /// which is that seeing it land on the right street is how a bad fix gets
+    /// caught before pulling away.
+    ///
+    /// So the same lift `frame(_:)` gives a route, by the same means: extend the
+    /// rect *downwards*, and MapKit centring the taller rect leaves the pin in
+    /// the upper part of the screen. (Downwards, because `MKMapRect`'s y grows
+    /// southward — this is the direction that raises a pin, not lowers it.)
+    ///
+    /// Not `frame(_:)` itself: that builds its rect from an array of
+    /// coordinates, and a single point gives it width and height 0, so
+    /// `bottomLift` and every padding multiplier collapse to a degenerate
+    /// zero-size rect.
+    private func frame(around point: CLLocationCoordinate2D, meters: Double = 1_200) {
+        let center = MKMapPoint(point)
+        let side = meters * MKMapPointsPerMeterAtLatitude(point.latitude)
+        // 0.9 of the width, matching the weaker of `frame(_:)`'s two multipliers
+        // — a square around one pin has no long axis to argue for more. It
+        // leaves the pin about a quarter of the way down the framed rect.
+        let lift = side * 0.9
+        let framed = MKMapRect(x: center.x - side / 2, y: center.y - side / 2,
+                               width: side, height: side + lift)
+        withAnimation { camera = .rect(framed) }
     }
 
     private func frame(_ coordinates: [CLLocationCoordinate2D]?) {

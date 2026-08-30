@@ -1,10 +1,95 @@
 import MapKit
 import SwiftUI
+import UIKit
 
 extension PresentationDetent {
     /// The planning sheet's resting height before the user engages with it:
     /// the two fields and the slider, and not much more.
-    static let planningCompact = PresentationDetent.height(260)
+    static let planningCompact = PresentationDetent.custom(PlanningCompactDetent.self)
+}
+
+/// How tall the compact planning sheet has to be to hold its own content.
+///
+/// It used to be a literal `.height(260)`, and the block measures more than
+/// that at the default text size — so "scenery preference 0.50" was bisected by
+/// the sheet's bottom edge on the first screen of every cold launch, before the
+/// user had touched an accessibility setting. Raising the literal would only
+/// move the failure one text size along: the title, the hint, the picker, both
+/// fields and the slider caption are all typed, so the block grows with Dynamic
+/// Type and no constant can follow it.
+///
+/// A `custom` detent rather than a computed `.height(x)` because a custom
+/// detent's *identity is its type*: `RoutePanel` compares `detent ==
+/// .planningCompact` in three places and `ContentView` seeds the selection with
+/// it, and a height that changed with the text size would silently stop
+/// matching. It also has to be this rather than measuring the content and
+/// assigning a detent to fit, which is the mechanism `onChange(of: focused)`
+/// below documents at length as leaving UIKit holding a stale hit-test frame.
+struct PlanningCompactDetent: CustomPresentationDetent {
+
+    /// The two halves of the block's height, in points, split so the padding
+    /// isn't scaled along with the text.
+    ///
+    /// Solved from the block measured on a booted iPhone 15 Pro: **311 pt** at
+    /// the default text size and **363 pt** at xxxLarge, where `UIFontMetrics`
+    /// reports a body scale of 1.0 and 1.3167. Those are the two ends of the
+    /// non-accessibility range, so the formula is exact at both and interpolates
+    /// between them (it lands within 8 pt at accessibility-medium, on the
+    /// generous side).
+    ///
+    /// Scaling the whole 311 would overshoot instead: most of it is padding,
+    /// gaps and control chrome that don't grow with text at all.
+    static let fixedPoints: CGFloat = 147
+    static let textPoints: CGFloat = 164
+
+    /// Room under the block for the home indicator, which overlapped the slider
+    /// caption even where the caption itself wasn't cut. Slack rather than
+    /// clipping on a device that has no home indicator.
+    static let bottomInset: CGFloat = 34
+
+    /// The most of the screen this detent will take. A planning sheet that has
+    /// eaten the whole map is not a trade anyone chose.
+    static let maximumFraction: CGFloat = 0.85
+
+    static func height(in context: Context) -> CGFloat? {
+        let cap = context.maxDetentValue * maximumFraction
+
+        // At the accessibility sizes there is no honest answer: the same block
+        // measures 884 pt at AX5, which is taller than an iPhone 15 Pro's whole
+        // 852 pt screen, so no detent can show all of it. Take everything the
+        // sheet is allowed and let the `ScrollView` carry the rest — which also
+        // means the compact detent is taller than `.medium` there, and
+        // `onChange(of: focused)` below lowers rather than raises it. That is
+        // the right way round while a keyboard is up.
+        guard !context.dynamicTypeSize.isAccessibilitySize else { return cap }
+
+        let traits = UITraitCollection(
+            preferredContentSizeCategory: contentSizeCategory(context.dynamicTypeSize))
+        let scaled = UIFontMetrics(forTextStyle: .body)
+            .scaledValue(for: textPoints, compatibleWith: traits)
+        return min(fixedPoints + scaled + bottomInset, cap)
+    }
+
+    /// SwiftUI's `DynamicTypeSize` and UIKit's `UIContentSizeCategory` are the
+    /// same twelve steps under two names. A detent's `Context` offers only the
+    /// first; `UIFontMetrics` takes only the second.
+    private static func contentSizeCategory(_ size: DynamicTypeSize) -> UIContentSizeCategory {
+        switch size {
+        case .xSmall:  return .extraSmall
+        case .small:   return .small
+        case .medium:  return .medium
+        case .large:   return .large
+        case .xLarge:  return .extraLarge
+        case .xxLarge: return .extraExtraLarge
+        case .xxxLarge: return .extraExtraExtraLarge
+        case .accessibility1: return .accessibilityMedium
+        case .accessibility2: return .accessibilityLarge
+        case .accessibility3: return .accessibilityExtraLarge
+        case .accessibility4: return .accessibilityExtraExtraLarge
+        case .accessibility5: return .accessibilityExtraExtraExtraLarge
+        @unknown default: return .large
+        }
+    }
 }
 
 /// The bottom-sheet panel: two address searches, the preference slider, the

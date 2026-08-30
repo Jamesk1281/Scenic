@@ -42,6 +42,29 @@ final class NavigationModelTests: XCTestCase {
         XCTAssertTrue(model.hasJoinedRoute)
     }
 
+    // MARK: - Giving up the scenic route
+
+    func test_switching_to_fastest_with_no_fix_says_so_instead_of_nothing() async {
+        // The defect. `NavView` wrapped the call in `if let here =
+        // locationManager.location` with no `else`, and `location` is nil until
+        // a fix passes `isUsable` — a cold start in a garage, an urban canyon,
+        // location denied. So the driver read "This gives up the scenic route
+        // for the rest of the drive", confirmed it, and nothing happened: same
+        // green line, same button, no message. This is the control someone
+        // reaches for when the scenic route has gone wrong, which makes a silent
+        // no-op the worst outcome available.
+        let model = nav()
+        model.fetchRoute = { _, _, _, _, _ in
+            XCTFail("must not reroute from a location we don't have")
+            throw CancellationError()
+        }
+
+        await model.switchToFastest(from: nil)
+
+        XCTAssertNotNil(model.actionProblem, "a refusal has to be visible")
+        XCTAssertFalse(model.followingFastest, "and must not claim it happened")
+    }
+
     // MARK: - Step advancement
 
     func test_steps_advance_as_each_maneuver_is_passed() {

@@ -8,15 +8,15 @@ struct RouteResults: View {
     var body: some View {
         let fastest = response.fastest.properties
         let scenic = response.scenic.properties
-        let extra = Int((scenic.minutes - fastest.minutes).rounded())
+        let comparison = RouteComparison(fastest: fastest, scenic: scenic)
         let maxKm = max(1, scenic.sceneryBreakdown.map(\.km).max() ?? 1)
 
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 10) {
-                card("Fastest", fastest, tint: .gray)
-                card("Scenic", scenic, tint: .scenic)
+                card("Fastest", minutes: comparison.fastestMinutes, fastest, tint: .gray)
+                card("Scenic", minutes: comparison.scenicMinutes, scenic, tint: .scenic)
             }
-            Text(deltaText(extra: extra, from: fastest.mean_score, to: scenic.mean_score))
+            Text(comparison.attributedSummary)
                 .font(.caption)
             ForEach(scenic.sceneryBreakdown, id: \.label) { item in
                 SceneryBar(label: item.label, km: item.km, maxKm: maxKm)
@@ -25,10 +25,14 @@ struct RouteResults: View {
     }
 
     /// One route summary card: big minutes, distance and score beneath.
-    private func card(_ title: String, _ p: RouteProps, tint: Color) -> some View {
+    ///
+    /// The minutes are handed in already rounded rather than rounded here, so
+    /// the card and the sentence under it are reading the same number — see
+    /// `RouteComparison`.
+    private func card(_ title: String, minutes: Int, _ p: RouteProps, tint: Color) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(title.uppercased()).font(.caption2).foregroundStyle(.secondary)
-            Text("\(Int(p.minutes.rounded())) min").font(.title3.bold())
+            Text("\(minutes) min").font(.title3.bold())
             Text("\(p.km.wholeMilesFromKm) mi · \(p.mean_score, format: .number.precision(.fractionLength(1)))/10")
                 .font(.caption2).foregroundStyle(.secondary)
         }
@@ -36,12 +40,62 @@ struct RouteResults: View {
         .padding(10)
         .background(tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
     }
+}
 
-    /// "Scenic adds **N min** and raises scenery **x** → **y**" (markdown bold).
-    private func deltaText(extra: Int, from: Double, to: Double) -> AttributedString {
-        let markdown = "Scenic adds **\(extra) min** and raises scenery "
-            + "**\(String(format: "%.1f", from))** → **\(String(format: "%.1f", to))**"
-        return (try? AttributedString(markdown: markdown)) ?? AttributedString(markdown)
+/// The arithmetic behind the two summary cards and the sentence beneath them.
+///
+/// It exists so the two cannot disagree, which they did: each card rounded its
+/// own minutes while the delta was rounded from the raw values, so 57.6 and
+/// 106.4 rendered as "58 min", "106 min" and "Scenic adds 49 min" — three
+/// individually correct roundings that cannot all be true at once, over a
+/// subtraction the reader can do in their head. Everything below is derived
+/// from the same two rounded integers, so the sentence is arithmetic that
+/// checks out against what is on screen.
+struct RouteComparison {
+    let fastestMinutes: Int
+    let scenicMinutes: Int
+    let fastestScore: Double
+    let scenicScore: Double
+
+    init(fastest: RouteProps, scenic: RouteProps) {
+        fastestMinutes = Int(fastest.minutes.rounded())
+        scenicMinutes = Int(scenic.minutes.rounded())
+        fastestScore = fastest.mean_score
+        scenicScore = scenic.mean_score
+    }
+
+    /// What the scenic route costs, in the minutes the cards are showing.
+    var extraMinutes: Int { scenicMinutes - fastestMinutes }
+
+    /// Whether the two routes read as the same drive. At `pref` 0 the server
+    /// answers with the same route twice, and the scores are compared at the
+    /// precision the cards print them to — two routes both labelled 4.4 have
+    /// nothing to say to each other about scenery.
+    var isSameDrive: Bool {
+        extraMinutes <= 0 && abs(scenicScore - fastestScore) < 0.05
+    }
+
+    /// The sentence under the cards, as markdown.
+    ///
+    /// Three shapes, because "Scenic adds 0 min and raises scenery 4.4 → 4.4"
+    /// is a sentence about nothing, and a scenic route that costs no extra
+    /// time is the best news this screen ever has to deliver — it should not
+    /// be phrased as a charge of zero.
+    var summary: String {
+        let scores = "**\(String(format: "%.1f", fastestScore))** → "
+            + "**\(String(format: "%.1f", scenicScore))**"
+        if isSameDrive {
+            return "**Same as the fastest route** at this setting."
+        }
+        if extraMinutes <= 0 {
+            return "Scenic raises scenery \(scores) **at no extra time**"
+        }
+        return "Scenic adds **\(extraMinutes) min** and raises scenery \(scores)"
+    }
+
+    /// `summary` with its markdown bold resolved, for display.
+    var attributedSummary: AttributedString {
+        (try? AttributedString(markdown: summary)) ?? AttributedString(summary)
     }
 }
 
