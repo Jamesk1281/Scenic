@@ -67,30 +67,57 @@ struct RouteComparison {
     /// What the scenic route costs, in the minutes the cards are showing.
     var extraMinutes: Int { scenicMinutes - fastestMinutes }
 
+    /// The two scores exactly as the cards print them. Everything below reads
+    /// these rather than the raw doubles, for this type's whole reason to
+    /// exist: the sentence has to check out against what is on screen.
+    var printedFastestScore: String { String(format: "%.1f", fastestScore) }
+    var printedScenicScore: String { String(format: "%.1f", scenicScore) }
+
+    /// Whether the scenery number moves at all, at the precision it is shown to.
+    ///
+    /// The printed strings, not a tolerance on the raw values — which is what
+    /// `abs(difference) < 0.05` was reaching for and missed in both directions.
+    /// 4.851 and 4.949 are 0.098 apart and both print "4.9", so the old test
+    /// called them different and the sentence claimed a rise the cards
+    /// contradicted; 4.949 and 4.951 are 0.002 apart and print "4.9" and "5.0",
+    /// so it called them the same while the cards visibly disagreed. Comparing
+    /// what is printed cannot be wrong about what is printed.
+    var scoreMoves: Bool { printedFastestScore != printedScenicScore }
+
     /// Whether the two routes read as the same drive. At `pref` 0 the server
-    /// answers with the same route twice, and the scores are compared at the
-    /// precision the cards print them to — two routes both labelled 4.4 have
-    /// nothing to say to each other about scenery.
-    var isSameDrive: Bool {
-        extraMinutes <= 0 && abs(scenicScore - fastestScore) < 0.05
-    }
+    /// answers with the same route twice, and two routes both labelled 4.4 have
+    /// nothing to say to each other about scenery whatever their raw scores are.
+    var isSameDrive: Bool { extraMinutes <= 0 && !scoreMoves }
 
     /// The sentence under the cards, as markdown.
     ///
-    /// Three shapes, because "Scenic adds 0 min and raises scenery 4.4 → 4.4"
-    /// is a sentence about nothing, and a scenic route that costs no extra
-    /// time is the best news this screen ever has to deliver — it should not
-    /// be phrased as a charge of zero.
+    /// Four shapes past "same drive". "Scenic adds 0 min and raises scenery
+    /// 4.4 → 4.4" is a sentence about nothing; a scenic route that costs no
+    /// extra time is the best news this screen ever has to deliver and must not
+    /// be phrased as a charge of zero; a route that costs time and moves the
+    /// number nowhere should say so rather than claim a rise; and the scenic
+    /// route can come back scoring *below* the fastest one, which "raises"
+    /// reported as an improvement.
+    ///
+    /// The server no longer returns that last case — see
+    /// `_no_worse_than_fastest` in server/app.py, which hands back the fastest
+    /// route instead — but this must not depend on that. An app in the store
+    /// talks to whichever backend is deployed, including an older one.
     var summary: String {
-        let scores = "**\(String(format: "%.1f", fastestScore))** → "
-            + "**\(String(format: "%.1f", scenicScore))**"
+        let scores = "**\(printedFastestScore)** → **\(printedScenicScore)**"
         if isSameDrive {
             return "**Same as the fastest route** at this setting."
         }
-        if extraMinutes <= 0 {
-            return "Scenic raises scenery \(scores) **at no extra time**"
+        // Past `isSameDrive`, a score that has not moved implies added minutes.
+        if !scoreMoves {
+            return "Scenic adds **\(extraMinutes) min** and leaves scenery "
+                + "at **\(printedScenicScore)**"
         }
-        return "Scenic adds **\(extraMinutes) min** and raises scenery \(scores)"
+        let verb = scenicScore > fastestScore ? "raises" : "**lowers**"
+        if extraMinutes <= 0 {
+            return "Scenic \(verb) scenery \(scores) **at no extra time**"
+        }
+        return "Scenic adds **\(extraMinutes) min** and \(verb) scenery \(scores)"
     }
 
     /// `summary` with its markdown bold resolved, for display.

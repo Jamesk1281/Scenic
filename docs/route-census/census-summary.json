@@ -1,0 +1,74 @@
+{
+  "processed_dir": "/Users/james./Desktop/myapps/primarily cc ditched ideas/Scenic/data/processed-ne",
+  "graph_built": "2026-08-29 14:33",
+  "place_points": 5421,
+  "seed": 20260829,
+  "per_band": 250,
+  "sweep_pairs_per_band": 63,
+  "beautiful_score": 7.0,
+  "default_pref": 0.5,
+  "weight_sets": {
+    "shipped": {
+      "water": 1.0,
+      "coast": 1.0,
+      "forest": 1.0,
+      "hills": 1.0,
+      "farm": 1.0,
+      "town": 1.0
+    },
+    "town_off": {
+      "water": 1.0,
+      "coast": 1.0,
+      "forest": 1.0,
+      "hills": 1.0,
+      "farm": 1.0,
+      "town": 0.0
+    }
+  },
+  "pref_sweep": [
+    0.0,
+    0.25,
+    0.5,
+    0.75,
+    1.0
+  ],
+  "snap_max_m": 5000.0,
+  "status_counts": {
+    "ok": 983,
+    "snap_far": 17,
+    "same_node": 0,
+    "no_path": 0
+  },
+  "status_by_band": {
+    "10-25": {
+      "ok": 247,
+      "snap_far": 3,
+      "same_node": 0,
+      "no_path": 0
+    },
+    "25-50": {
+      "ok": 246,
+      "snap_far": 4,
+      "same_node": 0,
+      "no_path": 0
+    },
+    "50-100": {
+      "ok": 246,
+      "snap_far": 4,
+      "same_node": 0,
+      "no_path": 0
+    },
+    "100-200": {
+      "ok": 244,
+      "snap_far": 6,
+      "same_node": 0,
+      "no_path": 0
+    }
+  },
+  "fastest_path_differs_across_weights": 0,
+  "routes": 5192,
+  "routes_attempted": 5192,
+  "router_load_s": 22.7,
+  "elapsed_s": 1279.0,
+  "s_per_route": 0.2463
+}

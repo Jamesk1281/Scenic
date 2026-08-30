@@ -107,6 +107,66 @@ def test_tuning_changes_the_reported_score(client):
     assert coastal["scenery_km"]["coast"] > plain["scenery_km"]["coast"]
 
 
+def test_a_scenic_route_scoring_below_the_fastest_one_is_not_offered(client):
+    """The scenic arm has one job, and a route that scores under the fastest
+    one has not done it.
+
+    The detour cost is proportional to length, so a *shorter* route can carry
+    less total penalty while being uglier per kilometre — measured on 6 of 983
+    sampled trips (docs/route-distribution-study.md), the worst of them 4.8 km
+    shorter, slower, and scoring 5.21 against 5.79. The app rendered that as
+    "raises scenery 5.8 -> 5.2".
+    """
+    import app as server_app
+
+    class Arm:
+        def __init__(self, score):
+            self.mean_score = score
+
+    fastest = Arm(5.794)
+    assert server_app._no_worse_than_fastest(fastest, Arm(5.210)) is fastest
+    # A tie is not a failure — pref 0 hands the same object in as both arms.
+    tie = Arm(5.794)
+    assert server_app._no_worse_than_fastest(fastest, tie) is tie
+    better = Arm(6.301)
+    assert server_app._no_worse_than_fastest(fastest, better) is better
+
+
+def test_the_route_that_found_this_defect_no_longer_returns_it(client):
+    """Hancock -> Shutesbury, the case this was caught on in Massachusetts.
+
+    Without the guard the scenic arm comes back 3.8 km *shorter*, 0.3 minutes
+    slower, and scoring 5.98 against the fastest route's 6.07 — the length-
+    proportional penalty buying "scenery" credit by cutting distance.
+    """
+    body = client.get("/api/route?from=42.4443,-73.0787&to=42.4945,-72.4684"
+                      "&pref=0.5").get_json()
+    fast = body["fastest"]["properties"]
+    scenic = body["scenic"]["properties"]
+    assert scenic["mean_score"] >= fast["mean_score"]
+    # It is the fastest route that comes back, so the app says "same drive".
+    assert scenic["mean_score"] == fast["mean_score"]
+    assert scenic["minutes"] == fast["minutes"]
+
+
+@pytest.mark.parametrize("pref", ["0.25", "0.5", "0.8", "1.0"])
+@pytest.mark.parametrize("pair", [
+    (WORCESTER, BOSTON),
+    (BOSTON, "41.6362,-70.9342"),                # Buzzards Bay
+    ("42.6334,-71.3162", "42.0834,-72.5866"),    # Lowell -> Springfield
+    ("42.4443,-73.0787", "42.4945,-72.4684"),    # Hancock -> Shutesbury
+    ("41.9019,-71.0931", "41.9166,-71.1141"),    # a short Attleboro hop
+])
+def test_the_scenic_arm_never_scores_below_the_fastest_arm(client, pair, pref):
+    """The property the guard exists to hold, asked of the real graph. The last
+    two pairs are known to have broken it before the guard; the rest are a net."""
+    body = client.get(f"/api/route?from={pair[0]}&to={pair[1]}"
+                      f"&pref={pref}").get_json()
+    fast = body["fastest"]["properties"]["mean_score"]
+    scenic = body["scenic"]["properties"]["mean_score"]
+    assert scenic >= fast, f"{pair} at pref {pref}: {fast} -> {scenic}"
+
+
 def test_weights_are_clamped_not_rejected(client):
     for query in ("w_coast=-3", "w_coast=99", "w_coast=1e999"):
         r = client.get(f"/api/route?from={WORCESTER}&to={BOSTON}&pref=0.5&{query}")
