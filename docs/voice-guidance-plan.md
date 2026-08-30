@@ -581,11 +581,11 @@ not produce a burst of catch-up.
 | **3** | Mute glyph in the banner, `UserDefaults` persistence. | 2–3 h | **done** |
 | **4** | Phrasing normaliser. Came in well under estimate — measuring the pronunciations first (§4.2) removed three of the four rules. | ½ day | **done** |
 | **5** | `actionProblem` reporting for session failures. | 2 h | **done** |
-| **6** | An ndjson replay harness, and the latch tests over the five recorded drives — **the harness does not exist yet**, see §10. | 1 day | outstanding |
+| **6** | An ndjson replay harness over the recorded drives. | 1 day | **done** — and it did not prove what stage 6 was for; see §10 |
 
-All of stages 0–5 landed in `ios/Sources/VoiceGuide.swift` plus wiring in
+All of it landed in `ios/Sources/VoiceGuide.swift` plus wiring in
 `NavigationModel`, `RouteModel` and `NavView`, with 28 tests in
-`ios/Tests/VoiceGuideTests.swift`. Suite: 211 passing.
+`ios/Tests/VoiceGuideTests.swift` and the replay in `ios/Tests/DriveReplay.swift`.
 
 **The minimum that makes the app driveable without looking at the screen is
 0 + 1 + 2, not 0 + 1.** Stage 1 alone sounds sufficient and is not: §3.3 measures
@@ -603,30 +603,77 @@ ones to land while `ios/Sources/` is quiet.
 
 ---
 
-## 10. Testing
+## 10. Testing, and what the replay turned out not to prove
+
+**Built, 2026-08-30.** 28 tests in `ios/Tests/VoiceGuideTests.swift` and the
+replay harness in `ios/Tests/DriveReplay.swift` + `DriveReplayTests.swift`.
 
 - **Unit, on the schedule.** `VoiceGuide` is a pure function of
-  (`distanceToNext`, `pace`, step list, latch) and needs no phone. Table-driven
-  over the leg lengths in §3.3.
-- **Replay, on the latch — the one that matters.** The five recorded drives
-  contain 51 reroutes, 8 byte-identical. Replay them through
-  `NavigationModel.update` with a fake `Speaker` and assert that **no maneuver
-  coordinate is ever announced twice in the same phase**, and that the 8
-  same-line reroutes produce exactly zero utterances between them. That test
-  fails today against a step-index latch, which is the point.
-
-  **This harness does not exist yet and is most of stage 5's cost.** The traces
-  are there — `traces/*.ndjson` in the **main checkout**, never in a worktree —
-  and `DriveTraceTests` already asserts that a trace header carries enough to
-  replay a drive, but nothing in `ios/Tests/` reads an `.ndjson` back. The
-  existing reroute tests (`RerouteTests`, `RerouteIdentityTests`,
-  `LoopRerouteTests`) drive `update` with synthetic fixes, so the seam is
-  proven; what is missing is a decoder from the recorded format into
-  `CLLocation`s plus the canned `fetchRoute` replies the recorded reroutes
-  returned. That is worth building once regardless of voice — it is the only
-  test that can exercise 51 real reroutes — but it should be costed honestly
-  rather than assumed.
+  (`distanceToNext`, `pace`, step list, latch) and needs no phone.
+- **Integration, through `NavigationModel`.** Fixes in, utterances out, over
+  the fixture route — this is what covers the wiring, the gate, and arrival.
+- **Replay, over the twelve recorded drives.** Real polylines of 1,300–6,700
+  points, real GPS wander, 42 reroutes exercised. Skipped when
+  `traces/*.ndjson` is absent, which it will be almost everywhere: the traces
+  are gitignored because they record where someone drove, so they cannot be
+  committed as a fixture. Costs ~70 s.
 - **Not by listening on the simulator.** §1.3.
+
+### The replay does not guard the latch, and that was worth finding out
+
+The plan above asserted that a replay would fail against a step-index latch.
+**It does not.** Two mutations were run and both passed:
+
+1. Keying the latch on the step index rather than the maneuver's place.
+2. Clearing the latch on a `merge` as well as an `adopt` — the naive
+   implementation this whole design is arranged around.
+
+Mutation 2 produces **byte-identical utterances on all twelve drives**. The
+reason is `awaitingJoin`. A same-line reply only ever arrives *because* the
+driver left the route; the voice is gated off until they rejoin; and by the
+time it clears they have passed the maneuver that would have been repeated. On
+real driving the off-route gate reaches the problem first, and the latch is
+defence sitting behind it.
+
+That does not make the latch wrong — the gate is not designed to carry this,
+and a brief GPS excursion punches straight through it. It makes the *claim*
+about the replay wrong. What has teeth against mutation 2 is
+`test_the_same_line_handed_back_does_not_re_announce_anything` at the unit
+level, and at the integration level a stray-and-return quick enough that the
+driver is still approaching a maneuver they have already been told about — 300 m
+sideways and back inside ten seconds, which is a GPS glitch rather than a
+driver. Both fail under the mutation; the second only started to after being
+rewritten for it, having originally strayed for long enough that
+`awaitingJoin` swallowed the whole thing.
+
+What the replay *is* worth keeping for is the pair of failures nothing else can
+see: a storm, and a voice that quietly stops. It also caught one real defect in
+its own instrument — keyed on the words alone it reported a repeat on the
+2026-08-14 evening drive, whose route turns left onto Washington Street at two
+junctions 11 km apart, and both deserve saying.
+
+### What the twelve drives actually sound like
+
+| drive | fixes | on route | utterances | maneuvers | replies |
+|---|---|---|---|---|---|
+| 2026-08-14 15:50 | 2,512 | 2,473 | 39 | 23 | 0 |
+| 2026-08-14 19:25 | 2,829 | 2,415 | 42 | 11 | 12 |
+| 2026-08-22 17:13 | 327 | 327 | 8 | 6 | 0 |
+| 2026-08-22 17:19 | 1,615 | 1,614 | 23 | 17 | 0 |
+| 2026-08-22 18:34 | 2,066 | 2,008 | 38 | 13 | 3 |
+| 2026-08-22 20:27 | 1,980 | 1,779 | 21 | 9 | 4 |
+| 2026-08-22 22:26 | 2,679 | **26** | 2 | 3 | 15 |
+| 2026-08-25 18:08 | 7,956 | 7,933 | 22 | 9 | 1 |
+| 2026-08-25 20:21 | 3,394 | 3,226 | 42 | 18 | 6 |
+| 2026-08-25 21:18 | 3,851 | 3,833 | 69 | 45 | 1 |
+| 2026-08-25 22:23 | 523 | **0** | 0 | 1 | 0 |
+
+About one utterance a minute on a drive that is going well, which is the right
+order. The two silent drives are correctly silent and are the reason
+`describableFixes` is measured at all: one never joined its route, and the
+other — the reroute-storm drive — spent 2,653 of its 2,679 fixes off the line
+it had been given. Neither is the voice failing; both would be indistinguishable
+from the voice failing without that column.
 
 ---
 

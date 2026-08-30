@@ -440,9 +440,18 @@ final class VoiceGuideIntegrationTests: XCTestCase {
     }
 
     func test_the_same_line_handed_back_mid_drive_re_announces_nothing() async {
-        // The whole trap, end to end. `merge` re-derives `currentStep` from
-        // zero on a line the car never left; across five recorded drives that
-        // happened 8 times.
+        // The trap, end to end. `merge` re-derives `currentStep` from zero on a
+        // line the car never left; across the recorded drives that happened 8
+        // times.
+        //
+        // The excursion has to be *brief* for this to test anything. A driver
+        // who strays and takes a while to come back has `awaitingJoin` holding
+        // the voice off, and by the time it clears they have passed the
+        // maneuver — which is why replaying the twelve real drives does **not**
+        // catch a latch that clears on every reply (see
+        // `docs/voice-guidance-plan.md` §10). What is needed is a stray and
+        // return quick enough that the driver is still approaching a maneuver
+        // they have already been told about. A GPS glitch does exactly this.
         let backend = RerouteTests.Backend()
         let speaker = VoiceGuideTests.FakeSpeaker()
         let model = NavigationModel(route: Fixture.straightRoute(),
@@ -450,16 +459,18 @@ final class VoiceGuideIntegrationTests: XCTestCase {
                                     pref: 0.8, weights: [:],
                                     voice: VoiceGuide(speaker: speaker, muted: false))
         model.fetchRoute = backend.fetch
-        for metres in stride(from: 0.0, through: 1500.0, by: 20) {
+
+        // Up to 680 m: the turn at 1 km is 320 m off, which at 30 mph is 24 s
+        // and inside the prepare window.
+        for metres in stride(from: 0.0, through: 680.0, by: 20) {
             model.update(rolling(metres))
         }
-        let beforeReroute = speaker.said
+        XCTAssertEqual(speaker.said, ["Head north on Test Road",
+                                      "In a quarter mile, turn right onto Elm Street"])
 
-        // Drift off the line and take the identical route back.
-        // One fix is enough: past `offRouteCertainMeters` an excursion counts
-        // for the whole streak at once, so a genuine wrong turn reroutes on the
-        // fix that reveals it.
-        let aside = CLLocationCoordinate2D(latitude: Fixture.north(1500).latitude,
+        // One fix 300 m to the side. Past `offRouteCertainMeters`, so it arms
+        // the whole streak at once and re-routes immediately.
+        let aside = CLLocationCoordinate2D(latitude: Fixture.north(700).latitude,
                                            longitude: Fixture.origin.longitude + 300 / 82_600)
         model.update(Fixture.movingFix(aside, course: 0, speed: 13.4))
         let deadline = Date().addingTimeInterval(2)
@@ -473,10 +484,17 @@ final class VoiceGuideIntegrationTests: XCTestCase {
             try? await Task.sleep(for: .milliseconds(2))
         }
 
-        for metres in stride(from: 1500.0, through: 1700.0, by: 20) {
+        // Straight back onto the line, still 280 m short of the turn — 21 s,
+        // squarely inside the prepare window it was already given.
+        for metres in stride(from: 700.0, through: 740.0, by: 20) {
             model.update(rolling(metres))
         }
-        XCTAssertEqual(speaker.said, beforeReroute,
-                       "the same line spoke again: \(speaker.said.dropFirst(beforeReroute.count))")
+        // Both halves matter: if the driver were still off the line, or had
+        // already passed the turn, this test would pass for the wrong reason.
+        XCTAssertTrue(model.stepsDescribeWhereWeAre, "not back on the line")
+        XCTAssertEqual(model.currentStep, 1, "the turn should still be ahead")
+        XCTAssertEqual(speaker.said, ["Head north on Test Road",
+                                      "In a quarter mile, turn right onto Elm Street"],
+                       "the same line spoke again")
     }
 }
