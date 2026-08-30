@@ -112,51 +112,90 @@ struct NavView: View {
     /// The maneuver banner — distance + instruction, or whatever else the driver
     /// most needs to know right now.
     @ViewBuilder private var banner: some View {
-        Group {
-            if nav.arrived {
-                Text("You've arrived 🎉").font(.title2.bold())
-                    .frame(maxWidth: .infinity)
-            } else if locationManager.authorization == .denied
-                        || locationManager.authorization == .restricted {
-                // Without location we can't follow the drive at all — say so
-                // instead of sitting silently on the first instruction.
-                Label("Location access is off — allow it in Settings to navigate.",
-                      systemImage: "location.slash")
-                    .font(.subheadline).frame(maxWidth: .infinity)
-            } else if nav.isRerouting {
-                Label("Rerouting…", systemImage: "arrow.triangle.2.circlepath")
-                    .font(.headline).frame(maxWidth: .infinity)
-            } else if !nav.hasJoinedRoute {
-                // The trip was planned from somewhere the driver isn't yet. Say
-                // so plainly rather than reading out a first instruction that
-                // belongs to a road miles away.
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("\(distanceText(nav.distanceToRouteStart)) away")
-                        .font(.subheadline).foregroundStyle(.secondary)
-                    Text("Head to the start of your route").font(.title3.bold())
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            } else {
-                HStack(spacing: 12) {
-                    // The maneuver glyph, ahead of the words. A driver reads
-                    // the arrow long before the sentence, and an exit should
-                    // not look like a left turn.
-                    Image(systemName: nav.currentSymbol)
-                        .font(.title2.bold())
-                        .foregroundStyle(Color.scenic)
-                        .accessibilityHidden(true)
+        HStack(spacing: 8) {
+            Group {
+                if nav.arrived {
+                    Text("You've arrived 🎉").font(.title2.bold())
+                        .frame(maxWidth: .infinity)
+                } else if locationManager.authorization == .denied
+                            || locationManager.authorization == .restricted {
+                    // Without location we can't follow the drive at all — say so
+                    // instead of sitting silently on the first instruction.
+                    Label("Location access is off — allow it in Settings to navigate.",
+                          systemImage: "location.slash")
+                        .font(.subheadline).frame(maxWidth: .infinity)
+                } else if nav.isRerouting {
+                    Label("Rerouting…", systemImage: "arrow.triangle.2.circlepath")
+                        .font(.headline).frame(maxWidth: .infinity)
+                } else if !nav.hasJoinedRoute {
+                    // The trip was planned from somewhere the driver isn't yet. Say
+                    // so plainly rather than reading out a first instruction that
+                    // belongs to a road miles away.
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(distanceText(nav.distanceToNext))
+                        Text("\(distanceText(nav.distanceToRouteStart)) away")
                             .font(.subheadline).foregroundStyle(.secondary)
-                        Text(nav.currentInstruction).font(.title3.bold())
+                        Text("Head to the start of your route").font(.title3.bold())
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                } else {
+                    HStack(spacing: 12) {
+                        // The maneuver glyph, ahead of the words. A driver reads
+                        // the arrow long before the sentence, and an exit should
+                        // not look like a left turn.
+                        Image(systemName: nav.currentSymbol)
+                            .font(.title2.bold())
+                            .foregroundStyle(Color.scenic)
+                            .accessibilityHidden(true)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(distanceText(nav.distanceToNext))
+                                .font(.subheadline).foregroundStyle(.secondary)
+                            Text(nav.currentInstruction).font(.title3.bold())
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
             }
+            muteButton
         }
         .padding()
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
         .padding(.horizontal)
+    }
+
+    /// Silence the spoken directions.
+    ///
+    /// In the banner, and deliberately not in `controlRow`. The banner is the
+    /// only thing on this screen that is always on it — the verdict buttons
+    /// vanish before joining and after arriving, `Fastest` vanishes once taken,
+    /// and `recenterButton` only appears when the map has been moved. A control
+    /// that moves mid-drive is one the driver has to hunt for. `controlRow`'s
+    /// layout is load-bearing besides: the stats sit in the middle because that
+    /// is where a resting thumb lands, and a `Color.clear` of exactly this size
+    /// holds them centred once `Fastest` goes, so a fourth control there either
+    /// unbalances the row or shifts everything when the third disappears.
+    ///
+    /// It is also, plainly, next to the words it governs.
+    ///
+    /// The reach to the top of the screen is longer. That is the right trade
+    /// for a once-a-drive action, and the same reasoning that puts the
+    /// destructive `End` button in a corner rather than under the thumb.
+    @ViewBuilder private var muteButton: some View {
+        if nav.canSpeak {
+            Button { nav.voiceMuted.toggle() } label: {
+                Image(systemName: nav.voiceMuted
+                      ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                    .font(.title3)
+                    .foregroundStyle(nav.voiceMuted ? Color.secondary : Color.scenic)
+                    // A generous tap target around a small glyph, so this is
+                    // hittable without aiming.
+                    .frame(width: controlSize, height: controlSize)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(nav.voiceMuted
+                                ? "Turn spoken directions on"
+                                : "Turn spoken directions off")
+        }
     }
 
     /// Trip stats front and center, with End and the fastest-route escape hatch

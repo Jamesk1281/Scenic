@@ -226,7 +226,8 @@ final class RouteModel {
         let trace = DriveTrace(origin: start, destination: end,
                                pref: pref, weights: weights)
         let session = NavigationModel(route: feature, destination: end,
-                                      pref: pref, weights: weights, trace: trace)
+                                      pref: pref, weights: weights, trace: trace,
+                                      voice: VoiceGuide(speaker: SystemSpeaker()))
         // Fixes go straight from CoreLocation into the drive, with no view in
         // between. A SwiftUI `onChange` would stop delivering the moment the
         // phone locked — see `LocationManager.onFix` — and a drive that only
@@ -250,7 +251,8 @@ final class RouteModel {
         let session = NavigationModel(
             route: response.loop, destination: origin,
             pref: 1.0, weights: weights, trace: trace,
-            turnaround: response.meta.turnaroundCoordinate)
+            turnaround: response.meta.turnaroundCoordinate,
+            voice: VoiceGuide(speaker: SystemSpeaker()))
         locationManager.onFix = { [weak session] location in session?.update(location) }
         nav = session
     }

@@ -11,13 +11,24 @@ import XCTest
 @MainActor
 final class LocationManagerTests: XCTestCase {
 
-    func test_the_app_declares_the_background_mode_it_asks_for() {
+    func test_the_app_declares_the_background_modes_it_asks_for() {
         // `allowsBackgroundLocationUpdates = true` raises an exception if
         // UIBackgroundModes doesn't contain "location" — a pairing across two
         // files with nothing but this to hold it together.
         let modes = Bundle.main.object(forInfoDictionaryKey: "UIBackgroundModes") as? [String]
-        XCTAssertEqual(modes, ["location"],
-                       "set in ios/project.yml; LocationManager.start() depends on it")
+        XCTAssertEqual(modes.map(Set.init), ["location", "audio"],
+                       "set in ios/project.yml; LocationManager.start() and "
+                       + "VoiceGuide both depend on it")
+        // `audio` is not decoration. Measured on an iPhone 17 on 2026-08-30:
+        // without it, `AVAudioSession.setActive(true)` threw `'!pla'` on all 19
+        // attempts made from the background and nothing was ever spoken, while
+        // the same binary with it declared spoke 23 of 23, 16 of those with the
+        // screen off. Every drive on this app runs with the phone in a pocket,
+        // so dropping this key does not degrade the voice, it removes it — and
+        // a simulator will insist everything is fine. See
+        // `docs/voice-guidance-plan.md` §1.
+        XCTAssertTrue(modes?.contains("audio") ?? false,
+                      "spoken guidance is silent in the background without this")
     }
 
     func test_starting_navigation_does_not_raise() {

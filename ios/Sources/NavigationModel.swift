@@ -477,12 +477,31 @@ final class NavigationModel {
     /// of them; only `RouteModel.startNavigation` — a real drive — passes one in.
     private let trace: DriveTrace?
 
+    /// Speaks the maneuvers, or nil to drive in silence.
+    ///
+    /// Injected and nil by default for the same reason `trace` is: a
+    /// `NavigationModel` built in a test must not reach for the audio hardware,
+    /// and the seam is what lets the schedule be driven by a fake.
+    private let voice: VoiceGuide?
+
+    /// Whether this drive has a voice at all, so the control is only offered
+    /// where it would do something. False in tests, which build without one.
+    var canSpeak: Bool { voice != nil }
+
+    /// Mirrors `VoiceGuide.muted` so the banner's control is observable —
+    /// `@Observable` tracks *this* model's stored properties, and the guide is
+    /// a plain reference held behind a `let`.
+    var voiceMuted: Bool {
+        didSet { voice?.muted = voiceMuted }
+    }
+
     /// - Parameter turnaround: the far point of a loop, when this drive is one.
     ///   Nil for an ordinary trip, which is every other caller — so an existing
     ///   `NavigationModel` behaves exactly as it did.
     init(route: RouteFeature, destination: CLLocationCoordinate2D,
          pref: Double, weights: [String: Double], trace: DriveTrace? = nil,
-         turnaround: CLLocationCoordinate2D? = nil) {
+         turnaround: CLLocationCoordinate2D? = nil,
+         voice: VoiceGuide? = nil) {
         self.route = route
         self.steps = route.properties.steps
         self.coordinates = route.coordinates
@@ -492,6 +511,8 @@ final class NavigationModel {
         self.remainingMeters = route.properties.km * 1000
         self.remainingMinutes = route.properties.minutes
         self.trace = trace
+        self.voice = voice
+        self.voiceMuted = voice?.muted ?? true
         if let turnaround {
             self.loopTurnaround = (turnaround,
                                    progress(of: turnaround,
@@ -502,6 +523,9 @@ final class NavigationModel {
         self.stepRemaining = Self.remainingAtEachStep(of: steps, along: coordinates)
         trace?.route(route, reason: "start")
         if trace != nil { startWatchdog() }
+        // Under the controls, with the recording state and the reply to a tap —
+        // never above the maneuver the driver is about to miss.
+        voice?.onProblem = { [weak self] message in self?.report(message) }
     }
 
     /// Close out the drive — called when the user leaves navigation, however it
@@ -702,14 +726,28 @@ final class NavigationModel {
     /// projects onto the abandoned line, and `advanceSteps` keeps walking the
     /// index off that projection. Which is worse than frozen, not better: the
     /// name changes, plausibly, and means nothing.
+    /// Whether the step list still describes the road the car is on.
+    ///
+    /// Extracted from `currentRoad` rather than copied, because `VoiceGuide`
+    /// needs the same test and the two must never disagree: what the screen
+    /// declines to name is exactly what the voice must decline to say.
+    ///
+    /// False before a fix or before joining, which is not the same thing as
+    /// off-route — `currentRoad` still tells those apart for its own purposes.
+    var stepsDescribeWhereWeAre: Bool {
+        guard !arrived, hasJoinedRoute, !steps.isEmpty,
+              let here = lastProgress else { return false }
+        return !awaitingJoin && !runningBackwards(here)
+            && here.offRoute <= Self.offRouteMeters
+    }
+
     var currentRoad: CurrentRoad {
         // `lastProgress` nil is not off-route, it is no fix yet: the reroute
         // path forces `hasJoinedRoute` true by hand, so tapping "fastest"
         // before the first fix lands would otherwise read as having strayed.
         guard !arrived, hasJoinedRoute, !steps.isEmpty,
-              let here = lastProgress else { return .unknown }
-        guard !awaitingJoin, !runningBackwards(here),
-              here.offRoute <= Self.offRouteMeters else { return .offRoute }
+              lastProgress != nil else { return .unknown }
+        guard stepsDescribeWhereWeAre else { return .offRoute }
         // Empty rather than absent on the arrival step and on a way carrying
         // neither name nor ref; nil on a response cached before the field
         // existed. An unnamed road is not an off-route one — say nothing.
@@ -813,6 +851,9 @@ final class NavigationModel {
             arrived = true
             remainingMeters = 0
             remainingMinutes = 0
+            // Said here and not below, because `arrived` latches on this line
+            // and nothing after the return ever runs again.
+            voice?.announceArrival()
             trace?.fix(location, progress: here, joined: hasJoinedRoute, step: currentStep)
             trace?.end(reason: "arrived")
             return
@@ -820,6 +861,14 @@ final class NavigationModel {
 
         advanceSteps(here, from: location)
         updateRemaining(here)
+        // Here, and not inside `advanceSteps`, so the decision sees the final
+        // `distanceToNext` — but still ahead of `settleAwaitingJoin` below, so
+        // it is gated on the same `awaitingJoin` that `advanceSteps` just used.
+        // Voice and banner cannot disagree about which maneuver is current.
+        voice?.consider(steps: steps, currentStep: currentStep,
+                        distanceToNext: distanceToNext, from: location,
+                        plannedPace: plannedPace,
+                        describesWhereWeAre: stepsDescribeWhereWeAre)
         // Recorded after the step and distance work so the fix carries the state
         // it produced, not the previous fix's.
         trace?.fix(location, progress: here, joined: hasJoinedRoute, step: currentStep)
@@ -1063,6 +1112,15 @@ final class NavigationModel {
     /// measurably optimistic on the small roads scenic routes favour), so this
     /// is an estimate on top of an estimate — good enough to plan by, not to
     /// promise by.
+    /// The route's own average speed, m/s — what the voice projects with until
+    /// a fix has reported a speed of its own. Free-flow and optimistic, which
+    /// is why `VoiceGuide` clamps it rather than trusting it.
+    private var plannedPace: Double {
+        let minutes = route.properties.minutes
+        guard minutes > 0 else { return 0 }
+        return route.properties.km * 1000 / (minutes * 60)
+    }
+
     private func updateRemaining(_ here: RouteProgress) {
         let total = route.properties.km * 1000
         remainingMeters = hasJoinedRoute ? here.remaining : total
@@ -1280,6 +1338,11 @@ final class NavigationModel {
         // very next fix, so it costs nothing there.
         awaitingJoin = true
         awaitingJoinSince = now()
+        // Nothing to un-say. Same line, same place on it, so an utterance in
+        // flight is still true and the latch still describes what the driver
+        // has heard — which is the whole point of keying it on the maneuver's
+        // place rather than on `currentStep`, reset from zero just above.
+        voice?.routeMerged()
     }
 
     /// Follow a different route from here on.
@@ -1315,5 +1378,10 @@ final class NavigationModel {
         awaitingJoinSince = now()
         // Evidence about the *old* line says nothing about this one.
         consecutiveOffRouteFixes = 0
+        // Nor does anything already said. A prepare in flight may be about a
+        // maneuver this route no longer contains, which is not stale but wrong,
+        // so it is cut mid-word. `awaitingJoin` above then holds the silence
+        // until the driver reaches the junction the new line starts at.
+        voice?.routeAdopted()
     }
 }
