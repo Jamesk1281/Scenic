@@ -92,6 +92,61 @@ final class RouteComparisonTests: XCTestCase {
         XCTAssertTrue(c.isSameDrive)
     }
 
+    func test_scores_a_tolerance_apart_still_go_by_what_is_printed() {
+        // The two cases `abs(difference) < 0.05` got backwards, in both
+        // directions. Neither is exotic: measured over 983 sampled routes, four
+        // of them printed an identical score under the word "raises".
+        let wider = comparison(fastest: 57.6, scenic: 57.6,
+                               fastestScore: 4.851, scenicScore: 4.949)
+        XCTAssertTrue(wider.isSameDrive,
+                      "0.098 apart, but both print 4.9 — the reader sees no change")
+
+        let narrower = comparison(fastest: 57.6, scenic: 57.6,
+                                  fastestScore: 4.949, scenicScore: 4.951)
+        XCTAssertFalse(narrower.isSameDrive,
+                       "0.002 apart, but they print 4.9 and 5.0 — the reader sees one")
+    }
+
+    // MARK: - The sentence cannot claim a rise the numbers do not show
+
+    func test_a_scenic_route_that_scores_lower_is_not_described_as_raising() {
+        // Worcester-area trip, 983-route census: the scenic arm came back
+        // 4.8 km shorter and 0.3 min slower, scoring 5.21 against 5.79, and the
+        // sentence read "adds 1 min and raises scenery 5.8 → 5.2". The server
+        // now returns the fastest route in that case, but the app must not be
+        // the only thing standing between an older backend and that sentence.
+        let c = comparison(fastest: 26.4, scenic: 26.7,
+                           fastestScore: 5.794, scenicScore: 5.210)
+
+        XCTAssertFalse(c.isSameDrive)
+        XCTAssertFalse(c.summary.contains("raises"), c.summary)
+        XCTAssertTrue(c.summary.contains("lowers"), c.summary)
+        XCTAssertTrue(c.summary.contains("**5.8**"), c.summary)
+        XCTAssertTrue(c.summary.contains("**5.2**"), c.summary)
+    }
+
+    func test_time_spent_for_no_change_in_scenery_says_exactly_that() {
+        // A different route that costs a minute and lands on the same printed
+        // score. "Raises scenery 5.3 → 5.3" is the sentence about nothing that
+        // `isSameDrive` catches only when the drive is also no slower.
+        let c = comparison(fastest: 23.0, scenic: 24.0,
+                           fastestScore: 5.313, scenicScore: 5.316)
+
+        XCTAssertEqual(c.extraMinutes, 1)
+        XCTAssertFalse(c.isSameDrive, "it costs a minute, so it is not the same drive")
+        XCTAssertFalse(c.summary.contains("raises"), c.summary)
+        XCTAssertTrue(c.summary.contains("leaves scenery at **5.3**"), c.summary)
+        XCTAssertTrue(c.summary.contains("**1 min**"), c.summary)
+    }
+
+    func test_the_ordinary_case_still_reads_as_before() {
+        // The guard above must not have cost the sentence everybody sees.
+        let c = comparison(fastest: 57.6, scenic: 106.4,
+                           fastestScore: 4.4, scenicScore: 6.1)
+        XCTAssertEqual(c.summary,
+                       "Scenic adds **48 min** and raises scenery **4.4** → **6.1**")
+    }
+
     func test_the_markdown_resolves_rather_than_being_shown_raw() {
         let c = comparison(fastest: 57.6, scenic: 106.4)
         let rendered = String(c.attributedSummary.characters)

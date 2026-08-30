@@ -1,10 +1,13 @@
 # What the router actually offers, across a thousand routes
 
-**Status: run.** 983 town-to-town trips on the shipping graph — 5,192 routes —
-all four questions answered. Everything below is measured
-unless it says otherwise. No production code was touched: this study adds
-`tools/route_census.py` and the three files in `docs/route-census/`, and nothing
-in `pipeline/`, `server/` or `ios/` moved. `pytest tests/ -q` is 294 passed.
+**Status: run, and one finding acted on.** 983 town-to-town trips on the
+shipping graph — 5,192 routes — all four questions answered. Everything below is
+measured unless it says otherwise.
+
+The measurement itself touched no production code: it adds
+`tools/route_census.py` and the three files in `docs/route-census/`. A separate
+follow-up commit then fixed the one unambiguous defect it turned up — see
+**What was fixed** at the end. `pytest tests/ -q` is 316 passed.
 
 **The build.** `data/processed-ne` — the New England parquets the deployed
 server runs — graph tables written **2026-08-29 14:33**, after the landcover
@@ -169,10 +172,38 @@ arm — median 0.41 miles lost, worst 18.86, median 1.8 extra minutes, on a rout
 median 3.6 km shorter. It concentrates in short trips (16 of the 30 are 10–25
 km). `mean_score` rose on **27 of those 30** (median +0.58), because a shorter
 route with a better average genuinely scores higher per km — so on those trips
-the app's sentence (`RouteResults.swift:93`) reads "Scenic adds N min and raises
-scenery 4.1 → 4.7" while the beautiful miles fell. That is not the app lying,
-but it does mean **the on-screen score cannot detect this case**, and a warning
-built on the score will never fire on it.
+the app's sentence read "Scenic adds N min and raises scenery 4.1 → 4.7" while
+the beautiful miles fell. That is not the app lying, but it does mean **the
+on-screen score cannot detect this case**, and a warning built on the score will
+never fire on it.
+
+**Three of the 30 are worse on the score too, and those are a defect.** Where
+the scenic arm scores *below* the fastest arm it has failed at its only job, and
+the product had a better route in hand and gave it away. Across all 983 pairs
+that is 6 (0.6%; 9 with `town` off) — the worst 4.8 km shorter, 0.3 minutes
+slower, scoring 5.21 against 5.79. That subset is now guarded; see **What was
+fixed**. The other 24 are not a defect:
+
+**What the router actually did with the distance.** Re-routing the 30 and
+reading the per-edge scores shows it cut the dullest road hard and bought
+middling road with it.
+
+| score band | median change in km, scenic − fastest |
+|---|---|
+| 0–4 (dull) | **−6.57** |
+| 4–5 | +1.38 |
+| 5–6 | +1.93 |
+| 6–7 | +0.78 |
+| 7–8 | −0.58 |
+| 8–10 | −0.12 |
+
+In minutes: time on road scoring under 4 falls by a median 1.5 minutes (down on
+25 of 30), time on road scoring 7 or better falls by 0.7 (down on 26 of 30), and
+time on road scoring 6 or better is a wash (up on 15, down on 13). The driver
+swaps dull road for pleasant road and loses a little of the very best. Whether
+that is the trade they wanted is a taste question; `beautiful_km`, thresholded
+at 7.0, cannot see the first half of it at all. That is a fact about the metric,
+not a bug in the router.
 
 Frequencies worth having in hand, pooled deliberately because they are counts,
 not levels:
@@ -487,6 +518,47 @@ have cost the two most useful sections here.
    (`docs/geodata-peer-review-verdict.md`), so a per-state cut of these same
    983 routes would probably not be flat. The CSV has the coordinates; it was
    not cut that way here.
+
+## What was fixed
+
+One finding here was an unambiguous defect and is fixed. The rest are
+measurements, and deliberately did not change any code.
+
+**1. The server no longer offers a scenic route that scores below the fastest
+one.** `server/app.py`, `_no_worse_than_fastest`: both arms are already computed
+on the same scale, so if the scenic one comes back lower it is handed the
+fastest route instead. Applies to `/api/route` with and without a waypoint.
+
+- Cause: the detour cost is `km * (1 - score/10)`, proportional to length, so a
+  shorter route can carry less total penalty while being uglier per kilometre.
+  Dijkstra returns it — right by its own objective, wrong by the driver's.
+- Reach: 6 of 983 trips at the shipped defaults, 9 with `town` off, and 0–4 of
+  252 at the other pref settings. Replayed through the guard, the 6 become
+  "Same as the fastest route at this setting".
+- Not fixed: the cost function itself. Making the penalty proportional to
+  minutes instead of km would remove the cause, and would also invalidate the
+  BETA/PREF_CURVE calibration those two constants share — a sweep, not a bug
+  fix, and the 24 non-dominated routes above suggest the current trade is
+  defensible anyway.
+
+**2. The app no longer describes a scenery number that did not rise as a rise.**
+`ios/Sources/RouteResults.swift`: `isSameDrive` compared the raw scores within
+0.05, while the cards print them to one decimal. That is wrong in both
+directions — 4.851 and 4.949 are 0.098 apart and both print "4.9", while 4.949
+and 4.951 are 0.002 apart and print "4.9" and "5.0". It now compares the printed
+strings, which is what the old comment already claimed it did, and `summary`
+gained the two shapes it was missing: a route that costs time and moves the
+number nowhere, and one that lowers it.
+
+The app keeps its own guard rather than relying on the server's, because a
+shipped app talks to whichever backend is deployed.
+
+**Verification.** Both fixes were replayed over the full 983-pair census: 6
+routes swapped, and **0 of 983 sentences now claim a rise the numbers beside
+them do not show** (was 6). `pytest tests/ -q` 316 passed, up from 294; the 13
+new Python tests and 3 new Swift tests were each confirmed to fail against the
+unfixed code. The Massachusetts pair pinned in `test_api.py` — Hancock to
+Shutesbury — is a real instance found by sweeping 461 random MA pairs.
 
 ## Files
 

@@ -166,6 +166,31 @@ def _parse_weights(args):
     return weights
 
 
+def _no_worse_than_fastest(fastest, scenic):
+    """The scenic route, or the fastest one when "scenic" came back scoring lower.
+
+    The detour cost is `km * (1 - score/10)` (`Router._weights`) — proportional
+    to *length* — so at any pref above 0 the router is also, quietly, a
+    shortest-distance router, and a shorter route can carry less total penalty
+    while being uglier per kilometre. Dijkstra then returns it, correctly by its
+    own objective and wrongly by the driver's.
+
+    Measured over 983 sampled trips at the shipped defaults, that happens on 6
+    of them (0.6%; 9 with `town` off). One came back 4.8 km shorter, 0.3 minutes
+    slower, and scoring 5.21 against the fastest route's 5.79 — and the app
+    dutifully rendered it as "adds 1 min and raises scenery 5.8 -> 5.2".
+    Handing back the fastest route instead is better on both numbers the app
+    prints, costs nothing because it is already computed, and makes the screen
+    say "Same as the fastest route at this setting", which is true.
+
+    Deliberately *not* a fix to the cost function. Making the penalty
+    proportional to minutes rather than km would remove the cause, and would
+    also invalidate the BETA/PREF_CURVE calibration those two constants share —
+    a sweep, not a bug fix. See docs/route-distribution-study.md.
+    """
+    return fastest if scenic.mean_score < fastest.mean_score else scenic
+
+
 @app.get("/api/route")
 def api_route():
     try:
@@ -227,6 +252,7 @@ def api_route():
         # worth fixing; see docs/loop-routes-design.md.
         if fastest is None or scenic is None:
             return jsonify(error="no route found through that waypoint"), 404
+        scenic = _no_worse_than_fastest(fastest, scenic)
         return jsonify(fastest=fastest.geojson(), scenic=scenic.geojson())
 
     fastest = ROUTER.route(s, t, 0.0, weights, heading=heading)
@@ -234,6 +260,7 @@ def api_route():
               else ROUTER.route(s, t, pref, weights, heading=heading))
     if fastest is None or scenic is None:
         return jsonify(error="no route found between those points"), 404
+    scenic = _no_worse_than_fastest(fastest, scenic)
     return jsonify(fastest=fastest.geojson(), scenic=scenic.geojson())
 
 
