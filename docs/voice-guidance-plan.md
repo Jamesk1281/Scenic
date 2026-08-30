@@ -571,6 +571,77 @@ not produce a burst of catch-up.
 
 ---
 
+## 8a. Choosing a voice
+
+**Added 2026-08-30, after the rest shipped.** The schedule is sized on how long
+an instruction takes to say, so "let the driver pick a voice" is not a cosmetic
+setting — it is a change to the input the thresholds were derived from.
+
+### The voices are not interchangeable
+
+Measured by offline synthesis of "Turn right onto Morton Street" over all 25
+English voices on iOS 26:
+
+| group | seconds |
+|---|---|
+| Karen, Samantha, Rishi, Daniel, Moira | 1.69 – 1.80 |
+| Fred, Bubbles, Kathy, Junior, Ralph, Tessa, Whisper | 1.84 – 1.98 |
+| Boing, Albert, Bahh | 2.15 – 2.38 |
+| Cellos, Organ | 2.90 – 3.26 |
+| Bad News, Jester, Bells | 3.79 – 4.91 |
+| **Good News** | **6.15** |
+
+The six modern voices sit within 9% of the 1.83 s the thresholds assume, so the
+schedule survives any of them unchanged. "Good News" takes **6.15 s** to say a
+sentence that has to finish three seconds before the junction: fired at
+`finalAt` it lands after the turn, every time.
+
+### Two gates, because neither is sufficient
+
+- **Provenance.** Modern voices are `com.apple.voice.*` (which covers the
+  enhanced and premium ones a driver downloads); the legacy MacinTalk bag is
+  `com.apple.speech.synthesis.voice.*`. On the measured runtime that split is
+  exact — six against nineteen.
+- **Duration**, capped at `VoiceCatalogue.budget` = 2.6 s, for a future voice
+  that is well-behaved but slow.
+
+Each catches what the other cannot. Duration alone lets "Bahh" — a sheep —
+through at 2.38 s, indistinguishable from a hypothetical slow premium voice;
+that was not hypothetical, it was in the picker until the namespace gate went
+in. Provenance alone cannot see speed at all.
+
+### The thresholds follow the voice
+
+`finalAt`, `chainWithin` and `prepareFloor` shift by however much longer the
+chosen voice takes than the 1.83 s reference — additively, because the
+clearance a driver needs *after* the words is the same whoever says them, and
+never downwards, because the reference values were validated against the corpus
+and a quicker voice is not evidence for cutting them. In practice this is at
+most 0.15 s for the six offered voices. It is there so the derivation stays
+honest if the budget is ever raised for a slower premium voice, rather than the
+constants quietly becoming wrong.
+
+### Where it lives
+
+Behind a long press on the mute glyph in the banner, which is the one
+affordance that already means "the voice". Choosing one **speaks a sample in
+it** and unmutes — a voice is picked by ear, and a list of names on a settings
+screen is not a choice anyone can make. That is also why it is on the nav
+screen rather than the planning sheet, despite the awkwardness of choosing one
+while driving.
+
+Measured once per voice and cached in `UserDefaults`, so it is instant on every
+drive after the first. The selection is stored as an identifier and re-resolved
+on read, so a voice deleted in Settings since it was chosen falls back to the
+default rather than leaving the app mute.
+
+**Not verified here:** enhanced and premium voices. The simulator has none
+installed, and they are the ones actually worth using — they are also the most
+likely to sit above the 2.6 s budget, which is the one number in this section a
+real phone could still move.
+
+---
+
 ## 9. Staged plan
 
 | stage | what | estimate | status |
@@ -582,6 +653,7 @@ not produce a burst of catch-up.
 | **4** | Phrasing normaliser. Came in well under estimate — measuring the pronunciations first (§4.2) removed three of the four rules. | ½ day | **done** |
 | **5** | `actionProblem` reporting for session failures. | 2 h | **done** |
 | **6** | An ndjson replay harness over the recorded drives. | 1 day | **done** — and it did not prove what stage 6 was for; see §10 |
+| **7** | Voice selection, filtered and threshold-adapting; see §8a. | ½ day | **done** |
 
 All of it landed in `ios/Sources/VoiceGuide.swift` plus wiring in
 `NavigationModel`, `RouteModel` and `NavView`, with 28 tests in

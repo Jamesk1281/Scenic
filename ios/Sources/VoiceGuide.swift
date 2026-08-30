@@ -46,6 +46,9 @@ protocol Speaker: AnyObject {
 
     /// Abandon anything in flight, mid-word.
     func stop()
+
+    /// Speak in this voice from now on. Nil is the system default.
+    func use(_ voice: AVSpeechSynthesisVoice?)
 }
 
 /// `Speaker` on `AVSpeechSynthesizer`.
@@ -56,6 +59,14 @@ final class SystemSpeaker: NSObject, Speaker {
     var onProblem: ((String) -> Void)?
 
     private let synth = AVSpeechSynthesizer()
+
+    /// Resolved once rather than looked up per utterance, and re-resolved by
+    /// `use` when the driver picks a different one.
+    private var voice: AVSpeechSynthesisVoice? = VoiceCatalogue.selectedVoice()
+
+    func use(_ voice: AVSpeechSynthesisVoice?) {
+        self.voice = voice ?? AVSpeechSynthesisVoice(language: "en-US")
+    }
 
     /// Handing the session back measured **573 ms** on an iPhone 17 (n=27, min
     /// 570, max 577) — and 0 ms on a simulator, so it is real hardware cost and
@@ -118,7 +129,7 @@ final class SystemSpeaker: NSObject, Speaker {
         }
 
         let utterance = AVSpeechUtterance(string: text)
-        utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
+        utterance.voice = voice
         utterance.rate = AVSpeechUtteranceDefaultSpeechRate
         synth.speak(utterance)
         return true
@@ -192,7 +203,7 @@ final class VoiceGuide {
     /// finishes them ~3 s before the turn even for a long instruction. Less and
     /// the longest instructions are still being spoken at the junction; more
     /// and "now" stops meaning now (8 s is 161 m at 45 mph).
-    static let finalAt: TimeInterval = 6
+    static let referenceFinalAt: TimeInterval = 6
 
     /// Speak it anyway at this distance, whatever the projection says. A time
     /// rule divides by speed, so a car stopped 30 m short of its turn at a
@@ -209,7 +220,7 @@ final class VoiceGuide {
     /// Below this when the maneuver becomes current, no prepare at all — there
     /// is no room for two utterances and a crammed one is worse than one.
     /// 6 s (the final) + 3.7 s (a p90 prepare) + 4 s of silence between them.
-    static let prepareFloor: TimeInterval = 14
+    static let referencePrepareFloor: TimeInterval = 14
 
     /// When the leg *after* the maneuver being announced is shorter than this,
     /// the maneuver beyond it is named in the same breath — "turn right onto
@@ -220,7 +231,35 @@ final class VoiceGuide {
     /// Not a nicety. Over the corpus this chains a fifth of all maneuvers at
     /// town speed and a third at 45, and a schedule without it cannot deliver
     /// 13.7% of maneuvers at 30 mph before the driver reaches them.
-    static let chainWithin: TimeInterval = 12
+    static let referenceChainWithin: TimeInterval = 12
+
+    /// The utterance length every threshold above was derived from — the
+    /// median bare instruction over the corpus, in the default voice.
+    static let referenceSeconds: TimeInterval = 1.83
+
+    /// How much longer the chosen voice takes to say a maneuver than the one
+    /// the thresholds were sized on.
+    ///
+    /// Additive and never negative. The clearance a driver needs *after* the
+    /// words is the same whichever voice says them, so a voice that takes half
+    /// a second longer has to start half a second earlier — nothing else about
+    /// the derivation moves. A faster voice does not tighten the thresholds,
+    /// because they were measured and validated at the reference and there is
+    /// no evidence for going below them.
+    ///
+    /// Small in practice: `VoiceCatalogue.budget` caps the list at 2.6 s, so
+    /// this is at most 0.77 s and for the sixteen real voices at most 0.15 s.
+    /// It is here so the derivation stays honest if the budget is ever raised
+    /// for a slower premium voice, rather than the constants quietly becoming
+    /// wrong.
+    private var stretch: TimeInterval = 0
+
+    /// Speak the maneuver — `referenceFinalAt`, shifted for this voice.
+    var finalAt: TimeInterval { Self.referenceFinalAt + stretch }
+    /// Both utterances stretch, so the room needed for the pair does twice.
+    var prepareFloor: TimeInterval { Self.referencePrepareFloor + 2 * stretch }
+    /// The chained maneuver's own words are what run long here.
+    var chainWithin: TimeInterval { Self.referenceChainWithin + stretch }
 
     // MARK: State
 
@@ -278,6 +317,11 @@ final class VoiceGuide {
     init(speaker: Speaker, muted: Bool = VoiceGuide.isMuted) {
         self.speaker = speaker
         self.muted = muted
+        // The selection outlives the process, so a drive that starts with a
+        // slower voice already chosen has to size its thresholds for it before
+        // the first fix rather than after the first picker visit.
+        self.stretch = max(0, (VoiceCatalogue.cachedSecondsForSelection()
+                               ?? Self.referenceSeconds) - Self.referenceSeconds)
         speaker.onProblem = { [weak self] message in self?.onProblem?(message) }
         speaker.onFinished = { [weak self] in self?.inFlight = nil }
         speaker.onInterrupted = { [weak self] in
@@ -341,13 +385,13 @@ final class VoiceGuide {
                                _ pace: Double) -> Bool {
         let key = Announcement(generation, at: step.coordinate, phase: .final)
         guard !spoken.contains(key) else { return false }
-        guard eta <= Self.finalAt || distance <= Self.finalFloorMeters else { return false }
+        guard eta <= finalAt || distance <= Self.finalFloorMeters else { return false }
 
         // Is the maneuver after this one too close to get its own announcement?
         // `distance_m` is how far *this* instruction carries the driver, so it
         // is the gap between this maneuver and the next.
         var chained: RouteStep?
-        if steps.indices.contains(index + 1), step.distance_m / pace < Self.chainWithin {
+        if steps.indices.contains(index + 1), step.distance_m / pace < chainWithin {
             chained = steps[index + 1]
         }
 
@@ -381,7 +425,7 @@ final class VoiceGuide {
         // Too late to fit one. Latched as done so it cannot fire later, which
         // is what "the prepare is skipped when the leg is too short" means in
         // code: on this route profile that is one maneuver in eight.
-        guard eta >= Self.prepareFloor else {
+        guard eta >= prepareFloor else {
             spoken.insert(key)
             return
         }
@@ -409,6 +453,22 @@ final class VoiceGuide {
             spoken.remove(key)
             inFlight = nil
         }
+    }
+
+    // MARK: Choosing a voice
+
+    /// Switch voice, remember it, and say something in it.
+    ///
+    /// The sample is the point of doing this from the nav screen rather than a
+    /// settings list: a voice is chosen by ear, and the only honest preview is
+    /// the app saying an actual instruction. It also unmutes — picking a voice
+    /// while silenced and hearing nothing would read as the picker being broken.
+    func useVoice(_ measured: VoiceCatalogue.Measured) {
+        VoiceCatalogue.selectedIdentifier = measured.identifier
+        stretch = max(0, measured.seconds - Self.referenceSeconds)
+        speaker.use(measured.voice)
+        muted = false
+        speaker.say(VoiceCatalogue.reference + ".")
     }
 
     // MARK: Route changes

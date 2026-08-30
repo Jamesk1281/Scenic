@@ -1,3 +1,4 @@
+import AVFoundation
 import CoreLocation
 import XCTest
 @testable import Scenic
@@ -35,6 +36,11 @@ final class VoiceGuideTests: XCTestCase {
         }
 
         func stop() { stops += 1 }
+
+        /// The last voice asked for, so a test can check the picker reached
+        /// the synthesiser rather than only the defaults.
+        private(set) var voiceUsed: AVSpeechSynthesisVoice??
+        func use(_ voice: AVSpeechSynthesisVoice?) { voiceUsed = voice }
 
         /// The synthesiser reaching the end of an utterance.
         func finish() { onFinished?() }

@@ -488,6 +488,16 @@ final class NavigationModel {
     /// where it would do something. False in tests, which build without one.
     var canSpeak: Bool { voice != nil }
 
+    /// Which voice is speaking, so the picker can tick it.
+    var selectedVoiceIdentifier: String? { VoiceCatalogue.selectedIdentifier }
+
+    /// Switch voice from the control in the banner. Speaks a sample in it,
+    /// which is the only honest way to choose one.
+    func useVoice(_ measured: VoiceCatalogue.Measured) {
+        voice?.useVoice(measured)
+        voiceMuted = false
+    }
+
     /// Mirrors `VoiceGuide.muted` so the banner's control is observable —
     /// `@Observable` tracks *this* model's stored properties, and the guide is
     /// a plain reference held behind a `let`.

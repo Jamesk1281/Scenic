@@ -17,6 +17,9 @@ struct NavView: View {
 
     /// Whether the "switch to fastest?" confirmation is up.
     @State private var confirmingFastest = false
+    /// English voices that can keep up with the schedule — see
+    /// `VoiceCatalogue`. Empty until the first measurement pass finishes.
+    @State private var voices: [VoiceCatalogue.Measured] = []
 
     /// Tap target for the two corner buttons. Scaled, so the glyph inside still
     /// fits when the driver runs a larger system text size.
@@ -162,7 +165,7 @@ struct NavView: View {
         .padding(.horizontal)
     }
 
-    /// Silence the spoken directions.
+    /// Silence the spoken directions — and, held down, choose the voice.
     ///
     /// In the banner, and deliberately not in `controlRow`. The banner is the
     /// only thing on this screen that is always on it — the verdict buttons
@@ -179,9 +182,32 @@ struct NavView: View {
     /// The reach to the top of the screen is longer. That is the right trade
     /// for a once-a-drive action, and the same reasoning that puts the
     /// destructive `End` button in a corner rather than under the thumb.
+    ///
+    /// Voice selection hides behind a long press rather than taking a control
+    /// of its own, because it is a once-ever choice sharing the one affordance
+    /// that already means "the voice". It lives here rather than on the
+    /// planning screen for a reason that outweighs the awkwardness of choosing
+    /// one while driving: a voice is picked by ear, and `useVoice` speaks a
+    /// real instruction in it. A list of names on a settings screen is not a
+    /// choice anyone can make.
     @ViewBuilder private var muteButton: some View {
         if nav.canSpeak {
-            Button { nav.voiceMuted.toggle() } label: {
+            Menu {
+                Section("Voice") {
+                    ForEach(voices) { option in
+                        Button {
+                            nav.useVoice(option)
+                        } label: {
+                            // A checkmark rather than a separate selected
+                            // state: `Menu` gives no free way to show one, and
+                            // a glyph beside the name reads at a glance.
+                            Label(option.label,
+                                  systemImage: option.identifier == nav.selectedVoiceIdentifier
+                                  ? "checkmark" : "speaker.wave.1")
+                        }
+                    }
+                }
+            } label: {
                 Image(systemName: nav.voiceMuted
                       ? "speaker.slash.fill" : "speaker.wave.2.fill")
                     .font(.title3)
@@ -190,11 +216,17 @@ struct NavView: View {
                     // hittable without aiming.
                     .frame(width: controlSize, height: controlSize)
                     .contentShape(Rectangle())
+            } primaryAction: {
+                nav.voiceMuted.toggle()
             }
-            .buttonStyle(.plain)
             .accessibilityLabel(nav.voiceMuted
                                 ? "Turn spoken directions on"
                                 : "Turn spoken directions off")
+            .accessibilityHint("Press and hold to change the voice")
+            // Measured once and cached, so this is instant on every drive after
+            // the first. Off the first fix's critical path either way: the
+            // menu cannot be open before the map is.
+            .task { voices = await VoiceCatalogue.usable() }
         }
     }
 
