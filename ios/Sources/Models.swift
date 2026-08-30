@@ -142,7 +142,37 @@ struct RouteProps: Decodable {
     let km: Double
     let minutes: Double
     /// Average scenic score (0–10) along the route, length-weighted.
+    ///
+    /// Still decoded, still what `tools/analyze_trace.py` and every recorded
+    /// drive are calibrated against — but no longer what the cards print. See
+    /// `beautiful_km`.
     let mean_score: Double
+    /// Kilometres of the route on road scoring `beautiful_score` or better:
+    /// the legible half of the same fact. `mean_score` is length-weighted over
+    /// the whole trip, so the unavoidable arterial at each end drags a lovely
+    /// middle down and nobody has a feel for 4.2 against 5.1; this counts the
+    /// road actually worth driving and leaves the rest out of it. It also sees
+    /// a case the mean cannot: on 3.1% of 983 sampled trips the scenic arm came
+    /// back slower *and* with less beautiful road, and `mean_score` rose on 27
+    /// of those 30.
+    ///
+    /// **Optional, and it has to stay optional.** The deployed backend predates
+    /// this field and an app in the store talks to whichever backend is
+    /// deployed — the same reasoning `RouteComparison.summary` records about
+    /// `_no_worse_than_fastest`. Non-optional here would fail *every* route
+    /// decode against the live server. `RouteComparison` falls back to the
+    /// 0–10 mean when it is nil.
+    ///
+    /// Comparable between the two arms of one response, which `server/app.py`
+    /// scores with the caller's weights on one scale — and not across weight
+    /// settings: on a road measured byte-identical under two Tune settings this
+    /// moved by up to 22.9 km where `mean_score` moved by at most 0.759. Do not
+    /// difference it across tunings.
+    let beautiful_km: Double?
+    /// The score at or above which road counts as beautiful (7.0), sent along
+    /// so the app can say what the bar was without hardcoding it. Optional for
+    /// the same reason as `beautiful_km`.
+    let beautiful_score: Double?
     /// Kilometers of the route that pass each scenery feature, e.g.
     /// `["forest/park": 36.0, "water": 27.0, ...]`.
     let scenery_km: [String: Double]

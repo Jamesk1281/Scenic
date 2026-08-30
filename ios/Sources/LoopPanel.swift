@@ -222,10 +222,17 @@ struct LoopPanel: View {
         .background(tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
     }
 
-    /// "A 25 mi loop scoring 5.8/10, back where you started."
+    /// "19 of your 25 mi on beautiful road, back where you started."
+    ///
+    /// The 0–10 mean used to be the middle clause. It is gone because the
+    /// BEAUTIFUL ROAD card two rows up already leads with the mile count, and
+    /// the planning tab's cards now do too — a second scale on the same screen
+    /// asks the driver to hold two rulers at once, and the mean is the one
+    /// nobody has a feel for. `mean_score` is still decoded and still what the
+    /// traces are calibrated against; it is just no longer printed here.
     private func summary(_ meta: LoopMeta) -> AttributedString {
-        let markdown = "**\(meta.km.wholeMilesFromKm) mi** scoring "
-            + "**\(String(format: "%.1f", meta.mean_score))/10**, "
+        let markdown = "**\(meta.beautiful_km.wholeMilesFromKm) of your "
+            + "\(meta.km.wholeMilesFromKm) mi** on beautiful road, "
             + "back where you started"
         return (try? AttributedString(markdown: markdown)) ?? AttributedString(markdown)
     }

@@ -177,28 +177,39 @@ enum Fixture {
 
     /// `steps` are (maneuver coordinate, instruction, name), where a nil name
     /// leaves the key off the step entirely.
+    /// `beautifulKm` defaults to nil, which leaves the key off entirely — the
+    /// shape the *deployed* backend still sends. Every fixture that does not
+    /// ask for it is therefore an old-backend response, which is how the
+    /// fallback path stays exercised for free rather than only where a test
+    /// remembers to check it.
     static func feature(coordinates: [[Double]], km: Double, minutes: Double,
                         steps: [(CLLocationCoordinate2D, String, String?)],
                         meanScore: Double = 6.0,
+                        beautifulKm: Double? = nil,
                         sceneryKm: [String: Double] = ["water": 3.0, "coast": 0.0,
                                                        "forest/park": 2.0]) -> [String: Any] {
-        [
+        var properties: [String: Any] = [
+            "km": km,
+            "minutes": minutes,
+            "mean_score": meanScore,
+            "scenery_km": sceneryKm,
+            "steps": steps.map { coordinate, text, name -> [String: Any] in
+                var step: [String: Any] = ["instruction": text,
+                                           "lat": coordinate.latitude,
+                                           "lon": coordinate.longitude,
+                                           "distance_m": 0]
+                if let name { step["name"] = name }
+                return step
+            },
+        ]
+        if let beautifulKm {
+            properties["beautiful_km"] = beautifulKm
+            properties["beautiful_score"] = 7.0
+        }
+        return [
             "type": "Feature",
             "geometry": ["type": "LineString", "coordinates": coordinates],
-            "properties": [
-                "km": km,
-                "minutes": minutes,
-                "mean_score": meanScore,
-                "scenery_km": sceneryKm,
-                "steps": steps.map { coordinate, text, name -> [String: Any] in
-                    var step: [String: Any] = ["instruction": text,
-                                               "lat": coordinate.latitude,
-                                               "lon": coordinate.longitude,
-                                               "distance_m": 0]
-                    if let name { step["name"] = name }
-                    return step
-                },
-            ],
+            "properties": properties,
         ]
     }
 
