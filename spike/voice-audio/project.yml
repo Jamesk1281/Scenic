@@ -1,0 +1,105 @@
+# THROWAWAY. Measures one thing: whether AVSpeechSynthesizer speaks while
+# backgrounded/locked with UIBackgroundModes: location and not audio.
+#
+# Two app targets over identical sources, differing in exactly one key, so the
+# comparison is a controlled diff and not two experiments.
+name: VoiceSpike
+options:
+  bundleIdPrefix: app.scenic.spike
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+
+targetTemplates:
+  SpikeApp:
+    type: application
+    platform: iOS
+    sources:
+      - Sources
+    info:
+      path: Generated/Info-${target_name}.plist
+      properties:
+        CFBundleDisplayName: ${target_name}
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        NSLocationWhenInUseUsageDescription: "Spike: background location, to test whether voice can speak from the same wakeups a drive runs on."
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+    settings:
+      base:
+        DEVELOPMENT_TEAM: 28ZU5P5GC3
+        MARKETING_VERSION: "0.1"
+        CURRENT_PROJECT_VERSION: "1"
+        TARGETED_DEVICE_FAMILY: "1"
+        SWIFT_VERSION: "5.0"
+        GENERATE_INFOPLIST_FILE: NO
+
+targets:
+  SpikeLoc:
+    templates: [SpikeApp]
+    info:
+      properties:
+        UIBackgroundModes:
+          - location
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.scenic.spike.loc
+
+  SpikeLocAudio:
+    templates: [SpikeApp]
+    info:
+      properties:
+        UIBackgroundModes:
+          - location
+          - audio
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.scenic.spike.locaudio
+
+  Tone:
+    type: application
+    platform: iOS
+    sources:
+      - Tone
+    info:
+      path: Generated/Info-Tone.plist
+      properties:
+        CFBundleDisplayName: Tone
+        UILaunchScreen: {}
+        UIBackgroundModes:
+          - audio
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.scenic.spike.tone
+        DEVELOPMENT_TEAM: 28ZU5P5GC3
+        TARGETED_DEVICE_FAMILY: "1"
+        SWIFT_VERSION: "5.0"
+        GENERATE_INFOPLIST_FILE: NO
+
+  SpikeUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - UITests
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.scenic.spike.uitests
+        DEVELOPMENT_TEAM: 28ZU5P5GC3
+        TARGETED_DEVICE_FAMILY: "1"
+        SWIFT_VERSION: "5.0"
+        GENERATE_INFOPLIST_FILE: YES
+
+schemes:
+  SpikeLoc:
+    build: { targets: { SpikeLoc: all } }
+    run: { config: Debug }
+  SpikeUITests:
+    build: { targets: { SpikeUITests: [test] } }
+    test: { config: Debug, targets: [SpikeUITests] }
+  SpikeLocAudio:
+    build: { targets: { SpikeLocAudio: all } }
+    run: { config: Debug }
+  Tone:
+    build: { targets: { Tone: all } }
+    run: { config: Debug }
