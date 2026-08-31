@@ -193,13 +193,26 @@ enum Fixture {
             "minutes": minutes,
             "mean_score": meanScore,
             "scenery_km": sceneryKm,
-            "steps": steps.map { coordinate, text, name -> [String: Any] in
-                var step: [String: Any] = ["instruction": text,
-                                           "lat": coordinate.latitude,
-                                           "lon": coordinate.longitude,
-                                           "distance_m": 0]
-                if let name { step["name"] = name }
-                return step
+            "steps": steps.enumerated().map { index, step -> [String: Any] in
+                let (coordinate, text, name) = step
+                // The gap to the *next* maneuver, which is what `distance_m`
+                // means: "how far this instruction carries you". It used to be
+                // hardcoded 0, which reads as every maneuver sitting on top of
+                // the one after it — harmless while nothing consumed it, and
+                // wrong the moment `VoiceGuide` asked whether two turns were
+                // too close together to announce separately. Zero on the last,
+                // as the backend really sends it.
+                let next = index + 1 < steps.count ? steps[index + 1].0 : nil
+                var out: [String: Any] = [
+                    "instruction": text,
+                    "lat": coordinate.latitude,
+                    "lon": coordinate.longitude,
+                    "distance_m": next.map { CLLocation(latitude: coordinate.latitude,
+                                                        longitude: coordinate.longitude)
+                        .distance(to: $0) } ?? 0,
+                ]
+                if let name { out["name"] = name }
+                return out
             },
         ]
         if let beautifulKm {

@@ -27,8 +27,22 @@ targets:
         # steps stop advancing, arrival never fires, and — since the recorder
         # runs on the same fix stream — half the drive trace goes missing. That
         # is the difference between one test drive and two.
+        #
+        # `audio` is here for spoken guidance, and it is not optional: measured
+        # on the phone on 2026-08-30, a build declaring only `location` failed
+        # to speak on all 19 attempts made from the background —
+        # `AVAudioSession.setActive(true)` throwing `'!pla'`
+        # (`CannotStartPlaying`) with `didStart` never firing — while the same
+        # binary with `audio` added spoke 23 of 23, 16 of them with the screen
+        # off. The app was demonstrably awake for all 19: fixes kept arriving
+        # and every attempt ran. What was refused was the audio session alone.
+        #
+        # Note that a *simulator* reports the opposite, cheerfully and
+        # consistently: it does not enforce this at all. See
+        # `docs/voice-guidance-plan.md` §1.
         UIBackgroundModes:
           - location
+          - audio
         # Expose Documents/ (where DriveTrace writes each drive) to Files.app and
         # to Finder over a cable. That is the whole export story for drive
         # traces: copy them off, delete the ones you don't want, no in-app UI
