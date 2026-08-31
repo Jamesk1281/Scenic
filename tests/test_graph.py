@@ -63,16 +63,19 @@ class TestSampleOffsets:
             assert along[0] == pytest.approx(length / 2)
 
 
-def _chunks(values_by_offset):
+def _chunks(values_by_offset, unpaved=None):
     """Chunks tiling a straight 1000 m line east from the origin.
 
     `values_by_offset` is [(start, end, component_value), ...]; every component
     takes that same value, which keeps the arithmetic in the tests obvious.
+    `unpaved` is an optional per-chunk 0/1 surface flag, defaulting to paved.
     """
     rows, geoms = [], []
-    for start, end, value in values_by_offset:
+    flags = unpaved or [0.0] * len(values_by_offset)
+    for (start, end, value), dirt in zip(values_by_offset, flags):
         geoms.append(shapely.LineString([(start, 0.0), (end, 0.0)]))
-        rows.append({**{c: float(value) for c in ALL_COMPONENTS}, "score_adj": 0.0})
+        rows.append({**{c: float(value) for c in ALL_COMPONENTS},
+                     "score_adj": 0.0, "unpaved": float(dirt)})
     gdf = gpd.GeoDataFrame(rows, geometry=geoms, crs=CRS_METERS)
     gdf["score"] = composite(blend(gdf[ALL_COMPONENTS]).to_numpy(),
                              gdf["score_adj"].to_numpy())
@@ -248,3 +251,33 @@ class TestOnRealData:
         # lands between those.
         blended = ~np.isin(np.round(long["c_water"].to_numpy(), 4), [0.0, 0.45, 1.0])
         assert blended.mean() > 0.05, "long edges still look point-sampled"
+
+
+class TestUnpavedFraction:
+    """Surface rides on the edge as a length share, not as a score penalty."""
+
+    def test_half_dirt_edge_reports_half(self):
+        """The number the router prices in minutes. An edge is one way, so in
+        practice it is 0 or 1 — but `attach_scores` length-averages it, and a
+        chunk boundary mid-edge is exactly where a midpoint reading would lie."""
+        chunks = _chunks([(0, 500, 0.5), (500, 1000, 0.5)], unpaved=[1.0, 0.0])
+        edges = _edge(0, 1000)
+        attach_scores(edges, chunks, step=100.0)
+        assert edges["unpaved_frac"].iloc[0] == pytest.approx(0.5, abs=0.02)
+
+    def test_paved_edge_is_zero_and_dirt_edge_is_one(self):
+        for flag, expected in ((0.0, 0.0), (1.0, 1.0)):
+            chunks = _chunks([(0, 1000, 0.5)], unpaved=[flag])
+            edges = _edge(0, 1000)
+            attach_scores(edges, chunks, step=100.0)
+            assert edges["unpaved_frac"].iloc[0] == pytest.approx(expected)
+
+    def test_surface_does_not_touch_the_score(self):
+        """The whole point of the column. Two edges identical but for surface
+        must score identically — the beauty blend makes no claim about it."""
+        paved = _edge(0, 1000)
+        dirt = _edge(0, 1000)
+        attach_scores(paved, _chunks([(0, 1000, 0.5)], unpaved=[0.0]), step=100.0)
+        attach_scores(dirt, _chunks([(0, 1000, 0.5)], unpaved=[1.0]), step=100.0)
+        assert dirt["score"].iloc[0] == pytest.approx(paved["score"].iloc[0])
+        assert dirt["score_adj"].iloc[0] == pytest.approx(paved["score_adj"].iloc[0])

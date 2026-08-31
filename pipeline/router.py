@@ -42,7 +42,8 @@ from shapely.strtree import STRtree
 from pyproj import Transformer
 
 from common import CONTROL_COLUMNS, CRS_METERS, ONEWAY_FWD, ONEWAY_REV
-from score import WEIGHTS, composite
+from score import (CLASS_ADJ, LEGACY_UNPAVED_ADJ, WEIGHTS, blend, components,
+                   composite)
 
 # Minutes-equivalent penalty per km of fully-unscenic road at pref=1.
 #
@@ -72,6 +73,37 @@ from score import WEIGHTS, composite
 # the router has already taken every detour worth taking, and the ceiling is
 # 5.6 on the 0-10 scale whatever these are set to.
 BETA = 8.0
+
+# **Re-swept 2026-08-29, when surface left the score, and deliberately left
+# alone.** Moving `UNPAVED_ADJ` out raised the region's mean score (4.57 -> 4.87
+# length-weighted), which weakens `km * (1 - score/10)` and so weakens BETA for
+# the same slider position. Re-running the sweep above, before against after,
+# with the same ten routes:
+#
+#            New England routes        Massachusetts routes
+#            bottom   top              bottom   top
+#   before     0.21  0.51                0.14  0.21
+#   after      0.14  0.59                0.14  0.21
+#
+# **Massachusetts does not move at all** — to two decimals, identically — which
+# is the whole reason not to touch this. The shift is confined to routes that
+# have dirt roads on them, and raising BETA is a global instrument: it would
+# re-shape every route in six states to compensate for something that only
+# happens in two. Restoring the New England bottom would take BETA ~10.0, a 25%
+# raise, and the table above already records 10.0 as measured and rejected.
+#
+# Read the softer bottom as the new behaviour rather than as drift. The surface
+# avoidance does not scale with `pref`, so at pref 0.25 it runs at full strength
+# against a scenery term that is barely awake — which is the point (a driver on
+# the fastest setting can now avoid dirt at all) and costs the slider some of
+# its low-end travel in dirt country. A driver who wants that back sets
+# `avoid_unpaved=0`.
+#
+# Note also that the `before` arm does not reproduce this file's own 0.32/0.15
+# either. That table was fitted on a Massachusetts build several rebuilds ago —
+# c_forest, the relief rescale and the New England extract have all landed
+# since. **Do not re-fit against 0.32/0.15 without first re-deriving it**, and
+# see docs/unpaved-and-urban-verdict.md for what a real re-fit needs.
 
 # --- Travel time --------------------------------------------------------------
 # `graph_edges.minutes` is free-flow — length over the speed limit, with nothing
@@ -107,6 +139,36 @@ BETA = 8.0
 # predicts what the driver will do, not what the sign says.
 SPEED_FACTOR = {"motorway": 1.16}
 SURFACE_SPEED_FACTOR = 0.95
+
+# --- Unpaved roads -----------------------------------------------------------
+# Minutes a driver is assumed willing to spend to avoid one km of dirt road, at
+# the default setting. Multiplied by the request's `avoid_unpaved` (0..2, 1.0 =
+# this number) and added to the Dijkstra weight *outside* the `pref` term.
+#
+# **Outside `pref` is the whole point.** This used to be `UNPAVED_ADJ = -0.25`
+# inside the scenery score, which put it inside
+# `pref**PREF_CURVE * BETA * km * (1 - score/10)` — so it charged
+# `pref**2 * 8.0 * 0.25` min/km, i.e. **0.00 at pref 0 and 2.00 at pref 1**.
+# A driver on the fastest setting got no dirt avoidance at all, and a driver
+# asking for maximum beauty got the most: raising the slider from 0.5 to 1.0
+# removed two thirds of the dirt from a Vermont loop (23.7% -> 8.2% of loop km,
+# 40 km loops from six Vermont starts). Wanting scenery and minding a dirt road
+# are different questions and now have different controls.
+#
+# **1.0 rather than 0.** The beauty evidence says these roads are pretty
+# (docs/unpaved-and-urban-verdict.md) but it is evidence about scenery, not
+# about what drivers want, and there is not one drive mark on unpaved road in
+# `traces/`. So this is set to preserve behaviour, not to change it: over the
+# same loops 1.0 min/km gives 15.0% / 17.2% dirt at pref 0.5 / 1.0 against the
+# old constant's 23.7% / 8.2% — mean 16.1% against 16.0%. Same average
+# exposure, no longer wired to the wrong knob. Re-fit it against marks from
+# Vermont dirt country when there are any; that measurement is specified in the
+# verdict doc and is the one thing that would justify moving it.
+UNPAVED_AVOID_MIN_PER_KM = 1.0
+
+# Ceiling on the request's multiplier. 2.0 reproduces the old constant's
+# strength at pref 1.0, which is the hardest this has ever avoided dirt.
+MAX_AVOID_UNPAVED = 2.0
 
 # Seconds lost per traffic control *met* — P(stop) and the delay when you do
 # stop, folded into the one number a static graph can charge. Fitted by
@@ -851,8 +913,8 @@ class Router:
         #   base_score   : the always-on baseline blend (curves/views/scenic tag)
         #   pref_matrix  : column k = default_weight_k * component_k, so scaling
         #                  column k by the user's weight leans into that type
-        #   score_adj    : the road-class/surface penalty, re-added after stretch
-        self.score_adj = e["score_adj"].to_numpy()
+        #   score_adj    : the road-class penalty, re-added after stretch
+        self.unpaved_frac, self.score_adj = self._load_unpaved(e)
         self.base_score = sum(w * e[col].to_numpy() for col, w in BASELINE)
         self.pref_matrix = np.column_stack(
             [w * e[col].to_numpy() for _, _, col, w in BEAUTY_TYPES]
@@ -873,6 +935,49 @@ class Router:
         self._pair_start = np.searchsorted(self.slot_pair[order],
                                            np.arange(self.n_pairs + 1))
         self._pair_key = self.u_tail.astype(np.int64) * self.n + self.u_head
+
+    def _load_unpaved(self, e):
+        """Per-edge unpaved share, and a `score_adj` with no surface term left.
+
+        Two graph vintages. One built since 2026-08-29 carries `unpaved_frac`
+        and a `score_adj` that is road class alone, and there is nothing to do.
+        One built before it folded `LEGACY_UNPAVED_ADJ` into `score_adj` and
+        kept no surface column at all — and re-deriving it there is worth the
+        twenty lines, because `data/processed-ne` is 364 MB behind a home
+        tunnel and this turns the fix into a restart.
+
+        **The recovery is exact, not an estimate.** `CLASS_ADJ` is a pure
+        function of `highway`, which is on every edge, and the old `score_adj`
+        was exactly `class_adj + LEGACY_UNPAVED_ADJ * unpaved` — so the residual
+        over that constant *is* the fraction, and subtracting it back off leaves
+        the class term. Measured on all 998,252 edges of the New England build:
+        none outside [0, 1], 94.6% exactly 0 and 5.4% exactly 1 with **nothing
+        in between**, per-class shares within 0.2 pp of the `surface` tags in
+        `scored_chunks.parquet`. The nearest-chunk join in `graph.py` can in
+        principle hand an edge a neighbouring way's `score_adj`, which would
+        land off those two values; on this build it never does.
+
+        Fragile in one specific way, which is why `graph.py` now writes the
+        column properly: this holds only while `score_adj` is exactly
+        `class_adj` plus a surface term. A third addend would corrupt it
+        silently, so the clip is a guard rail rather than decoration — and the
+        whole branch should be deleted once no deployed graph predates it.
+        """
+        if "unpaved_frac" in e.columns:
+            return e["unpaved_frac"].to_numpy(), e["score_adj"].to_numpy()
+
+        adj = e["score_adj"].to_numpy()
+        class_adj = e["highway"].map(CLASS_ADJ).fillna(0.0).to_numpy()
+        frac = np.clip((adj - class_adj) / LEGACY_UNPAVED_ADJ, 0.0, 1.0)
+        adj = adj - LEGACY_UNPAVED_ADJ * frac
+        # The stored `score` column was written with the penalty in it, and
+        # `RouteResult.mean_score` and `looper.beautiful_km` both fall back to
+        # it. Left alone it would report the old number for a route chosen on
+        # the new one — the exact disagreement `_edge_scores` exists to prevent.
+        # Rewriting the in-memory frame (never the parquet) keeps every reader
+        # on one scale.
+        e["score"] = composite(blend(e[components(e)]).to_numpy(), adj)
+        return frac, adj
 
     def _edge_scores(self, weights: dict) -> np.ndarray:
         """Per *undirected* edge 0-10 scenic score under the given beauty weights.
@@ -904,12 +1009,20 @@ class Router:
         raw = self.base_score + self.pref_matrix @ w
         return composite(raw, self.score_adj)
 
-    def _weights(self, pref: float, scores: np.ndarray) -> np.ndarray:
-        """Directed-edge Dijkstra weights: travel time + a scenery detour cost.
+    def _weights(self, pref: float, scores: np.ndarray,
+                 avoid_unpaved: float = 1.0) -> np.ndarray:
+        """Directed-edge Dijkstra weights: travel time, a scenery detour cost,
+        and a surface avoidance.
 
         `scores` is the per-undirected-edge 0-10 score from `_edge_scores`,
         passed in rather than recomputed so the route is reported on exactly the
         scale it was optimized against (see `route`).
+
+        The two costs are deliberately not the same shape. Scenery scales with
+        `pref`, because that is what `pref` means. Surface does not: whether a
+        driver minds a dirt road is a fact about their car and their day, not
+        about how much scenery they asked for, and folding it into `pref` made
+        the beauty slider double as a dirt-avoidance slider running backwards.
         """
         penalty = self.km * (1.0 - scores / 10.0)           # km of "unscenic" road
         # Clamped because a negative pref raised to a fractional power is a
@@ -917,7 +1030,13 @@ class Router:
         # the whole cost matrix. The API clamps too; this keeps the class safe
         # for its other caller, the CLI.
         strength = max(0.0, min(1.0, pref)) ** PREF_CURVE
-        return self.d_minutes + strength * BETA * penalty[self.eidx]
+        w = self.d_minutes + strength * BETA * penalty[self.eidx]
+
+        avoid = max(0.0, min(MAX_AVOID_UNPAVED, avoid_unpaved))
+        if avoid:
+            dirt_km = self.km * self.unpaved_frac
+            w = w + avoid * UNPAVED_AVOID_MIN_PER_KM * dirt_km[self.eidx]
+        return w
 
     def snap(self, lat: float, lon: float,
              heading: float | None = None) -> tuple[int, float]:
@@ -1042,7 +1161,7 @@ class Router:
         return v if abs(_turn_delta(heading, tangent)) <= 90.0 else u
 
     def route(self, src_idx: int, dst_idx: int, pref: float, weights: dict = None,
-              heading: float | None = None):
+              heading: float | None = None, avoid_unpaved: float = 1.0):
         # Scored once, then used for both jobs: choosing the route and reporting
         # it. They used to disagree — the router optimized the live re-blend
         # while RouteResult.mean_score read the stored neutral column, so a user
@@ -1050,7 +1169,7 @@ class Router:
         # (measured 1.9 points apart on a 0-10 scale). That number is the whole
         # output of the tune screen.
         scores = self._edge_scores(weights or {})
-        w = self._weights(pref, scores)
+        w = self._weights(pref, scores, avoid_unpaved)
         # Collapse parallel edges to the cheapest weight per node-pair, so the
         # cost matrix has one entry per pair (no summed duplicates).
         pair_w = np.full(self.n_pairs, np.inf)

@@ -456,3 +456,37 @@ def test_a_waypoint_outside_the_region_is_rejected(client):
 def test_an_unparseable_waypoint_is_a_bad_request(client):
     assert client.get(f"/api/route?from={NEEDHAM}&to={BOSTON}"
                       "&via=nonsense").status_code == 400
+
+
+def test_avoid_unpaved_is_accepted_and_clamped(client):
+    """The surface preference is its own query parameter, not a `w_<type>`:
+    those six are renormalised against each other, so an avoidance among them
+    would quietly turn every attraction down."""
+    for value in ("0", "1", "2", "-5", "99", "1.5"):
+        r = client.get(f"/api/route?from={WORCESTER}&to={BOSTON}&pref=0.6"
+                       f"&avoid_unpaved={value}")
+        assert r.status_code == 200, value
+
+
+def test_avoid_unpaved_rejects_nonsense(client):
+    r = client.get(f"/api/route?from={WORCESTER}&to={BOSTON}&avoid_unpaved=lots")
+    assert r.status_code == 400
+
+
+def test_avoid_unpaved_does_not_move_the_reported_score(client):
+    """It is priced in minutes, not in beauty. Two routes that differ only in
+    surface avoidance may take different roads, but neither is *scored* for
+    its surface — so the scale the app displays is unchanged."""
+    free = client.get(f"/api/route?from={WORCESTER}&to={BOSTON}&pref=0"
+                      "&avoid_unpaved=0").get_json()["scenic"]["properties"]
+    firm = client.get(f"/api/route?from={WORCESTER}&to={BOSTON}&pref=0"
+                      "&avoid_unpaved=2").get_json()["scenic"]["properties"]
+    # pref=0 is the fastest route, which no scenery setting may move.
+    assert free["km"] == firm["km"]
+    assert free["mean_score"] == firm["mean_score"]
+
+
+def test_loop_accepts_the_surface_preference(client):
+    r = client.get(f"/api/loop?from={NEEDHAM}&km=40&avoid_unpaved=0")
+    assert r.status_code == 200
+    assert "loop" in r.get_json()

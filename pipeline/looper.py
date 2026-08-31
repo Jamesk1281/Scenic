@@ -312,7 +312,7 @@ class LoopPlanner:
     # ------------------------------------------------------------------ public
 
     def sectors(self, start: int, target_km: float, pref: float = 1.0,
-                weights: dict = None):
+                weights: dict = None, avoid_unpaved: float = 1.0):
         """Which compass directions actually hold a loop of about this length.
 
         Returns `{sector: candidate count}` for the ones worth offering, which is
@@ -327,7 +327,7 @@ class LoopPlanner:
         that returns the same drive on every press, and it cannot honour the
         distance slider either.
         """
-        fields = self._fields(start, pref, weights)
+        fields = self._fields(start, pref, weights, avoid_unpaved)
         idx = self.candidates(fields, target_km)
         if not len(idx):
             return {}
@@ -356,7 +356,8 @@ class LoopPlanner:
 
     def plan(self, start: int, target_km: float, pref: float = 1.0,
              weights: dict = None, sector: str = None,
-             picks: int = SPAN_PICKS, penalty: float = PENALTY):
+             picks: int = SPAN_PICKS, penalty: float = PENALTY,
+             avoid_unpaved: float = 1.0):
         """A scenic loop of about `target_km` from `start`, or None.
 
         None means the geography cannot answer — a rural start asked for a loop
@@ -372,7 +373,7 @@ class LoopPlanner:
         (~0.5 s) the first time this start, pref and weight set are seen.
         """
         target_km = float(np.clip(target_km, MIN_TARGET_KM, MAX_TARGET_KM))
-        fields = self._fields(start, pref, weights)
+        fields = self._fields(start, pref, weights, avoid_unpaved)
         idx = self.candidates(fields, target_km, sector=sector)
         if not len(idx):
             return None
@@ -393,7 +394,7 @@ class LoopPlanner:
         return best
 
     def resume(self, src: int, via: int, dst: int, pref: float = 1.0,
-               weights: dict = None):
+               weights: dict = None, avoid_unpaved: float = 1.0):
         """A drive from `src` to `dst` that still goes round by way of `via`.
 
         What a loop's reroute needs, and it cannot be had from `route()`. A loop
@@ -412,7 +413,8 @@ class LoopPlanner:
         from two searches and the turn-by-turn reads continuously across the
         waypoint.
         """
-        cost = self._cost(round(float(pref), 4), _weights_key(weights))
+        cost = self._cost(round(float(pref), 4), _weights_key(weights),
+                          round(float(avoid_unpaved), 4))
         out = self._leg(cost, int(src), int(via))
         if out is None:
             return None
@@ -455,13 +457,13 @@ class LoopPlanner:
         return paths or None
 
     def nearest_length(self, start: int, target_km: float, pref: float = 1.0,
-                       weights: dict = None):
+                       weights: dict = None, avoid_unpaved: float = 1.0):
         """The closest loop length that has any candidate at all, or None.
 
         For the message shown when `plan` returns None. Reuses the cached
         passes, so it is free.
         """
-        fields = self._fields(start, pref, weights)
+        fields = self._fields(start, pref, weights, avoid_unpaved)
         ok = fields.reachable & (fields.out.km >= MIN_LEG_KM)
         km = fields.loop_km[ok]
         km = km[(km >= MIN_TARGET_KM) & (km <= MAX_TARGET_KM)]
@@ -579,13 +581,18 @@ class LoopPlanner:
 
     # ------------------------------------------------------------------ fields
 
-    def _fields(self, start: int, pref: float, weights: dict):
-        key = (int(start), round(float(pref), 4), _weights_key(weights))
+    def _fields(self, start: int, pref: float, weights: dict,
+                avoid_unpaved: float = 1.0):
+        # `avoid_unpaved` is in the key for the same reason `pref` is: it moves
+        # every edge weight, so a cached field set built under a different one
+        # answers a question nobody asked.
+        key = (int(start), round(float(pref), 4), _weights_key(weights),
+               round(float(avoid_unpaved), 4))
         hit = self._fields_by_key.pop(key, None)
         if hit is not None:
             self._fields_by_key[key] = hit          # move to the warm end
             return hit
-        cost = self._cost(key[1], key[2])
+        cost = self._cost(key[1], key[2], key[3])
         fields = _Fields(start=int(start), cost=cost,
                          out=self._pass(cost, int(start), reverse=False),
                          back=self._pass(cost, int(start), reverse=True))
@@ -642,15 +649,16 @@ class LoopPlanner:
 
     # -------------------------------------------------------------- cost model
 
-    def _cost(self, pref: float, weights_key: tuple):
-        hit = self._costs_by_key.pop(weights_key + (pref,), None)
-        key = weights_key + (pref,)
+    def _cost(self, pref: float, weights_key: tuple,
+              avoid_unpaved: float = 1.0):
+        key = weights_key + (pref, avoid_unpaved)
+        hit = self._costs_by_key.pop(key, None)
         if hit is not None:
             self._costs_by_key[key] = hit
             return hit
         r = self.router
         scores = r._edge_scores(dict(weights_key))
-        w_slot = r._weights(pref, scores)
+        w_slot = r._weights(pref, scores, avoid_unpaved)
         pair_w = np.full(r.n_pairs, np.inf)
         np.minimum.at(pair_w, r.slot_pair, w_slot)
         # Which slot won each pair, so the km and score reported for a hop are

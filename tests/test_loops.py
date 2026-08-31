@@ -379,3 +379,28 @@ class TestCaching:
         assert _weights_key({"coast": 2.0, "farm": 0.0}) == \
                _weights_key({"farm": 0.0, "coast": 2.0})
         assert _weights_key(None) == _weights_key({})
+
+
+class TestSurfaceAvoidanceReachesTheLoops:
+    """`avoid_unpaved` moves every edge weight, so it has to be part of the
+    cache keys. A cost model or field set cached under a different setting
+    answers a question nobody asked — and the loop planner caches both."""
+
+    def test_the_cost_cache_is_keyed_on_the_avoidance(self, planner):
+        loose = planner._cost(1.0, (), 0.0)
+        tight = planner._cost(1.0, (), 2.0)
+        assert loose is not tight
+        if not (planner.router.unpaved_frac > 0).any():
+            pytest.skip("no unpaved road in this build")
+        assert not np.array_equal(loose.w_slot, tight.w_slot)
+
+    def test_asking_again_with_the_same_avoidance_hits_the_cache(self, planner):
+        first = planner._cost(1.0, (), 0.5)
+        assert planner._cost(1.0, (), 0.5) is first
+
+    def test_the_field_cache_is_keyed_on_the_avoidance(self, router, planner):
+        start = router.snap(*PETERSHAM)[0]
+        assert (planner._fields(start, 1.0, {}, 0.0)
+                is not planner._fields(start, 1.0, {}, 2.0))
+        assert (planner._fields(start, 1.0, {}, 0.0)
+                is planner._fields(start, 1.0, {}, 0.0))

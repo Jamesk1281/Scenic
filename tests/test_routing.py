@@ -10,7 +10,8 @@ import numpy as np
 import pytest
 import shapely
 
-from router import (BEAUTY_TYPES, BREAKDOWN_MIN, PREF_CURVE, ManeuverContext,
+from router import (BEAUTY_TYPES, BREAKDOWN_MIN, CLASS_ADJ,
+                    MAX_AVOID_UNPAVED, PREF_CURVE, ManeuverContext,
                     RouteResult, Router, _bearing, _compass, _turn_delta,
                     _turn_modifier, stitch)
 
@@ -1123,8 +1124,15 @@ class TestBeautyWeightsAreWellBehaved:
         an accidental revert should not be able to.
         """
         neutral = router._edge_scores({})
-        half = router._weights(0.5, neutral) - router.d_minutes
-        full = router._weights(1.0, neutral) - router.d_minutes
+        # `avoid_unpaved=0` because the surface avoidance is deliberately *not*
+        # shaped by pref — it is priced in minutes and added flat. Leaving it on
+        # puts a pref-independent constant in both terms and lifts this ratio
+        # above 0.25 (measured 0.2736 on the New England build), which would
+        # read as a broken curve when it is the surface cost doing exactly what
+        # it is supposed to. `test_the_surface_cost_is_what_lifts_the_ratio`
+        # below pins that other half.
+        half = router._weights(0.5, neutral, 0.0) - router.d_minutes
+        full = router._weights(1.0, neutral, 0.0) - router.d_minutes
         moving = full > 0
         ratio = half[moving].sum() / full[moving].sum()
         assert ratio == pytest.approx(0.25, rel=1e-9), (
@@ -1132,3 +1140,157 @@ class TestBeautyWeightsAreWellBehaved:
             f"for a squared curve (linear would be 0.50, 1.3 would be 0.41)")
         assert PREF_CURVE == 2.0, \
             "the curve moved; re-derive the sweep table in router.py with it"
+
+    def test_the_surface_cost_is_what_lifts_the_ratio(self, router):
+        """The other half of the test above, and the one that fails if surface
+        ever goes back inside the scenery term: with the avoidance on, the
+        half-to-full ratio must sit *above* the squared curve's 0.25, because a
+        constant that does not scale with pref is present in both."""
+        if not (router.unpaved_frac > 0).any():
+            pytest.skip("no unpaved road in this build")
+        neutral = router._edge_scores({})
+        half = router._weights(0.5, neutral, 1.0) - router.d_minutes
+        full = router._weights(1.0, neutral, 1.0) - router.d_minutes
+        moving = full > 0
+        assert half[moving].sum() / full[moving].sum() > 0.25
+
+
+class TestSurfaceAvoidanceIsNotAScenerySetting:
+    """The defect this class exists for: `UNPAVED_ADJ` lived in the scenery
+    score, so it was multiplied by `pref**PREF_CURVE` and charged 0.00 min/km
+    of dirt at pref 0 and 2.00 at pref 1. Turning the beauty slider up made the
+    router avoid dirt roads harder — two thirds of the dirt vanished from a
+    Vermont loop between pref 0.5 and 1.0. Surface is now priced in minutes,
+    outside the scenery term. See docs/unpaved-and-urban-verdict.md.
+    """
+
+    def _dirt(self, router):
+        dirt = (router.km * router.unpaved_frac)[router.eidx]
+        if not (dirt > 1e-9).any():
+            pytest.skip("no unpaved road in this build")
+        return dirt
+
+    def _charge(self, router, pref, avoid=1.0):
+        """Minutes per km of dirt that `avoid` buys, at this `pref`."""
+        dirt = self._dirt(router)
+        scores = router._edge_scores({})
+        delta = (router._weights(pref, scores, avoid)
+                 - router._weights(pref, scores, 0.0))
+        on_dirt = dirt > 1e-9
+        return delta[on_dirt] / dirt[on_dirt]
+
+    @pytest.mark.parametrize("pref", [0.0, 0.25, 0.5, 0.75, 1.0])
+    def test_the_charge_is_the_same_at_every_pref(self, router, pref):
+        """The regression that matters. If this constant ever goes back inside
+        the `strength * BETA` term, the charge at pref 0 collapses to zero and
+        this fails at both ends."""
+        charge = self._charge(router, pref)
+        assert np.allclose(charge, charge[0])
+        assert charge[0] > 0.0, "the avoidance is not being charged at all"
+
+    def test_pref_zero_and_pref_one_charge_identically(self, router):
+        assert np.allclose(self._charge(router, 0.0), self._charge(router, 1.0))
+
+    def test_the_multiplier_scales_the_charge_linearly(self, router):
+        """Written as a ratio so it holds whatever the calibrated default is."""
+        once = self._charge(router, 0.6, avoid=1.0)
+        twice = self._charge(router, 0.6, avoid=2.0)
+        assert np.allclose(twice, 2.0 * once)
+
+    def test_zero_avoidance_costs_nothing(self, router):
+        scores = router._edge_scores({})
+        assert np.array_equal(router._weights(0.7, scores, 0.0),
+                              router._weights(0.7, scores, 0.0))
+        assert not np.array_equal(router._weights(0.7, scores, 0.0),
+                                  router._weights(0.7, scores, 1.0))
+
+    def test_the_multiplier_is_clamped(self, router):
+        """A negative or runaway value from a client must not invert the cost."""
+        scores = router._edge_scores({})
+        assert np.array_equal(router._weights(0.5, scores, -3.0),
+                              router._weights(0.5, scores, 0.0))
+        assert np.array_equal(router._weights(0.5, scores, 99.0),
+                              router._weights(0.5, scores, MAX_AVOID_UNPAVED))
+
+    def test_paved_roads_are_not_charged(self, router):
+        scores = router._edge_scores({})
+        delta = (router._weights(0.8, scores, 2.0)
+                 - router._weights(0.8, scores, 0.0))
+        paved = (router.km * router.unpaved_frac)[router.eidx] <= 1e-9
+        assert np.allclose(delta[paved], 0.0)
+
+    def test_surface_is_absent_from_the_reported_score(self, router):
+        """Two edges that differ only in surface must not differ in score. The
+        score is what the app shows and what `BETA` is calibrated against."""
+        adj = router.score_adj
+        by_class = router.edges["highway"].map(CLASS_ADJ).fillna(0.0).to_numpy()
+        assert np.allclose(adj, by_class), (
+            "score_adj carries something other than road class")
+
+
+class TestLegacyGraphMigration:
+    """A graph built before 2026-08-29 baked the surface penalty into
+    `score_adj` and stored no surface column. `data/processed-ne` is 364 MB
+    behind a home tunnel, so the router undoes it at load rather than waiting
+    for a rebuild."""
+
+    def test_the_recovered_fraction_is_a_share(self, router):
+        assert router.unpaved_frac.min() >= 0.0
+        assert router.unpaved_frac.max() <= 1.0
+        assert len(router.unpaved_frac) == len(router.edges)
+
+    def test_recovery_agrees_with_the_surface_tags(self, router, chunks):
+        """Independent of the arithmetic under test: re-derive the unpaved share
+        per road class straight from `scored_chunks.surface` and compare.
+
+        Against `LEGACY_UNPAVED`, not `UNPAVED`, and that is the point rather
+        than a convenience: a legacy graph can only give back the surfaces that
+        were penalised when it was built, so `compacted` is invisible to the
+        recovery — 1.0 pp of residential km. Using the current set here fails by
+        exactly that gap, which is a real limitation of the restart-only path
+        and is recorded beside `LEGACY_UNPAVED`."""
+        from score import LEGACY_UNPAVED
+        dirt = chunks["surface"].fillna("").str.lower().isin(LEGACY_UNPAVED)
+        km = chunks["length_m"].to_numpy() / 1000.0
+        e_km = router.edges["length_m"].to_numpy() / 1000.0
+        for hw in ("residential", "unclassified", "tertiary", "secondary"):
+            c_sel = (chunks["highway"] == hw).to_numpy()
+            e_sel = (router.edges["highway"] == hw).to_numpy()
+            if km[c_sel].sum() < 100 or e_km[e_sel].sum() < 100:
+                continue
+            from_tags = km[c_sel & dirt.to_numpy()].sum() / km[c_sel].sum()
+            recovered = ((router.unpaved_frac[e_sel] * e_km[e_sel]).sum()
+                         / e_km[e_sel].sum())
+            assert recovered == pytest.approx(from_tags, abs=0.01), hw
+
+    def test_the_stored_score_column_was_migrated_too(self, router):
+        """`RouteResult.mean_score` and `looper.beautiful_km` fall back to the
+        stored column. Left un-migrated it would report the penalised number
+        for a route chosen without the penalty."""
+        live = router._edge_scores({name: 1.0 for name, *_ in BEAUTY_TYPES})
+        assert np.allclose(live, router.edges["score"].to_numpy(), atol=1e-9)
+
+    def test_a_modern_graph_is_taken_as_given(self, router):
+        """When `unpaved_frac` is present the router must read it, not re-derive
+        it — the derivation is only valid while `score_adj` is class + surface."""
+        e = router.edges.head(50).copy()
+        e["unpaved_frac"] = 0.5
+        e["score_adj"] = -0.11
+        frac, adj = router._load_unpaved(e)
+        assert np.allclose(frac, 0.5)
+        assert np.allclose(adj, -0.11)
+
+    def test_a_legacy_graph_cannot_see_compacted(self, router, chunks):
+        """Names the one thing the restart-only migration does not buy, so the
+        rebuild that fixes it has a reason recorded in the suite."""
+        from score import LEGACY_UNPAVED, UNPAVED
+        assert "compacted" in UNPAVED and "compacted" not in LEGACY_UNPAVED
+        km = chunks["length_m"].to_numpy() / 1000.0
+        missed = chunks["surface"].fillna("").str.lower().isin(
+            UNPAVED - LEGACY_UNPAVED).to_numpy()
+        if km[missed].sum() < 100:
+            pytest.skip("no compacted road in this build")
+        e_km = router.edges["length_m"].to_numpy() / 1000.0
+        recovered = (router.unpaved_frac * e_km).sum()
+        assert recovered < km[chunks["surface"].fillna("").str.lower()
+                              .isin(UNPAVED).to_numpy()].sum()

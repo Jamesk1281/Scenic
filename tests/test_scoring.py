@@ -7,10 +7,11 @@ thousands of deg/km.
 """
 
 import numpy as np
+import pytest
 import shapely
 
-from score import (CLASS_ADJ, CURVE_FULL, RAW_BASE, STRETCH, WEIGHTS,
-                   composite, curvature_deg_per_km)
+from score import (CLASS_ADJ, CURVE_FULL, RAW_BASE, STRETCH, UNPAVED,
+                   WEIGHTS, composite, curvature_deg_per_km)
 
 
 def line(points):
@@ -112,3 +113,39 @@ class TestComposite:
         raw, adj = 0.3, -0.05
         expected = 10.0 * ((raw + RAW_BASE) * STRETCH + adj)
         assert composite(np.array([raw]), np.array([adj]))[0] == expected
+
+
+class TestSurfaceIsNotBeauty:
+    """`UNPAVED_ADJ` used to take 2.5 points off a dirt road. It measured
+    mapping diligence and contradicted this file's own components, so surface
+    left the score for a minutes-priced avoidance in router.py. See
+    docs/unpaved-and-urban-verdict.md."""
+
+    def test_the_score_makes_no_claim_about_surface(self):
+        """Written against the class table directly rather than by importing
+        whatever `score_adj` happens to be built from — the point is that a
+        surface term cannot creep back in unnoticed."""
+        for highway, expected in (("residential", -0.05), ("motorway", -0.45),
+                                  ("unclassified", 0.0), ("tertiary", 0.0)):
+            assert CLASS_ADJ[highway] == expected
+        # And the composite itself: a -0.25 surface term would move this.
+        assert composite(0.30, CLASS_ADJ["unclassified"]) == pytest.approx(
+            10.0 * ((0.30 + RAW_BASE) * STRETCH))
+
+    def test_compacted_is_unpaved(self):
+        """The omission that let 2,258 km escape, 1,125 km of it in Maine —
+        the state already escaping most through untagged roads."""
+        assert "compacted" in UNPAVED
+
+    def test_the_unpaved_set_is_osms_unpaved_family(self):
+        """Spot values, written out rather than imported, so a careless edit to
+        the set fails here instead of silently re-scoring a state."""
+        for value in ("unpaved", "gravel", "dirt", "ground", "compacted",
+                      "fine_gravel", "pebblestone", "sand", "grass", "mud"):
+            assert value in UNPAVED, value
+
+    def test_sealed_and_laid_surfaces_are_not_unpaved(self):
+        """Rough is not the same as unpaved. A cobbled lane is a paved road."""
+        for value in ("asphalt", "concrete", "paved", "chipseal", "sett",
+                      "paving_stones", "cobblestone"):
+            assert value not in UNPAVED, value
