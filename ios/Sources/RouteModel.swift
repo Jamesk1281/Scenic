@@ -65,17 +65,24 @@ final class RouteModel {
     /// per-type weights below shape *what kind* of scenery.
     var pref: Double = 0.5
 
-    /// Per-beauty-type weights, keyed by `BeautyType.apiName`. Each starts
-    /// neutral (1.0); the tune screen edits them and they're sent to the
-    /// backend on every route request.
+    /// Per-beauty-type weights, keyed by `BeautyType.apiName`. Each starts at
+    /// its own `defaultWeight` — neutral for five of the six, zero for `town`;
+    /// the tune screen edits them and they're sent to the backend on every
+    /// route request.
     var weights: [String: Double] = Dictionary(
-        uniqueKeysWithValues: BeautyType.all.map { ($0.apiName, BeautyType.neutralWeight) }
+        uniqueKeysWithValues: BeautyType.all.map { ($0.apiName, $0.defaultWeight) }
     )
 
-    /// True once the user has moved any type off neutral — used to highlight the
-    /// Tune button so it's clear a preference is active.
+    /// True once the user has moved any type off *its own* default — used to
+    /// highlight the Tune button so it's clear a preference is active.
+    ///
+    /// Measured against `defaultWeight` and not against `neutralWeight`, or the
+    /// button would light up on a launch nobody had touched, purely because
+    /// `town` starts at zero.
     var isTuned: Bool {
-        weights.values.contains { abs($0 - BeautyType.neutralWeight) > 0.01 }
+        BeautyType.all.contains { type in
+            abs((weights[type.apiName] ?? type.defaultWeight) - type.defaultWeight) > 0.01
+        }
     }
 
     var response: RouteResponse?
@@ -206,9 +213,13 @@ final class RouteModel {
         response = nil; errorText = nil
     }
 
-    /// Put every beauty type back to neutral, then re-route.
+    /// Put every beauty type back to where it started, then re-route.
+    ///
+    /// Back to `defaultWeight`, not to neutral: Reset means "undo my tuning",
+    /// and resetting `town` to 1.0 would quietly turn on the one type the app
+    /// deliberately ships off.
     func resetWeights() {
-        for type in BeautyType.all { weights[type.apiName] = BeautyType.neutralWeight }
+        for type in BeautyType.all { weights[type.apiName] = type.defaultWeight }
         Task { await computeRoute() }
     }
 

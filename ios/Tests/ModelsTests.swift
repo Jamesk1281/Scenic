@@ -166,6 +166,29 @@ final class ModelsTests: XCTestCase {
                        BeautyType.neutralWeight, accuracy: 1e-9)
     }
 
+    func test_town_is_the_only_type_that_ships_switched_off() {
+        // `c_urban` is the one component the drive marks scored below chance
+        // (0.35 against a 0.50 coin), so the app sends w_town=0 unless the
+        // driver asks for it back. If a second type ever ships off, this test
+        // is the place to say so deliberately rather than by accident.
+        let off = BeautyType.all.filter { $0.defaultWeight != BeautyType.neutralWeight }
+        XCTAssertEqual(off.map(\.apiName), ["town"])
+        XCTAssertEqual(off.first?.defaultWeight, 0.0)
+        // Every default has to be somewhere the slider can actually reach, or
+        // the control cannot express the state the app starts in.
+        for type in BeautyType.all {
+            XCTAssertTrue(BeautyType.weightRange.contains(type.defaultWeight),
+                          "\(type.apiName) starts outside the slider's range")
+        }
+    }
+
+    func test_a_type_that_ships_off_explains_itself() {
+        // A slider pinned to the left with no explanation reads as a bug.
+        for type in BeautyType.all where type.defaultWeight != BeautyType.neutralWeight {
+            XCTAssertNotNil(type.note, "\(type.apiName) starts off default with no note")
+        }
+    }
+
     // MARK: - Maneuvers
 
     func test_a_structured_maneuver_decodes() {
