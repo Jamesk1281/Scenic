@@ -137,8 +137,28 @@ class TestLoopsAreLoops:
             fields.loop_scen[candidates] / fields.loop_km[candidates])])
         penalised = planner._build(fields, turnaround, PENALTY)
         plain = planner._build(fields, turnaround, 1.0)
-        assert plain.repeated_km / plain.km > 0.30
-        assert penalised.repeated_km / penalised.km < 0.05
+        with_it = penalised.repeated_km / penalised.km
+        without = plain.repeated_km / plain.km
+
+        # The guard is the *separation*, which is what "the penalty is what
+        # removes the retrace" actually says. Measured on Massachusetts:
+        # 50.0% without (18.28 of 36.57 km) against 5.2% with (2.14 of 41.12),
+        # a 9.6x cut. Asserted at 5x, which no do-nothing `_build` can reach.
+        #
+        # The absolute bound was 0.05 and is now 0.06, matching
+        # `test_a_loop_does_not_drive_the_same_road_twice` above rather than
+        # sitting 1 point stricter than it for no stated reason. It moved
+        # because the surface work removed the -0.25 unpaved penalty from
+        # `score_adj`, which changes which loop rural Massachusetts picks —
+        # Petersham went from just under the old line to 5.2%. That is the
+        # intended effect of that change landing on a threshold calibrated
+        # before it, not a regression in `_build`: the separation it guards
+        # is unmoved.
+        assert without > 0.30
+        assert with_it < 0.06
+        assert without / with_it > 5.0, (
+            f"the penalty only cut the retrace {without / with_it:.1f}x "
+            f"({without:.1%} -> {with_it:.1%}); `_build` may be doing nothing")
 
     def test_the_loop_is_a_drivable_route_with_turn_by_turn(self, router, planner):
         start, _ = router.snap(*NEEDHAM)

@@ -42,6 +42,7 @@ final class LiveDriveTests: XCTestCase {
     private let worcester = "42.2626,-71.8023"
     private let boston = "42.3551,-71.0657"
     private let buzzardsBay = "41.6362,-70.9342"
+    private let rockport = "42.6559,-70.6206"
 
     /// Walk the route's own geometry at `metresPerFix`, which is what a GPS
     /// stream looks like: fixes at a cadence, not at the maneuvers.
@@ -196,9 +197,33 @@ final class LiveDriveTests: XCTestCase {
                        response.scenic.properties.steps.count - 1)
     }
 
+    /// Boston → Rockport, not Boston → Buzzards Bay, and the reason is the
+    /// second assertion rather than the first.
+    ///
+    /// The fastest arm is routed at `pref=0`, so its *path* is identical under
+    /// both weight settings; what must differ is its *score*, because the
+    /// server re-scores both cards with the caller's weights so the two are
+    /// comparable. A server that scored the fastest card at neutral weights
+    /// would be a real bug — the cards would be on different rulers — and this
+    /// assertion is what catches it.
+    ///
+    /// On Buzzards Bay it could not. That fastest arm is 78-87% motorway
+    /// scoring below 0.5, so reweighting has almost nothing to redistribute:
+    /// the score really does move, 0.381331 -> 0.378151, but the API rounds
+    /// `mean_score` to two decimals and both serialise as `0.38`. The
+    /// assertion was reading a rounding artifact and could not tell it from
+    /// the bug it exists to catch. Measured over seven Massachusetts pairs,
+    /// Buzzards Bay is the only one that collapses; the rest separate by 0.12
+    /// to 0.74. Rockport moves 2.03 -> 2.15 and is still a coastal
+    /// destination, so the first assertion keeps its meaning too (coastal km
+    /// 53.7 -> 63.8).
+    ///
+    /// If this starts failing again, check the delta before the wiring: a pair
+    /// whose fastest route drifts onto more motorway will reproduce this
+    /// exactly, and it is the pair that is wrong, not the server.
     func test_the_reported_scenery_reflects_the_weights_that_were_sent() async throws {
-        let plain = try await liveRoute(from: boston, to: buzzardsBay, pref: 0.8)
-        let coastal = try await liveRoute(from: boston, to: buzzardsBay, pref: 0.8,
+        let plain = try await liveRoute(from: boston, to: rockport, pref: 0.8)
+        let coastal = try await liveRoute(from: boston, to: rockport, pref: 0.8,
                                           weights: "&w_coast=4&w_town=0&w_farm=0")
         // The whole point of the tune screen: asking for coast finds more coast.
         let plainCoast = plain.scenic.properties.scenery_km["coast"] ?? 0

@@ -1221,11 +1221,39 @@ class TestSurfaceAvoidanceIsNotAScenerySetting:
 
     def test_surface_is_absent_from_the_reported_score(self, router):
         """Two edges that differ only in surface must not differ in score. The
-        score is what the app shows and what `BETA` is calibrated against."""
+        score is what the app shows and what `BETA` is calibrated against.
+
+        Asserted as a one-sided claim, because that is the claim. The surface
+        term is the only *negative* contribution `_load_unpaved` removes, so
+        "no edge is still carrying it" is exactly "no residual below zero" —
+        and that holds at zero tolerance on both builds (Massachusetts:
+        400,983 edges, none; New England: 998,252, none).
+
+        Equality with the class adjustment does **not** hold, and demanding it
+        is what this test used to get wrong. Two Massachusetts edges sit
+        *above* their class — both `primary_link`, `score_adj` -0.04 against
+        `CLASS_ADJ` -0.10. A positive residual cannot be surface, which only
+        ever subtracts; it is an edge whose chunks span more than one `highway`
+        value while `graph.py` records one, so the stored `score_adj` is a
+        length-weighted average of two classes. Pre-existing, unrelated to this
+        feature, and nothing `_load_unpaved` can or should undo. It is bounded
+        rather than ignored, so the test still fails if that population grows.
+        """
         adj = router.score_adj
         by_class = router.edges["highway"].map(CLASS_ADJ).fillna(0.0).to_numpy()
-        assert np.allclose(adj, by_class), (
-            "score_adj carries something other than road class")
+        residual = adj - by_class
+
+        assert residual.min() >= -1e-9, (
+            "score_adj is still carrying a surface penalty: "
+            f"{int((residual < -1e-9).sum())} edges below their road class, "
+            f"worst {residual.min():.4f}")
+
+        mixed = residual > 1e-9
+        assert mixed.sum() <= 8, (
+            f"{int(mixed.sum())} edges score above their own road class — "
+            "graph.py is averaging more than one `highway` value onto an edge "
+            "more often than it used to, which breaks the exact recovery in "
+            "`_load_unpaved`")
 
 
 class TestLegacyGraphMigration:
